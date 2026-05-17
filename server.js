@@ -42,6 +42,32 @@ const pool = new Pool({
 
 const JWT_SECRET = "triangle_wms_secret_key";
 
+function getCompanyFilter(req) {
+  const companyId = req.headers["x-company-id"];
+  const isSuperAdmin = req.headers["x-super-admin"] === "true";
+
+  return {
+    companyId,
+    isSuperAdmin
+  };
+}
+
+async function getCompanyPlanLimits(companyId) {
+  const result = await pool.query(
+    `SELECT 
+      sp.*
+     FROM subscriptions s
+     LEFT JOIN subscription_plans sp 
+     ON s.plan_id = sp.id
+     WHERE s.company_id = $1
+     ORDER BY s.id DESC
+     LIMIT 1`,
+    [companyId]
+  );
+
+  return result.rows[0] || null;
+}
+
 async function logActivity(user_name, user_role, action, module, details) {
   try {
     await pool.query(
@@ -172,24 +198,67 @@ app.put("/company-settings", async (req, res) => {
   }
 });
 
-/* LOGIN */
+/* LOGIN SAAS */
 app.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body;
 
-    const result = await pool.query("SELECT * FROM users WHERE email = $1", [
-      email
-    ]);
+    const result = await pool.query(
+      `SELECT 
+        u.*,
+        c.name AS company_name,
+        c.status AS company_status,
+        s.status AS subscription_status,
+        s.end_date AS subscription_end_date,
+        sp.name AS plan_name
+       FROM users u
+       LEFT JOIN companies c ON u.company_id = c.id
+       LEFT JOIN subscriptions s ON c.id = s.company_id
+       LEFT JOIN subscription_plans sp ON s.plan_id = sp.id
+       WHERE u.email = $1
+       ORDER BY s.id DESC
+       LIMIT 1`,
+      [email]
+    );
+
     const user = result.rows[0];
 
     if (!user) return res.status(401).json({ error: "Email incorrect" });
-    if (user.is_active === false)
+
+    if (user.is_active === false) {
       return res.status(403).json({ error: "Compte désactivé" });
-    if (password !== user.password)
+    }
+
+    if (password !== user.password) {
       return res.status(401).json({ error: "Mot de passe incorrect" });
+    }
+
+    if (!user.is_super_admin) {
+      if (user.company_status === "suspended") {
+        return res.status(403).json({
+          error: "Entreprise suspendue. Veuillez contacter l’administration."
+        });
+      }
+
+      if (
+        user.subscription_status === "expired" ||
+        user.subscription_status === "suspended" ||
+        user.subscription_status === "cancelled"
+      ) {
+        return res.status(403).json({
+          error: "Abonnement inactif. Veuillez renouveler votre abonnement."
+        });
+      }
+    }
 
     const token = jwt.sign(
-      { id: user.id, email: user.email, role: user.role },
+      {
+        id: user.id,
+        email: user.email,
+        role: user.role,
+        company_id: user.company_id,
+        is_super_admin: user.is_super_admin || false
+      },
       JWT_SECRET,
       { expiresIn: "1d" }
     );
@@ -210,12 +279,19 @@ app.post("/login", async (req, res) => {
         fullname: user.fullname,
         email: user.email,
         role: user.role,
+        company_id: user.company_id,
+        company_name: user.company_name || "",
+        company_status: user.company_status || "",
+        is_super_admin: user.is_super_admin || false,
+        subscription_status: user.subscription_status || "",
+        subscription_end_date: user.subscription_end_date || "",
+        plan_name: user.plan_name || "",
         profile_image_url: user.profile_image_url || ""
       }
     });
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: "Erreur login" });
+    res.status(500).json({ error: "Erreur login SaaS" });
   }
 });
 
@@ -237,21 +313,59 @@ app.get("/users", async (req, res) => {
 
 app.post("/users", async (req, res) => {
   try {
+    const { companyId, isSuperAdmin } = getCompanyFilter(req);
+
+    if (!isSuperAdmin) {
+      const limits = await getCompanyPlanLimits(companyId);
+
+      const countResult = await pool.query(
+        "SELECT COUNT(*) FROM users WHERE company_id = $1",
+        [companyId]
+      );
+
+      const currentUsers = Number(countResult.rows[0].count);
+      const maxUsers = Number(limits?.max_users || 0);
+
+      if (maxUsers > 0 && currentUsers >= maxUsers) {
+        return res.status(403).json({
+          error:
+            "Limite utilisateurs atteinte pour votre formule. Veuillez passer à une formule supérieure."
+        });
+      }
+    }
+
     const { fullname, email, password, role, is_active, profile_image_url } =
       req.body;
 
     const result = await pool.query(
       `INSERT INTO users
-      (fullname, email, password, role, is_active, profile_image_url)
-      VALUES ($1, $2, $3, $4, $5, $6)
-      RETURNING id, fullname, email, role, is_active, profile_image_url, created_at`,
+      (
+        fullname,
+        email,
+        password,
+        role,
+        is_active,
+        profile_image_url,
+        company_id
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      RETURNING 
+        id,
+        fullname,
+        email,
+        role,
+        is_active,
+        profile_image_url,
+        company_id,
+        created_at`,
       [
         fullname,
         email,
         password || "123456",
         role || "magasinier",
         is_active !== false,
-        profile_image_url || ""
+        profile_image_url || "",
+        companyId
       ]
     );
 
@@ -266,7 +380,9 @@ app.post("/users", async (req, res) => {
     res.status(201).json(result.rows[0]);
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: "Erreur ajout utilisateur" });
+    res.status(500).json({
+      error: "Erreur ajout utilisateur"
+    });
   }
 });
 
@@ -355,25 +471,61 @@ app.delete("/users/:id", async (req, res) => {
   }
 });
 
-/* PRODUITS */
+/* PRODUITS SAAS */
 app.get("/products", async (req, res) => {
   try {
-    const result = await pool.query(`
+    const { companyId, isSuperAdmin } = getCompanyFilter(req);
+
+    let query = `
       SELECT products.*, locations.emplacement_code
       FROM products
-      LEFT JOIN locations ON products.location_id = locations.id
-      ORDER BY products.id DESC
-    `);
+      LEFT JOIN locations 
+      ON products.location_id = locations.id
+    `;
+
+    let values = [];
+
+    if (!isSuperAdmin) {
+      query += ` WHERE products.company_id = $1 `;
+      values.push(companyId);
+    }
+
+    query += ` ORDER BY products.id DESC`;
+
+    const result = await pool.query(query, values);
 
     res.json(result.rows);
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: "Erreur serveur produits" });
+    res.status(500).json({
+      error: "Erreur récupération produits SaaS"
+    });
   }
 });
 
 app.post("/products", async (req, res) => {
   try {
+    const { companyId, isSuperAdmin } = getCompanyFilter(req);
+
+    if (!isSuperAdmin) {
+      const limits = await getCompanyPlanLimits(companyId);
+
+      const countResult = await pool.query(
+        "SELECT COUNT(*) FROM products WHERE company_id = $1",
+        [companyId]
+      );
+
+      const currentProducts = Number(countResult.rows[0].count);
+      const maxProducts = Number(limits?.max_products || 0);
+
+      if (maxProducts > 0 && currentProducts >= maxProducts) {
+        return res.status(403).json({
+          error:
+            "Limite produits atteinte pour votre formule. Veuillez passer à une formule supérieure."
+        });
+      }
+    }
+
     const {
       reference,
       name,
@@ -397,11 +549,30 @@ app.post("/products", async (req, res) => {
 
     const result = await pool.query(
       `INSERT INTO products
-      (reference, name, category, stock, warehouse, status, unit, weight,
-       dimensions, barcode, description, is_active, location_id, location_code,
-       minimum_stock, image_url)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
-      RETURNING *`,
+  (
+    reference,
+    name,
+    category,
+    stock,
+    warehouse,
+    status,
+    unit,
+    weight,
+    dimensions,
+    barcode,
+    description,
+    is_active,
+    location_id,
+    location_code,
+    minimum_stock,
+    image_url,
+    company_id
+  )
+  VALUES (
+    $1,$2,$3,$4,$5,$6,$7,$8,
+    $9,$10,$11,$12,$13,$14,$15,$16,$17
+  )
+  RETURNING *`,
       [
         reference,
         name,
@@ -418,7 +589,8 @@ app.post("/products", async (req, res) => {
         location_id || null,
         location_code || "",
         Number(minimum_stock || 5),
-        image_url || ""
+        image_url || "",
+        companyId
       ]
     );
 
@@ -525,16 +697,32 @@ app.delete("/products/:id", async (req, res) => {
   }
 });
 
-/* MOUVEMENTS STOCK */
+/* MOUVEMENTS STOCK SAAS */
 app.get("/stock-movements", async (req, res) => {
   try {
-    const result = await pool.query(
-      "SELECT * FROM stock_movements ORDER BY id DESC"
-    );
+    const { companyId, isSuperAdmin } = getCompanyFilter(req);
+
+    let query = `
+      SELECT * FROM stock_movements
+    `;
+
+    let values = [];
+
+    if (!isSuperAdmin) {
+      query += ` WHERE company_id = $1 `;
+      values.push(companyId);
+    }
+
+    query += ` ORDER BY id DESC`;
+
+    const result = await pool.query(query, values);
+
     res.json(result.rows);
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: "Erreur mouvements stock" });
+    res.status(500).json({
+      error: "Erreur mouvements stock SaaS"
+    });
   }
 });
 
@@ -721,15 +909,32 @@ app.put("/stock-movements/:id/reject", async (req, res) => {
   }
 });
 
-/* DOCUMENTS : BL / BR / FACTURE / PROFORMA */
+/* DOCUMENTS SAAS */
 app.get("/documents", async (req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM documents ORDER BY id DESC");
+    const { companyId, isSuperAdmin } = getCompanyFilter(req);
+
+    let query = `
+      SELECT * FROM documents
+    `;
+
+    let values = [];
+
+    if (!isSuperAdmin) {
+      query += ` WHERE company_id = $1 `;
+      values.push(companyId);
+    }
+
+    query += ` ORDER BY id DESC`;
+
+    const result = await pool.query(query, values);
 
     res.json(result.rows);
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: "Erreur lecture documents" });
+    res.status(500).json({
+      error: "Erreur lecture documents SaaS"
+    });
   }
 });
 
@@ -1002,41 +1207,101 @@ app.post("/documents/from-movement/:id", async (req, res) => {
   }
 });
 
-/* HISTORIQUE INVENTAIRE */
+/* HISTORIQUE INVENTAIRE SAAS */
 app.get("/inventory-history", async (req, res) => {
   try {
-    const result = await pool.query(
-      "SELECT * FROM inventory_history ORDER BY id DESC"
-    );
+    const { companyId, isSuperAdmin } = getCompanyFilter(req);
+
+    let query = `
+      SELECT * FROM inventory_history
+    `;
+
+    let values = [];
+
+    if (!isSuperAdmin) {
+      query += ` WHERE company_id = $1 `;
+      values.push(companyId);
+    }
+
+    query += ` ORDER BY id DESC`;
+
+    const result = await pool.query(query, values);
 
     res.json(result.rows);
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: "Erreur lecture historique inventaire" });
+    res.status(500).json({
+      error: "Erreur historique inventaire SaaS"
+    });
   }
 });
 
-/* ENTREPÔTS */
+/* ENTREPÔTS SAAS */
 app.get("/warehouses", async (req, res) => {
   try {
-    const result = await pool.query(
-      "SELECT * FROM warehouses ORDER BY id DESC"
-    );
+    const { companyId, isSuperAdmin } = getCompanyFilter(req);
+
+    let query = `
+      SELECT * FROM warehouses
+    `;
+
+    let values = [];
+
+    if (!isSuperAdmin) {
+      query += ` WHERE company_id = $1 `;
+      values.push(companyId);
+    }
+
+    query += ` ORDER BY id DESC`;
+
+    const result = await pool.query(query, values);
+
     res.json(result.rows);
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: "Erreur lecture entrepôts" });
+    res.status(500).json({
+      error: "Erreur lecture entrepôts SaaS"
+    });
   }
 });
 
 app.post("/warehouses", async (req, res) => {
   try {
+    const { companyId, isSuperAdmin } = getCompanyFilter(req);
+
+    if (!isSuperAdmin) {
+      const limits = await getCompanyPlanLimits(companyId);
+
+      const countResult = await pool.query(
+        "SELECT COUNT(*) FROM warehouses WHERE company_id = $1",
+        [companyId]
+      );
+
+      const currentWarehouses = Number(countResult.rows[0].count);
+      const maxWarehouses = Number(limits?.max_warehouses || 0);
+
+      if (maxWarehouses > 0 && currentWarehouses >= maxWarehouses) {
+        return res.status(403).json({
+          error:
+            "Limite entrepôts atteinte pour votre formule. Veuillez passer à une formule supérieure."
+        });
+      }
+    }
+
     const { code, name, location, manager, racks_count, status } = req.body;
 
     const result = await pool.query(
       `INSERT INTO warehouses
-      (code, name, location, manager, racks_count, status)
-      VALUES ($1,$2,$3,$4,$5,$6)
+      (
+        code,
+        name,
+        location,
+        manager,
+        racks_count,
+        status,
+        company_id
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7)
       RETURNING *`,
       [
         code,
@@ -1044,7 +1309,8 @@ app.post("/warehouses", async (req, res) => {
         location,
         manager,
         Number(racks_count || 0),
-        status || "Actif"
+        status || "Actif",
+        companyId
       ]
     );
 
@@ -1059,7 +1325,9 @@ app.post("/warehouses", async (req, res) => {
     res.status(201).json(result.rows[0]);
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: "Erreur ajout entrepôt" });
+    res.status(500).json({
+      error: "Erreur ajout entrepôt"
+    });
   }
 });
 
@@ -1367,25 +1635,36 @@ app.get("/search", async (req, res) => {
   }
 });
 
-/* CHAT INTERNE & NOTIFICATIONS */
-app.get("/chat/conversations/:userId", async (req, res) => {
+/* MESSAGES SAAS */
+app.get("/chat/messages/:conversationId", async (req, res) => {
   try {
-    const { userId } = req.params;
+    const { conversationId } = req.params;
+    const { companyId, isSuperAdmin } = getCompanyFilter(req);
 
-    const result = await pool.query(
-      `SELECT c.*
-       FROM conversations c
-       INNER JOIN conversation_participants cp
-       ON c.id = cp.conversation_id
-       WHERE cp.user_id = $1
-       ORDER BY c.id DESC`,
-      [userId]
-    );
+    let query = `
+      SELECT m.*, u.fullname AS sender_name, u.role AS sender_role, u.profile_image_url
+      FROM messages m
+      LEFT JOIN users u ON m.sender_id = u.id
+      WHERE m.conversation_id = $1
+    `;
+
+    let values = [conversationId];
+
+    if (!isSuperAdmin) {
+      query += ` AND m.company_id = $2 `;
+      values.push(companyId);
+    }
+
+    query += ` ORDER BY m.id ASC`;
+
+    const result = await pool.query(query, values);
 
     res.json(result.rows);
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: "Erreur lecture conversations" });
+    res.status(500).json({
+      error: "Erreur lecture messages SaaS"
+    });
   }
 });
 
@@ -1547,20 +1826,35 @@ app.get("/attendance/schedule-groups", async (req, res) => {
   }
 });
 
+/* POINTAGES DU JOUR SAAS */
 app.get("/attendance/today", async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT ar.*, u.fullname, u.email, u.role, u.profile_image_url
-       FROM attendance_records ar
-       LEFT JOIN users u ON ar.user_id = u.id
-       WHERE ar.work_date = CURRENT_DATE
-       ORDER BY ar.id DESC`
-    );
+    const { companyId, isSuperAdmin } = getCompanyFilter(req);
+
+    let query = `
+      SELECT ar.*, u.fullname, u.email, u.role, u.profile_image_url
+      FROM attendance_records ar
+      LEFT JOIN users u ON ar.user_id = u.id
+      WHERE ar.work_date = CURRENT_DATE
+    `;
+
+    let values = [];
+
+    if (!isSuperAdmin) {
+      query += ` AND u.company_id = $1 `;
+      values.push(companyId);
+    }
+
+    query += ` ORDER BY ar.id DESC`;
+
+    const result = await pool.query(query, values);
 
     res.json(result.rows);
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: "Erreur lecture pointages du jour" });
+    res.status(500).json({
+      error: "Erreur lecture pointages SaaS"
+    });
   }
 });
 
@@ -2072,6 +2366,142 @@ app.post("/ai/chat", async (req, res) => {
     res.status(500).json({
       error: "Erreur assistant IA"
     });
+  }
+});
+
+/* SUPER ADMIN SAAS */
+app.get("/super-admin/overview", async (req, res) => {
+  try {
+    const totalCompanies = await pool.query("SELECT COUNT(*) FROM companies");
+    const activeCompanies = await pool.query(
+      "SELECT COUNT(*) FROM companies WHERE status='active'"
+    );
+    const suspendedCompanies = await pool.query(
+      "SELECT COUNT(*) FROM companies WHERE status='suspended'"
+    );
+    const totalPlans = await pool.query(
+      "SELECT COUNT(*) FROM subscription_plans"
+    );
+    const activeSubscriptions = await pool.query(
+      "SELECT COUNT(*) FROM subscriptions WHERE status='active'"
+    );
+    const trialSubscriptions = await pool.query(
+      "SELECT COUNT(*) FROM subscriptions WHERE status='trial'"
+    );
+    const totalPayments = await pool.query(
+      "SELECT COALESCE(SUM(amount), 0) AS total FROM payments WHERE status='paid'"
+    );
+
+    res.json({
+      total_companies: Number(totalCompanies.rows[0].count),
+      active_companies: Number(activeCompanies.rows[0].count),
+      suspended_companies: Number(suspendedCompanies.rows[0].count),
+      total_plans: Number(totalPlans.rows[0].count),
+      active_subscriptions: Number(activeSubscriptions.rows[0].count),
+      trial_subscriptions: Number(trialSubscriptions.rows[0].count),
+      total_revenue: Number(totalPayments.rows[0].total)
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erreur overview super admin" });
+  }
+});
+
+app.get("/super-admin/companies", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT 
+        c.*,
+        s.status AS subscription_status,
+        s.end_date,
+        sp.name AS plan_name,
+        sp.price_monthly
+       FROM companies c
+       LEFT JOIN subscriptions s ON c.id = s.company_id
+       LEFT JOIN subscription_plans sp ON s.plan_id = sp.id
+       ORDER BY c.id DESC`
+    );
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erreur liste entreprises" });
+  }
+});
+
+app.put("/super-admin/companies/:id/status", async (req, res) => {
+  try {
+    const { status } = req.body;
+
+    const result = await pool.query(
+      `UPDATE companies
+       SET status=$1,
+           updated_at=CURRENT_TIMESTAMP
+       WHERE id=$2
+       RETURNING *`,
+      [status, req.params.id]
+    );
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erreur changement statut entreprise" });
+  }
+});
+
+app.put("/super-admin/subscriptions/:companyId/renew", async (req, res) => {
+  try {
+    const { months, payment_mode } = req.body;
+
+    const result = await pool.query(
+      `UPDATE subscriptions
+       SET status='active',
+           start_date=CURRENT_DATE,
+           end_date=CURRENT_DATE + ($1 || ' months')::interval,
+           payment_mode=$2,
+           is_payment_required=true
+       WHERE company_id=$3
+       RETURNING *`,
+      [Number(months || 1), payment_mode || "manual", req.params.companyId]
+    );
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erreur renouvellement abonnement" });
+  }
+});
+
+app.put("/super-admin/subscriptions/:companyId/free", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE subscriptions
+       SET status='free',
+           payment_mode='free',
+           is_payment_required=false,
+           end_date=NULL
+       WHERE company_id=$1
+       RETURNING *`,
+      [req.params.companyId]
+    );
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erreur accès gratuit" });
+  }
+});
+
+app.get("/super-admin/plans", async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM subscription_plans ORDER BY id ASC"
+    );
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erreur plans SaaS" });
   }
 });
 
