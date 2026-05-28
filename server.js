@@ -52,6 +52,60 @@ function getCompanyFilter(req) {
   };
 }
 
+function normalizeRole(role) {
+  return String(role || "").toLowerCase();
+}
+
+function isAdminUser(user) {
+  const role = normalizeRole(user?.role);
+  return (
+    user?.is_super_admin === true || role === "admin" || role === "super_admin"
+  );
+}
+
+function authorizeRoles(...roles) {
+  return (req, res, next) => {
+    const allowed = roles.map(normalizeRole);
+    const userRole = normalizeRole(req.user?.role);
+
+    if (req.user?.is_super_admin === true || allowed.includes(userRole)) {
+      return next();
+    }
+
+    return res.status(403).json({
+      error: "Accès refusé : vous n'avez pas l'autorisation."
+    });
+  };
+}
+
+function getUserCompanyId(req) {
+  return req.user?.company_id || null;
+}
+
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers["authorization"];
+
+  const token = authHeader && authHeader.split(" ")[1];
+
+  if (!token) {
+    return res.status(401).json({
+      error: "Token manquant"
+    });
+  }
+
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(403).json({
+        error: "Token invalide"
+      });
+    }
+
+    req.user = user;
+
+    next();
+  });
+}
+
 async function getCompanyPlanLimits(companyId) {
   const result = await pool.query(
     `SELECT 
@@ -198,6 +252,158 @@ app.put("/company-settings", async (req, res) => {
   }
 });
 
+/* REGISTER SAAS - AVEC PLAN CHOISI */
+app.post("/register-saas", async (req, res) => {
+  try {
+    const {
+      company_name,
+      business_type,
+      responsible_name,
+      email,
+      phone,
+      address,
+      password,
+      plan_id
+    } = req.body;
+
+    if (!company_name || !responsible_name || !email || !password || !plan_id) {
+      return res.status(400).json({
+        error: "Informations obligatoires manquantes."
+      });
+    }
+
+    const planResult = await pool.query(
+      `
+      SELECT *
+      FROM subscription_plans
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [plan_id]
+    );
+
+    if (planResult.rows.length === 0) {
+      return res.status(404).json({
+        error: "Plan introuvable"
+      });
+    }
+
+    const plan = planResult.rows[0];
+
+    const existingUser = await pool.query(
+      `
+      SELECT id
+      FROM users
+      WHERE email = $1
+      LIMIT 1
+      `,
+      [email]
+    );
+
+    if (existingUser.rows.length > 0) {
+      return res.status(400).json({
+        error: "Cet email existe déjà."
+      });
+    }
+
+    const companyResult = await pool.query(
+      `
+      INSERT INTO companies
+      (
+        name,
+        business_type,
+        responsible_name,
+        email,
+        phone,
+        address,
+        plan_id,
+        subscription_status,
+        trial_ends_at
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW() + ($9 || ' days')::interval)
+      RETURNING *
+      `,
+      [
+        company_name,
+        business_type || "",
+        responsible_name,
+        email,
+        phone || "",
+        address || "",
+        plan.id,
+        "trial",
+        Number(plan.trial_days || 15)
+      ]
+    );
+
+    const company = companyResult.rows[0];
+
+    const userResult = await pool.query(
+      `
+      INSERT INTO users
+      (
+        fullname,
+        email,
+        password,
+        role,
+        company_id,
+        is_super_admin,
+        badge_code
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7)
+      RETURNING *
+      `,
+      [
+        responsible_name,
+        email,
+        password,
+        "admin",
+        company.id,
+        false,
+        `TRIANGLE-EMP-${company.id}-${Date.now()}`
+      ]
+    );
+
+    const user = userResult.rows[0];
+
+    await pool.query(
+      `
+      INSERT INTO subscriptions
+      (
+        company_id,
+        plan_id,
+        start_date,
+        end_date,
+        status,
+        payment_status
+      )
+      VALUES ($1,$2,NOW(),NOW() + ($3 || ' days')::interval,$4,$5)
+      `,
+      [
+        company.id,
+        plan.id,
+        Number(plan.trial_days || 15),
+        "trial",
+        "free_trial"
+      ]
+    );
+
+    res.status(201).json({
+      success: true,
+      message: "Entreprise créée avec succès. Essai gratuit activé.",
+      company,
+      user,
+      plan
+    });
+  } catch (error) {
+    console.error("ERREUR REGISTER SAAS :", error);
+
+    res.status(500).json({
+      error: "Erreur création entreprise SaaS"
+    });
+  }
+});
+
 /* LOGIN SAAS */
 app.post("/login", async (req, res) => {
   try {
@@ -296,12 +502,43 @@ app.post("/login", async (req, res) => {
 });
 
 /* UTILISATEURS */
-app.get("/users", async (req, res) => {
+app.get("/users", authenticateToken, async (req, res) => {
   try {
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
+
+    const values = [];
+    let companyFilter = "";
+
+    if (!isSuperAdmin) {
+      values.push(companyId);
+      companyFilter = "WHERE u.company_id = $1";
+    }
+
     const result = await pool.query(
-      `SELECT id, fullname, email, role, is_active, profile_image_url, created_at
-       FROM users
-       ORDER BY id DESC`
+      `SELECT
+         u.id,
+         u.fullname,
+         u.email,
+         u.role,
+         u.is_active,
+         u.profile_image_url,
+         u.badge_code,
+         u.created_at,
+         u.schedule_group_id,
+         COALESCE(s.schedule_group, sg.name, '') AS schedule_group,
+         COALESCE(s.salary_type, u.payment_type, '') AS salary_type,
+         COALESCE(s.hourly_rate, u.hourly_rate, 0) AS hourly_rate,
+         COALESCE(s.daily_salary, u.daily_rate, 0) AS daily_rate,
+         COALESCE(s.monthly_salary, 0) AS monthly_salary,
+         COALESCE(s.start_time, sg.start_time) AS start_time,
+         COALESCE(s.end_time, sg.end_time) AS end_time
+       FROM users u
+       LEFT JOIN attendance_settings s ON s.user_id = u.id
+       LEFT JOIN schedule_groups sg ON sg.id = u.schedule_group_id
+       ${companyFilter}
+       ORDER BY u.id DESC`,
+      values
     );
 
     res.json(result.rows);
@@ -311,170 +548,93 @@ app.get("/users", async (req, res) => {
   }
 });
 
-app.post("/users", async (req, res) => {
-  try {
-    const { companyId, isSuperAdmin } = getCompanyFilter(req);
+/* CREATE USER AVEC BADGE + PARAMÈTRES POINTAGE AUTOMATIQUES */
+app.post(
+  "/users",
+  authenticateToken,
+  authorizeRoles("admin", "super_admin"),
+  async (req, res) => {
+    try {
+      const { fullname, email, password, role, phone, company_id } = req.body;
+      const assignedCompanyId =
+        req.user.is_super_admin === true
+          ? company_id || req.user.company_id || null
+          : req.user.company_id;
 
-    if (!isSuperAdmin) {
-      const limits = await getCompanyPlanLimits(companyId);
-
-      const countResult = await pool.query(
-        "SELECT COUNT(*) FROM users WHERE company_id = $1",
-        [companyId]
-      );
-
-      const currentUsers = Number(countResult.rows[0].count);
-      const maxUsers = Number(limits?.max_users || 0);
-
-      if (maxUsers > 0 && currentUsers >= maxUsers) {
-        return res.status(403).json({
-          error:
-            "Limite utilisateurs atteinte pour votre formule. Veuillez passer à une formule supérieure."
-        });
-      }
-    }
-
-    const { fullname, email, password, role, is_active, profile_image_url } =
-      req.body;
-
-    const result = await pool.query(
-      `INSERT INTO users
+      const userResult = await pool.query(
+        `
+      INSERT INTO users
       (
         fullname,
         email,
         password,
         role,
-        is_active,
-        profile_image_url,
-        company_id
-      )
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
-      RETURNING 
-        id,
-        fullname,
-        email,
-        role,
-        is_active,
-        profile_image_url,
+        phone,
         company_id,
-        created_at`,
-      [
-        fullname,
-        email,
-        password || "123456",
-        role || "magasinier",
-        is_active !== false,
-        profile_image_url || "",
-        companyId
-      ]
-    );
-
-    await logActivity(
-      "Administrateur",
-      "admin",
-      "Ajout utilisateur",
-      "Utilisateurs",
-      `Utilisateur ajouté : ${fullname}`
-    );
-
-    res.status(201).json(result.rows[0]);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      error: "Erreur ajout utilisateur"
-    });
-  }
-});
-
-app.put("/users/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    const { fullname, email, password, role, is_active, profile_image_url } =
-      req.body;
-
-    let result;
-
-    if (password && password.trim() !== "") {
-      result = await pool.query(
-        `UPDATE users
-         SET fullname=$1,
-             email=$2,
-             password=$3,
-             role=$4,
-             is_active=$5,
-             profile_image_url=$6
-         WHERE id=$7
-         RETURNING id, fullname, email, role, is_active, profile_image_url, created_at`,
+        is_super_admin
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7)
+      RETURNING *
+      `,
         [
           fullname,
           email,
-          password,
-          role,
-          is_active !== false,
-          profile_image_url || "",
-          id
+          password || "123456",
+          role || "magasinier",
+          phone || "",
+          assignedCompanyId,
+          false
         ]
       );
-    } else {
-      result = await pool.query(
-        `UPDATE users
-         SET fullname=$1,
-             email=$2,
-             role=$3,
-             is_active=$4,
-             profile_image_url=$5
-         WHERE id=$6
-         RETURNING id, fullname, email, role, is_active, profile_image_url, created_at`,
-        [
-          fullname,
-          email,
-          role,
-          is_active !== false,
-          profile_image_url || "",
-          id
-        ]
+
+      const user = userResult.rows[0];
+
+      const badgeCode = `TRIANGLE-EMP-${user.id}`;
+
+      const updatedUser = await pool.query(
+        `
+      UPDATE users
+      SET badge_code = $1
+      WHERE id = $2
+      RETURNING *
+      `,
+        [badgeCode, user.id]
       );
+
+      await pool.query(
+        `
+      INSERT INTO attendance_settings
+      (
+        user_id,
+        schedule_group,
+        salary_type,
+        hourly_rate,
+        daily_salary,
+        monthly_salary,
+        start_time,
+        end_time
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+      ON CONFLICT (user_id) DO NOTHING
+      `,
+        [user.id, "Standard", "horaire", 1000, 8000, 200000, "08:00", "17:00"]
+      );
+
+      res.status(201).json(updatedUser.rows[0]);
+    } catch (error) {
+      console.error("ERREUR CREATE USER :", error);
+      res.status(500).json({
+        error: "Erreur création utilisateur"
+      });
     }
-
-    await logActivity(
-      "Administrateur",
-      "admin",
-      "Modification utilisateur",
-      "Utilisateurs",
-      `Utilisateur modifié : ${fullname}`
-    );
-
-    res.json(result.rows[0]);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Erreur modification utilisateur" });
   }
-});
-
-app.delete("/users/:id", async (req, res) => {
-  try {
-    await pool.query("DELETE FROM users WHERE id=$1", [req.params.id]);
-
-    await logActivity(
-      "Administrateur",
-      "admin",
-      "Suppression utilisateur",
-      "Utilisateurs",
-      `Utilisateur supprimé ID : ${req.params.id}`
-    );
-
-    res.json({ message: "Utilisateur supprimé" });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Erreur suppression utilisateur" });
-  }
-});
+);
 
 /* PRODUITS SAAS */
-app.get("/products", async (req, res) => {
+app.get("/products", authenticateToken, async (req, res) => {
   try {
-    const { companyId, isSuperAdmin } = getCompanyFilter(req);
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
 
     let query = `
       SELECT products.*, locations.emplacement_code
@@ -503,9 +663,10 @@ app.get("/products", async (req, res) => {
   }
 });
 
-app.post("/products", async (req, res) => {
+app.post("/products", authenticateToken, async (req, res) => {
   try {
-    const { companyId, isSuperAdmin } = getCompanyFilter(req);
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
 
     if (!isSuperAdmin) {
       const limits = await getCompanyPlanLimits(companyId);
@@ -698,9 +859,10 @@ app.delete("/products/:id", async (req, res) => {
 });
 
 /* MOUVEMENTS STOCK SAAS */
-app.get("/stock-movements", async (req, res) => {
+app.get("/stock-movements", authenticateToken, async (req, res) => {
   try {
-    const { companyId, isSuperAdmin } = getCompanyFilter(req);
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
 
     let query = `
       SELECT * FROM stock_movements
@@ -726,8 +888,11 @@ app.get("/stock-movements", async (req, res) => {
   }
 });
 
-app.post("/stock-movements", async (req, res) => {
+app.post("/stock-movements", authenticateToken, async (req, res) => {
   try {
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
+
     const {
       type,
       product_reference,
@@ -740,31 +905,46 @@ app.post("/stock-movements", async (req, res) => {
       user_role
     } = req.body;
 
+    const productCheck = await pool.query(
+      `SELECT *
+       FROM products
+       WHERE reference=$1
+       ${isSuperAdmin ? "" : "AND company_id=$2"}
+       LIMIT 1`,
+      isSuperAdmin ? [product_reference] : [product_reference, companyId]
+    );
+
+    if (productCheck.rows.length === 0) {
+      return res
+        .status(404)
+        .json({ error: "Produit introuvable pour cette entreprise" });
+    }
+
+    const product = productCheck.rows[0];
+
     const result = await pool.query(
       `INSERT INTO stock_movements
       (type, product_reference, product_name, quantity, source_warehouse,
-       destination_warehouse, reason, status)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       destination_warehouse, reason, status, company_id, created_by, created_by_name, created_by_role)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
       RETURNING *`,
       [
         type,
         product_reference,
-        product_name,
+        product_name || product.name,
         Number(quantity),
-        source_warehouse,
+        source_warehouse || product.warehouse || "",
         destination_warehouse,
         reason,
-        "En attente"
+        "En attente",
+        companyId,
+        req.user.id,
+        user_name || req.user.email || "Utilisateur",
+        user_role || req.user.role || "Non défini"
       ]
     );
 
     if (type === "Inventaire") {
-      const productResult = await pool.query(
-        "SELECT stock, warehouse, location_code FROM products WHERE reference=$1",
-        [product_reference]
-      );
-
-      const product = productResult.rows[0];
       const systemStock = Number(product?.stock || 0);
       const realStock = Number(quantity || 0);
       const difference = realStock - systemStock;
@@ -772,11 +952,11 @@ app.post("/stock-movements", async (req, res) => {
       await pool.query(
         `INSERT INTO inventory_history
         (product_reference, product_name, system_stock, real_stock, difference,
-         warehouse, location_code, user_name, user_role, status, observation)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+         warehouse, location_code, user_name, user_role, status, observation, company_id)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
         [
           product_reference,
-          product_name,
+          product_name || product.name,
           systemStock,
           realStock,
           difference,
@@ -785,7 +965,8 @@ app.post("/stock-movements", async (req, res) => {
           user_name || "Magasinier",
           user_role || "magasinier",
           "En attente",
-          reason || ""
+          reason || "",
+          companyId
         ]
       );
     }
@@ -798,6 +979,30 @@ app.post("/stock-movements", async (req, res) => {
       `${type} créée pour ${product_reference}`
     );
 
+    const adminUsers = await pool.query(
+      `SELECT id FROM users
+       WHERE company_id=$1
+       AND (role='admin' OR role='super_admin' OR is_super_admin=true)`,
+      [companyId]
+    );
+
+    for (const admin of adminUsers.rows) {
+      if (admin.id !== req.user.id) {
+        await pool.query(
+          `INSERT INTO notifications
+           (user_id, title, message, type, company_id)
+           VALUES ($1,$2,$3,$4,$5)`,
+          [
+            admin.id,
+            "Mouvement stock à valider",
+            `${req.user.email || "Un utilisateur"} a créé une demande ${type} pour ${product_reference}.`,
+            "stock",
+            companyId
+          ]
+        );
+      }
+    }
+
     res.status(201).json(result.rows[0]);
   } catch (error) {
     console.error(error);
@@ -805,92 +1010,155 @@ app.post("/stock-movements", async (req, res) => {
   }
 });
 
-app.put("/stock-movements/:id/validate", async (req, res) => {
-  try {
-    const { id } = req.params;
+app.put(
+  "/stock-movements/:id/validate",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const companyId = req.user.company_id;
+      const isSuperAdmin = req.user.is_super_admin === true;
 
-    const movementResult = await pool.query(
-      "SELECT * FROM stock_movements WHERE id=$1",
-      [id]
-    );
-
-    const movement = movementResult.rows[0];
-
-    if (!movement)
-      return res.status(404).json({ error: "Mouvement introuvable" });
-
-    if (movement.status !== "En attente") {
-      return res.status(400).json({ error: "Mouvement déjà traité" });
-    }
-
-    if (movement.type === "Entrée") {
-      await pool.query(
-        "UPDATE products SET stock = stock + $1 WHERE reference = $2",
-        [movement.quantity, movement.product_reference]
+      const movementResult = await pool.query(
+        `SELECT * FROM stock_movements
+       WHERE id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}`,
+        isSuperAdmin ? [id] : [id, companyId]
       );
-    }
 
-    if (movement.type === "Sortie") {
-      await pool.query(
-        "UPDATE products SET stock = stock - $1 WHERE reference = $2",
-        [movement.quantity, movement.product_reference]
-      );
-    }
+      const movement = movementResult.rows[0];
 
-    if (movement.type === "Inventaire") {
-      await pool.query("UPDATE products SET stock = $1 WHERE reference = $2", [
-        movement.quantity,
-        movement.product_reference
-      ]);
+      if (!movement)
+        return res.status(404).json({ error: "Mouvement introuvable" });
 
-      await pool.query(
-        `UPDATE inventory_history
+      if (movement.status !== "En attente") {
+        return res.status(400).json({ error: "Mouvement déjà traité" });
+      }
+
+      if (movement.type === "Entrée") {
+        await pool.query(
+          `UPDATE products SET stock = stock + $1
+         WHERE reference = $2 ${isSuperAdmin ? "" : "AND company_id=$3"}`,
+          isSuperAdmin
+            ? [movement.quantity, movement.product_reference]
+            : [movement.quantity, movement.product_reference, companyId]
+        );
+      }
+
+      if (movement.type === "Sortie") {
+        await pool.query(
+          `UPDATE products SET stock = GREATEST(stock - $1, 0)
+         WHERE reference = $2 ${isSuperAdmin ? "" : "AND company_id=$3"}`,
+          isSuperAdmin
+            ? [movement.quantity, movement.product_reference]
+            : [movement.quantity, movement.product_reference, companyId]
+        );
+      }
+
+      if (movement.type === "Transfert") {
+        await pool.query(
+          `UPDATE products SET warehouse = $1
+         WHERE reference = $2 ${isSuperAdmin ? "" : "AND company_id=$3"}`,
+          isSuperAdmin
+            ? [movement.destination_warehouse || "", movement.product_reference]
+            : [
+                movement.destination_warehouse || "",
+                movement.product_reference,
+                companyId
+              ]
+        );
+      }
+
+      if (movement.type === "Inventaire") {
+        await pool.query(
+          `UPDATE products SET stock = $1
+         WHERE reference = $2 ${isSuperAdmin ? "" : "AND company_id=$3"}`,
+          isSuperAdmin
+            ? [movement.quantity, movement.product_reference]
+            : [movement.quantity, movement.product_reference, companyId]
+        );
+
+        await pool.query(
+          `UPDATE inventory_history
          SET status='Validé'
-         WHERE product_reference=$1 AND status='En attente'`,
-        [movement.product_reference]
+         WHERE product_reference=$1 AND status='En attente'
+         ${isSuperAdmin ? "" : "AND company_id=$2"}`,
+          isSuperAdmin
+            ? [movement.product_reference]
+            : [movement.product_reference, companyId]
+        );
+      }
+
+      const updated = await pool.query(
+        `UPDATE stock_movements
+       SET status='Validé', validated_by=$1, validated_at=CURRENT_TIMESTAMP
+       WHERE id=$2 ${isSuperAdmin ? "" : "AND company_id=$3"}
+       RETURNING *`,
+        isSuperAdmin ? [req.user.id, id] : [req.user.id, id, companyId]
       );
+
+      await logActivity(
+        "Administrateur",
+        "admin",
+        "Validation mouvement stock",
+        "Stocks",
+        `${movement.type} validé pour ${movement.product_reference}`
+      );
+
+      if (movement.created_by) {
+        await pool.query(
+          `INSERT INTO notifications
+         (user_id, title, message, type, company_id)
+         VALUES ($1,$2,$3,$4,$5)`,
+          [
+            movement.created_by,
+            "Mouvement stock validé",
+            `Votre demande ${movement.type} pour ${movement.product_reference} a été validée.`,
+            "stock",
+            movement.company_id || companyId
+          ]
+        );
+      }
+
+      res.json(updated.rows[0]);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Erreur validation mouvement" });
     }
-
-    const updated = await pool.query(
-      "UPDATE stock_movements SET status='Validé' WHERE id=$1 RETURNING *",
-      [id]
-    );
-
-    await logActivity(
-      "Administrateur",
-      "admin",
-      "Validation mouvement stock",
-      "Stocks",
-      `${movement.type} validé pour ${movement.product_reference}`
-    );
-
-    res.json(updated.rows[0]);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Erreur validation mouvement" });
   }
-});
+);
 
-app.put("/stock-movements/:id/reject", async (req, res) => {
+app.put("/stock-movements/:id/reject", authenticateToken, async (req, res) => {
   try {
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
+
     const movementResult = await pool.query(
-      "SELECT * FROM stock_movements WHERE id=$1",
-      [req.params.id]
+      `SELECT * FROM stock_movements
+       WHERE id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}`,
+      isSuperAdmin ? [req.params.id] : [req.params.id, companyId]
     );
 
     const movement = movementResult.rows[0];
 
     const updated = await pool.query(
-      "UPDATE stock_movements SET status='Refusé' WHERE id=$1 RETURNING *",
-      [req.params.id]
+      `UPDATE stock_movements
+       SET status='Refusé', validated_by=$1, validated_at=CURRENT_TIMESTAMP
+       WHERE id=$2 ${isSuperAdmin ? "" : "AND company_id=$3"}
+       RETURNING *`,
+      isSuperAdmin
+        ? [req.user.id, req.params.id]
+        : [req.user.id, req.params.id, companyId]
     );
 
     if (movement?.type === "Inventaire") {
       await pool.query(
         `UPDATE inventory_history
          SET status='Refusé'
-         WHERE product_reference=$1 AND status='En attente'`,
-        [movement.product_reference]
+         WHERE product_reference=$1 AND status='En attente'
+         ${isSuperAdmin ? "" : "AND company_id=$2"}`,
+        isSuperAdmin
+          ? [movement.product_reference]
+          : [movement.product_reference, companyId]
       );
     }
 
@@ -901,6 +1169,21 @@ app.put("/stock-movements/:id/reject", async (req, res) => {
       "Stocks",
       `Mouvement refusé ID : ${req.params.id}`
     );
+
+    if (movement?.created_by) {
+      await pool.query(
+        `INSERT INTO notifications
+         (user_id, title, message, type, company_id)
+         VALUES ($1,$2,$3,$4,$5)`,
+        [
+          movement.created_by,
+          "Mouvement stock refusé",
+          `Votre demande ${movement.type} pour ${movement.product_reference} a été refusée.`,
+          "stock",
+          movement.company_id || companyId
+        ]
+      );
+    }
 
     res.json(updated.rows[0]);
   } catch (error) {
@@ -1236,10 +1519,11 @@ app.get("/inventory-history", async (req, res) => {
   }
 });
 
-/* ENTREPÔTS SAAS */
-app.get("/warehouses", async (req, res) => {
+/* ENTREPÔTS SAAS JWT */
+app.get("/warehouses", authenticateToken, async (req, res) => {
   try {
-    const { companyId, isSuperAdmin } = getCompanyFilter(req);
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
 
     let query = `
       SELECT * FROM warehouses
@@ -1265,9 +1549,10 @@ app.get("/warehouses", async (req, res) => {
   }
 });
 
-app.post("/warehouses", async (req, res) => {
+app.post("/warehouses", authenticateToken, async (req, res) => {
   try {
-    const { companyId, isSuperAdmin } = getCompanyFilter(req);
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
 
     if (!isSuperAdmin) {
       const limits = await getCompanyPlanLimits(companyId);
@@ -1306,20 +1591,12 @@ app.post("/warehouses", async (req, res) => {
       [
         code,
         name,
-        location,
-        manager,
+        location || "",
+        manager || "",
         Number(racks_count || 0),
         status || "Actif",
         companyId
       ]
-    );
-
-    await logActivity(
-      "Administrateur",
-      "admin",
-      "Ajout entrepôt",
-      "Entrepôts",
-      `Entrepôt ajouté : ${code} - ${name}`
     );
 
     res.status(201).json(result.rows[0]);
@@ -1331,26 +1608,38 @@ app.post("/warehouses", async (req, res) => {
   }
 });
 
-app.put("/warehouses/:id", async (req, res) => {
+app.put("/warehouses/:id", authenticateToken, async (req, res) => {
   try {
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
+
     const { id } = req.params;
     const { code, name, location, manager, racks_count, status } = req.body;
 
-    const result = await pool.query(
-      `UPDATE warehouses
+    let query = `
+      UPDATE warehouses
       SET code=$1, name=$2, location=$3, manager=$4, racks_count=$5, status=$6
       WHERE id=$7
-      RETURNING *`,
-      [code, name, location, manager, Number(racks_count || 0), status, id]
-    );
+    `;
 
-    await logActivity(
-      "Administrateur",
-      "admin",
-      "Modification entrepôt",
-      "Entrepôts",
-      `Entrepôt modifié : ${code} - ${name}`
-    );
+    const values = [
+      code,
+      name,
+      location || "",
+      manager || "",
+      Number(racks_count || 0),
+      status || "Actif",
+      id
+    ];
+
+    if (!isSuperAdmin) {
+      query += ` AND company_id=$8`;
+      values.push(companyId);
+    }
+
+    query += ` RETURNING *`;
+
+    const result = await pool.query(query, values);
 
     res.json(result.rows[0]);
   } catch (error) {
@@ -1359,25 +1648,32 @@ app.put("/warehouses/:id", async (req, res) => {
   }
 });
 
-app.delete("/warehouses/:id", async (req, res) => {
+app.delete("/warehouses/:id", authenticateToken, async (req, res) => {
   try {
-    await pool.query("DELETE FROM warehouses WHERE id=$1", [req.params.id]);
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
 
-    await logActivity(
-      "Administrateur",
-      "admin",
-      "Suppression entrepôt",
-      "Entrepôts",
-      `Entrepôt supprimé ID : ${req.params.id}`
-    );
+    let query = "DELETE FROM warehouses WHERE id=$1";
+    const values = [req.params.id];
 
-    res.json({ message: "Entrepôt supprimé" });
+    if (!isSuperAdmin) {
+      query += " AND company_id=$2";
+      values.push(companyId);
+    }
+
+    query += " RETURNING *";
+
+    const result = await pool.query(query, values);
+
+    res.json({
+      message: "Entrepôt supprimé",
+      warehouse: result.rows[0]
+    });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Erreur suppression entrepôt" });
   }
 });
-
 /* EMPLACEMENTS */
 app.get("/locations", async (req, res) => {
   try {
@@ -1635,27 +1931,32 @@ app.get("/search", async (req, res) => {
   }
 });
 
-/* MESSAGES SAAS */
-app.get("/chat/messages/:conversationId", async (req, res) => {
+/* CHAT INTERNE & NOTIFICATIONS */
+
+/* CONVERSATIONS SAAS */
+app.get("/chat/conversations/:userId", authenticateToken, async (req, res) => {
   try {
-    const { conversationId } = req.params;
-    const { companyId, isSuperAdmin } = getCompanyFilter(req);
+    const { userId } = req.params;
+
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
 
     let query = `
-      SELECT m.*, u.fullname AS sender_name, u.role AS sender_role, u.profile_image_url
-      FROM messages m
-      LEFT JOIN users u ON m.sender_id = u.id
-      WHERE m.conversation_id = $1
+      SELECT c.*
+      FROM conversations c
+      INNER JOIN conversation_participants cp
+      ON c.id = cp.conversation_id
+      WHERE cp.user_id = $1
     `;
 
-    let values = [conversationId];
+    let values = [userId];
 
     if (!isSuperAdmin) {
-      query += ` AND m.company_id = $2 `;
+      query += ` AND c.company_id = $2 `;
       values.push(companyId);
     }
 
-    query += ` ORDER BY m.id ASC`;
+    query += ` ORDER BY c.id DESC`;
 
     const result = await pool.query(query, values);
 
@@ -1663,21 +1964,43 @@ app.get("/chat/messages/:conversationId", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({
-      error: "Erreur lecture messages SaaS"
+      error: "Erreur conversations SaaS"
     });
   }
 });
 
-app.post("/chat/conversations", async (req, res) => {
+app.post("/chat/conversations", authenticateToken, async (req, res) => {
   try {
+    const companyId = req.user.company_id;
+
     const { title, type, created_by, participants } = req.body;
+
+    const existingConversation = await pool.query(
+      `
+  SELECT c.*
+  FROM conversations c
+  INNER JOIN conversation_participants cp1
+    ON c.id = cp1.conversation_id
+  INNER JOIN conversation_participants cp2
+    ON c.id = cp2.conversation_id
+  WHERE cp1.user_id = $1
+    AND cp2.user_id = $2
+    AND c.type = 'private'
+  LIMIT 1
+  `,
+      [created_by, participants[1]]
+    );
+
+    if (existingConversation.rows.length > 0) {
+      return res.json(existingConversation.rows[0]);
+    }
 
     const conversationResult = await pool.query(
       `INSERT INTO conversations
-       (title, type, created_by)
-       VALUES ($1,$2,$3)
+       (title, type, created_by, company_id)
+       VALUES ($1,$2,$3,$4)
        RETURNING *`,
-      [title, type || "private", created_by]
+      [title, type || "private", created_by, companyId]
     );
 
     const conversation = conversationResult.rows[0];
@@ -1691,51 +2014,93 @@ app.post("/chat/conversations", async (req, res) => {
       );
     }
 
-    await logActivity(
-      "Système",
-      "chat",
-      "Création conversation",
-      "Chat",
-      `Conversation créée : ${title}`
-    );
-
     res.status(201).json(conversation);
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Erreur création conversation" });
+    console.error("ERREUR CREATION CONVERSATION :", error);
+    res.status(500).json({
+      error: "Erreur création conversation"
+    });
   }
 });
 
-app.get("/chat/messages/:conversationId", async (req, res) => {
-  try {
-    const { conversationId } = req.params;
+/* MESSAGES SAAS */
+app.get(
+  "/chat/messages/:conversationId",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const { conversationId } = req.params;
 
-    const result = await pool.query(
-      `SELECT m.*, u.fullname AS sender_name, u.role AS sender_role, u.profile_image_url
-       FROM messages m
-       LEFT JOIN users u ON m.sender_id = u.id
-       WHERE m.conversation_id = $1
-       ORDER BY m.id ASC`,
-      [conversationId]
-    );
+      const companyId = req.user.company_id;
+      const isSuperAdmin = req.user.is_super_admin === true;
 
-    res.json(result.rows);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Erreur lecture messages" });
+      let query = `
+      SELECT 
+        m.*, 
+        u.fullname AS sender_name, 
+        u.role AS sender_role, 
+        u.profile_image_url
+      FROM messages m
+      LEFT JOIN users u ON m.sender_id = u.id
+      WHERE m.conversation_id = $1
+    `;
+
+      let values = [conversationId];
+
+      if (!isSuperAdmin) {
+        query += ` AND m.company_id = $2 `;
+        values.push(companyId);
+      }
+
+      query += ` ORDER BY m.id ASC`;
+
+      const result = await pool.query(query, values);
+
+      res.json(result.rows);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({
+        error: "Erreur lecture messages SaaS"
+      });
+    }
   }
-});
+);
 
-app.post("/chat/messages", async (req, res) => {
+app.post("/chat/messages", authenticateToken, async (req, res) => {
   try {
-    const { conversation_id, sender_id, receiver_id, content } = req.body;
+    const companyId = req.user.company_id;
+
+    const {
+      conversation_id,
+      sender_id,
+      receiver_id,
+      content,
+      message_type,
+      audio_url
+    } = req.body;
 
     const messageResult = await pool.query(
       `INSERT INTO messages
-       (conversation_id, sender_id, receiver_id, content)
-       VALUES ($1,$2,$3,$4)
+       (
+        conversation_id,
+        sender_id,
+        receiver_id,
+        content,
+        message_type,
+        audio_url,
+        company_id
+       )
+       VALUES ($1,$2,$3,$4,$5,$6,$7)
        RETURNING *`,
-      [conversation_id, sender_id, receiver_id || null, content]
+      [
+        conversation_id,
+        sender_id,
+        receiver_id || null,
+        content || "",
+        message_type || "text",
+        audio_url || "",
+        companyId
+      ]
     );
 
     const message = messageResult.rows[0];
@@ -1743,75 +2108,121 @@ app.post("/chat/messages", async (req, res) => {
     if (receiver_id) {
       await pool.query(
         `INSERT INTO notifications
-         (user_id, title, message, type)
-         VALUES ($1,$2,$3,$4)`,
+         (user_id, title, message, type, company_id)
+         VALUES ($1,$2,$3,$4,$5)`,
         [
           receiver_id,
           "Nouveau message",
-          "Vous avez reçu un nouveau message interne.",
-          "message"
+          message_type === "audio"
+            ? "Vous avez reçu un message vocal."
+            : "Vous avez reçu un nouveau message interne.",
+          "message",
+          companyId
         ]
       );
     }
 
     res.status(201).json(message);
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Erreur envoi message" });
+    console.error("ERREUR ENVOI MESSAGE :", error);
+    res.status(500).json({
+      error: "Erreur envoi message"
+    });
   }
 });
 
-app.put("/chat/messages/:id/read", async (req, res) => {
+app.put("/chat/messages/:id/read", authenticateToken, async (req, res) => {
   try {
-    const updated = await pool.query(
-      `UPDATE messages
-       SET is_read = true
-       WHERE id = $1
-       RETURNING *`,
-      [req.params.id]
-    );
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
+
+    let query = `
+      UPDATE messages
+      SET is_read = true
+      WHERE id = $1
+    `;
+
+    let values = [req.params.id];
+
+    if (!isSuperAdmin) {
+      query += ` AND company_id = $2 `;
+      values.push(companyId);
+    }
+
+    query += ` RETURNING *`;
+
+    const updated = await pool.query(query, values);
 
     res.json(updated.rows[0]);
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: "Erreur lecture message" });
+    res.status(500).json({
+      error: "Erreur lecture message"
+    });
   }
 });
 
-app.get("/notifications/:userId", async (req, res) => {
+app.get("/notifications/:userId", authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT *
-       FROM notifications
-       WHERE user_id = $1
-       ORDER BY id DESC`,
-      [req.params.userId]
-    );
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
+
+    let query = `
+      SELECT *
+      FROM notifications
+      WHERE user_id = $1
+    `;
+
+    let values = [req.params.userId];
+
+    if (!isSuperAdmin) {
+      query += ` AND company_id = $2 `;
+      values.push(companyId);
+    }
+
+    query += ` ORDER BY id DESC`;
+
+    const result = await pool.query(query, values);
 
     res.json(result.rows);
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: "Erreur lecture notifications" });
+    res.status(500).json({
+      error: "Erreur lecture notifications"
+    });
   }
 });
 
-app.put("/notifications/:id/read", async (req, res) => {
+app.put("/notifications/:id/read", authenticateToken, async (req, res) => {
   try {
-    const updated = await pool.query(
-      `UPDATE notifications
-       SET is_read = true
-       WHERE id = $1
-       RETURNING *`,
-      [req.params.id]
-    );
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
+
+    let query = `
+      UPDATE notifications
+      SET is_read = true
+      WHERE id = $1
+    `;
+
+    let values = [req.params.id];
+
+    if (!isSuperAdmin) {
+      query += ` AND company_id = $2 `;
+      values.push(companyId);
+    }
+
+    query += ` RETURNING *`;
+
+    const updated = await pool.query(query, values);
 
     res.json(updated.rows[0]);
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: "Erreur notification lue" });
+    res.status(500).json({
+      error: "Erreur notification lue"
+    });
   }
 });
-
 /* POINTAGE INTELLIGENT */
 app.get("/attendance/schedule-groups", async (req, res) => {
   try {
@@ -1826,6 +2237,96 @@ app.get("/attendance/schedule-groups", async (req, res) => {
   }
 });
 
+/* ATTENDANCE TODAY - AFFICHAGE POINTAGE */
+app.get("/attendance/today", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        u.id AS user_id,
+        u.fullname,
+        u.role,
+        u.badge_code,
+
+        s.schedule_group,
+        s.salary_type,
+        s.hourly_rate,
+        s.daily_salary AS setting_daily_salary,
+        s.monthly_salary,
+        s.start_time,
+        s.end_time,
+
+        ar.id AS attendance_id,
+        ar.work_date,
+        ar.check_in,
+        ar.break_out,
+        ar.break_in,
+        ar.check_out
+
+      FROM users u
+      LEFT JOIN attendance_settings s ON s.user_id = u.id
+      LEFT JOIN attendance_records ar
+        ON ar.user_id = u.id
+        AND ar.work_date = CURRENT_DATE
+      ORDER BY u.fullname ASC
+    `);
+
+    const records = result.rows.map((r) => {
+      let status = "Absent";
+      let late_minutes = 0;
+      let worked_hours = 0;
+      let calculated_salary = 0;
+
+      if (r.check_in && !r.check_out) status = "Présent";
+      if (r.break_out && !r.break_in) status = "En pause";
+      if (r.check_out) status = "Terminé";
+
+      if (r.check_in) {
+        const check = new Date(r.check_in);
+        const normal = new Date(r.check_in);
+        const [h, m] = String(r.start_time || "08:00").split(":");
+        normal.setHours(Number(h), Number(m), 0, 0);
+
+        if (check > normal) {
+          late_minutes = Math.round((check - normal) / 1000 / 60);
+        }
+      }
+
+      if (r.check_in && r.check_out) {
+        const start = new Date(r.check_in).getTime();
+        const end = new Date(r.check_out).getTime();
+        worked_hours = (end - start) / 1000 / 60 / 60;
+      }
+
+      if (r.salary_type === "horaire") {
+        calculated_salary = Math.round(
+          worked_hours * Number(r.hourly_rate || 0)
+        );
+      }
+
+      if (r.salary_type === "journalier" && r.check_in) {
+        calculated_salary = Number(r.setting_daily_salary || 0);
+      }
+
+      if (r.salary_type === "mensuel" && r.check_in) {
+        calculated_salary = Math.round(Number(r.monthly_salary || 0) / 26);
+      }
+
+      return {
+        ...r,
+        id: r.attendance_id || r.user_id,
+        status,
+        late_minutes,
+        worked_hours: worked_hours.toFixed(2),
+        calculated_salary
+      };
+    });
+
+    res.json(records);
+  } catch (error) {
+    console.error("ERREUR ATTENDANCE TODAY :", error);
+    res.status(500).json({ error: "Erreur récupération pointage" });
+  }
+});
 /* POINTAGES DU JOUR SAAS */
 app.get("/attendance/today", async (req, res) => {
   try {
@@ -2109,26 +2610,88 @@ app.put("/attendance/settings/users/:id", async (req, res) => {
       monthly_salary
     } = req.body;
 
-    const result = await pool.query(
+    const groupResult = await pool.query(
+      "SELECT * FROM schedule_groups WHERE id=$1 LIMIT 1",
+      [schedule_group_id || null]
+    );
+
+    const group = groupResult.rows[0] || null;
+
+    await pool.query(
       `UPDATE users
        SET schedule_group_id=$1,
-           salary_type=$2,
+           payment_type=$2,
            hourly_rate=$3,
-           daily_rate=$4,
-           monthly_salary=$5
-       WHERE id=$6
-       RETURNING id, fullname, email, role, schedule_group_id, salary_type, hourly_rate, daily_rate, monthly_salary`,
+           daily_rate=$4
+       WHERE id=$5`,
       [
         schedule_group_id || null,
         salary_type || "horaire",
         Number(hourly_rate || 0),
         Number(daily_rate || 0),
-        Number(monthly_salary || 0),
         id
       ]
     );
 
-    res.json(result.rows[0]);
+    const settingsResult = await pool.query(
+      `INSERT INTO attendance_settings
+       (
+         user_id,
+         schedule_group,
+         salary_type,
+         hourly_rate,
+         daily_salary,
+         monthly_salary,
+         start_time,
+         end_time
+       )
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       ON CONFLICT (user_id)
+       DO UPDATE SET
+         schedule_group=EXCLUDED.schedule_group,
+         salary_type=EXCLUDED.salary_type,
+         hourly_rate=EXCLUDED.hourly_rate,
+         daily_salary=EXCLUDED.daily_salary,
+         monthly_salary=EXCLUDED.monthly_salary,
+         start_time=EXCLUDED.start_time,
+         end_time=EXCLUDED.end_time
+       RETURNING *`,
+      [
+        id,
+        group?.name || "Standard",
+        salary_type || "horaire",
+        Number(hourly_rate || 0),
+        Number(daily_rate || 0),
+        Number(monthly_salary || 0),
+        group?.start_time || "08:00",
+        group?.end_time || "17:00"
+      ]
+    );
+
+    const userResult = await pool.query(
+      `SELECT
+         u.id,
+         u.fullname,
+         u.email,
+         u.role,
+         u.schedule_group_id,
+         s.schedule_group,
+         s.salary_type,
+         s.hourly_rate,
+         s.daily_salary AS daily_rate,
+         s.monthly_salary,
+         s.start_time,
+         s.end_time
+       FROM users u
+       LEFT JOIN attendance_settings s ON s.user_id = u.id
+       WHERE u.id=$1`,
+      [id]
+    );
+
+    res.json({
+      ...userResult.rows[0],
+      attendance_settings: settingsResult.rows[0]
+    });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Erreur paramètres utilisateur pointage" });
@@ -2369,6 +2932,113 @@ app.post("/ai/chat", async (req, res) => {
   }
 });
 
+/* PAIEMENT MANUEL SAAS */
+app.post("/payments/manual", async (req, res) => {
+  try {
+    const {
+      company_id,
+      subscription_id,
+      amount,
+      payment_method,
+      payment_reference,
+      notes
+    } = req.body;
+
+    const result = await pool.query(
+      `INSERT INTO payments
+      (
+        company_id,
+        subscription_id,
+        amount,
+        currency,
+        payment_method,
+        payment_reference,
+        status,
+        notes,
+        paid_at
+      )
+      VALUES ($1,$2,$3,'FCFA',$4,$5,'paid',$6,CURRENT_TIMESTAMP)
+      RETURNING *`,
+      [
+        company_id,
+        subscription_id || null,
+        Number(amount || 0),
+        payment_method,
+        payment_reference || "",
+        notes || ""
+      ]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      error: "Erreur enregistrement paiement manuel"
+    });
+  }
+});
+
+/* RENOUVELLEMENT ABONNEMENT */
+app.post("/subscriptions/renew", async (req, res) => {
+  try {
+    const { subscription_id, months } = req.body;
+
+    const subscriptionResult = await pool.query(
+      `SELECT * FROM subscriptions
+       WHERE id = $1`,
+      [subscription_id]
+    );
+
+    if (subscriptionResult.rows.length === 0) {
+      return res.status(404).json({
+        error: "Abonnement introuvable"
+      });
+    }
+
+    await pool.query(
+      `UPDATE subscriptions
+       SET
+         status = 'active',
+         end_date = COALESCE(end_date, CURRENT_DATE)
+         + ($1 || ' month')::INTERVAL
+       WHERE id = $2`,
+      [Number(months || 1), subscription_id]
+    );
+
+    res.json({
+      message: "Abonnement renouvelé avec succès"
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      error: "Erreur renouvellement abonnement"
+    });
+  }
+});
+
+/* UPLOAD AUDIO CHAT */
+app.post("/chat/upload-audio", upload.single("audio"), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({
+        error: "Aucun fichier audio reçu"
+      });
+    }
+
+    const audioUrl = `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`;
+
+    res.json({
+      message: "Audio uploadé avec succès",
+      audio_url: audioUrl
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      error: "Erreur upload audio"
+    });
+  }
+});
+
 /* SUPER ADMIN SAAS */
 app.get("/super-admin/overview", async (req, res) => {
   try {
@@ -2505,6 +3175,393 @@ app.get("/super-admin/plans", async (req, res) => {
   }
 });
 
+/* PARTENAIRES SAAS : CLIENTS / FOURNISSEURS */
+app.get("/partners", authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
+
+    let query = `SELECT * FROM partners`;
+    const values = [];
+
+    if (!isSuperAdmin) {
+      query += ` WHERE company_id = $1`;
+      values.push(companyId);
+    }
+
+    query += ` ORDER BY id DESC`;
+
+    const result = await pool.query(query, values);
+    res.json(result.rows);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erreur lecture partenaires" });
+  }
+});
+
+app.post("/partners", authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.company_id;
+
+    const {
+      type,
+      name,
+      phone,
+      email,
+      address,
+      city,
+      country,
+      contact_person,
+      nif,
+      rccm,
+      notes,
+      status
+    } = req.body;
+
+    const result = await pool.query(
+      `INSERT INTO partners
+      (
+        company_id, type, name, phone, email, address, city, country,
+        contact_person, nif, rccm, notes, status
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+      RETURNING *`,
+      [
+        companyId,
+        type,
+        name,
+        phone || "",
+        email || "",
+        address || "",
+        city || "",
+        country || "",
+        contact_person || "",
+        nif || "",
+        rccm || "",
+        notes || "",
+        status || "active"
+      ]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erreur ajout partenaire" });
+  }
+});
+
+app.put("/partners/:id", authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
+
+    const {
+      type,
+      name,
+      phone,
+      email,
+      address,
+      city,
+      country,
+      contact_person,
+      nif,
+      rccm,
+      notes,
+      status
+    } = req.body;
+
+    let query = `
+      UPDATE partners
+      SET type=$1, name=$2, phone=$3, email=$4, address=$5,
+          city=$6, country=$7, contact_person=$8, nif=$9,
+          rccm=$10, notes=$11, status=$12
+      WHERE id=$13
+    `;
+
+    const values = [
+      type,
+      name,
+      phone || "",
+      email || "",
+      address || "",
+      city || "",
+      country || "",
+      contact_person || "",
+      nif || "",
+      rccm || "",
+      notes || "",
+      status || "active",
+      req.params.id
+    ];
+
+    if (!isSuperAdmin) {
+      query += ` AND company_id=$14`;
+      values.push(companyId);
+    }
+
+    query += ` RETURNING *`;
+
+    const result = await pool.query(query, values);
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erreur modification partenaire" });
+  }
+});
+
+app.delete("/partners/:id", authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
+
+    let query = `DELETE FROM partners WHERE id=$1`;
+    const values = [req.params.id];
+
+    if (!isSuperAdmin) {
+      query += ` AND company_id=$2`;
+      values.push(companyId);
+    }
+
+    query += ` RETURNING *`;
+
+    const result = await pool.query(query, values);
+
+    res.json({
+      message: "Partenaire supprimé",
+      partner: result.rows[0]
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erreur suppression partenaire" });
+  }
+});
+
+/* PLANS PUBLICS POUR INSCRIPTION */
+app.get("/public/plans", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        id,
+        name,
+        price_monthly,
+        max_users,
+        max_warehouses,
+        max_products,
+        max_movements_monthly,
+        trial_days,
+        modules,
+        can_use_reports,
+        can_use_qr,
+        can_use_advanced_inventory,
+        can_use_documents,
+        can_use_chat,
+        can_use_ai
+      FROM subscription_plans
+      ORDER BY price_monthly ASC
+    `);
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR PLANS PUBLICS :", error);
+    res.status(500).json({ error: "Erreur récupération plans" });
+  }
+});
+
+/* CREER PAIEMENT ABONNEMENT - VERSION PREPAREE */
+app.post(
+  "/payments/create-subscription-payment",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const companyId = req.user.company_id;
+      const { plan_id, payment_method } = req.body;
+
+      const planResult = await pool.query(
+        `SELECT * FROM subscription_plans WHERE id = $1`,
+        [plan_id]
+      );
+
+      if (planResult.rows.length === 0) {
+        return res.status(404).json({ error: "Plan introuvable" });
+      }
+
+      const plan = planResult.rows[0];
+
+      const reference = `TRIANGLE-${companyId}-${Date.now()}`;
+
+      await pool.query(
+        `INSERT INTO subscriptions
+       (company_id, plan_id, payment_provider, payment_status, payment_reference)
+       VALUES ($1,$2,$3,$4,$5)`,
+        [companyId, plan.id, payment_method || "manual", "pending", reference]
+      );
+
+      res.json({
+        success: true,
+        message: "Paiement préparé",
+        provider: payment_method,
+        reference,
+        amount: plan.price_monthly,
+        currency: "XOF",
+        checkout_url: null
+      });
+    } catch (error) {
+      console.error("ERREUR CREATION PAIEMENT :", error);
+      res.status(500).json({ error: "Erreur création paiement" });
+    }
+  }
+);
+
+/* GESTION PLANS SAAS */
+app.put("/super-admin/plans/:id", async (req, res) => {
+  try {
+    const {
+      name,
+      price_monthly,
+      max_users,
+      max_warehouses,
+      max_products,
+      max_movements_monthly,
+      trial_days,
+      modules,
+      can_use_reports,
+      can_use_qr,
+      can_use_advanced_inventory,
+      can_use_documents,
+      can_use_chat,
+      can_use_ai
+    } = req.body;
+
+    const result = await pool.query(
+      `UPDATE subscription_plans
+       SET
+        name=$1,
+        price_monthly=$2,
+        max_users=$3,
+        max_warehouses=$4,
+        max_products=$5,
+        max_movements_monthly=$6,
+        trial_days=$7,
+        modules=$8,
+        can_use_reports=$9,
+        can_use_qr=$10,
+        can_use_advanced_inventory=$11,
+        can_use_documents=$12,
+        can_use_chat=$13,
+        can_use_ai=$14
+       WHERE id=$15
+       RETURNING *`,
+      [
+        name,
+        Number(price_monthly || 0),
+        Number(max_users || 0),
+        Number(max_warehouses || 0),
+        Number(max_products || 0),
+        Number(max_movements_monthly || 0),
+        Number(trial_days || 15),
+        modules || "",
+        can_use_reports === true,
+        can_use_qr === true,
+        can_use_advanced_inventory === true,
+        can_use_documents === true,
+        can_use_chat === true,
+        can_use_ai === true,
+        req.params.id
+      ]
+    );
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      error: "Erreur modification plan SaaS"
+    });
+  }
+});
+
+/* SUPER ADMIN - GESTION UTILISATEURS */
+app.get("/super-admin/users", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT 
+        u.id,
+        u.fullname,
+        u.email,
+        u.phone,
+        u.role,
+        u.is_active,
+        u.is_super_admin,
+        u.company_id,
+        c.name AS company_name,
+        u.created_at
+      FROM users u
+      LEFT JOIN companies c ON u.company_id = c.id
+      ORDER BY u.id DESC
+    `);
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erreur lecture utilisateurs super admin" });
+  }
+});
+
+app.put("/super-admin/users/:id", async (req, res) => {
+  try {
+    const { fullname, email, phone, role, is_active, is_super_admin } =
+      req.body;
+
+    const result = await pool.query(
+      `UPDATE users
+       SET fullname=$1,
+           email=$2,
+           phone=$3,
+           role=$4,
+           is_active=$5,
+           is_super_admin=$6
+       WHERE id=$7
+       RETURNING id, fullname, email, phone, role, is_active, is_super_admin`,
+      [
+        fullname,
+        email,
+        phone || "",
+        role || "magasinier",
+        is_active !== false,
+        is_super_admin === true,
+        req.params.id
+      ]
+    );
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erreur modification utilisateur" });
+  }
+});
+
+app.put("/super-admin/users/:id/password", async (req, res) => {
+  try {
+    const { password } = req.body;
+
+    const result = await pool.query(
+      `UPDATE users
+       SET password=$1
+       WHERE id=$2
+       RETURNING id, fullname, email`,
+      [password, req.params.id]
+    );
+
+    res.json({
+      message: "Mot de passe modifié",
+      user: result.rows[0]
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erreur changement mot de passe" });
+  }
+});
+
 /* DASHBOARD STATS */
 app.get("/dashboard-stats", async (req, res) => {
   try {
@@ -2558,6 +3615,742 @@ app.get("/dashboard-stats", async (req, res) => {
   }
 });
 
+/* ATTENDANCE TODAY - AFFICHAGE CORRIGÉ */
+app.get("/attendance/today", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        u.id AS user_id,
+        u.fullname,
+        u.role,
+        u.badge_code,
+
+        s.schedule_group,
+        s.salary_type,
+        s.hourly_rate,
+        s.daily_salary AS setting_daily_salary,
+        s.monthly_salary,
+        s.start_time,
+        s.end_time,
+
+        ar.id AS attendance_id,
+        ar.work_date,
+        ar.check_in,
+        ar.break_out,
+        ar.break_in,
+        ar.check_out
+
+      FROM users u
+
+      LEFT JOIN attendance_settings s
+      ON s.user_id = u.id
+
+      LEFT JOIN attendance_records ar
+      ON ar.user_id = u.id
+      AND ar.work_date = CURRENT_DATE
+
+      ORDER BY u.fullname ASC
+    `);
+
+    const records = result.rows.map((r) => {
+      let computedStatus = "Absent";
+
+      let late_minutes = 0;
+
+      let worked_hours = 0;
+
+      let calculated_salary = 0;
+
+      if (r.check_in && !r.break_out && !r.check_out) {
+        computedStatus = "Présent";
+      }
+
+      if (r.break_out && !r.break_in && !r.check_out) {
+        computedStatus = "En pause";
+      }
+
+      if (r.check_out) {
+        computedStatus = "Terminé";
+      }
+
+      if (r.check_in) {
+        const check = new Date(r.check_in);
+
+        const normal = new Date(r.check_in);
+
+        const [h, m] = String(r.start_time || "08:00").split(":");
+
+        normal.setHours(Number(h), Number(m), 0, 0);
+
+        if (check > normal) {
+          late_minutes = Math.round((check - normal) / 1000 / 60);
+        }
+      }
+
+      if (r.check_in && r.check_out) {
+        const start = new Date(r.check_in).getTime();
+
+        const end = new Date(r.check_out).getTime();
+
+        worked_hours = (end - start) / 1000 / 60 / 60;
+      }
+
+      if (r.salary_type === "horaire") {
+        calculated_salary = Math.round(
+          worked_hours * Number(r.hourly_rate || 0)
+        );
+      }
+
+      if (r.salary_type === "journalier" && r.check_in) {
+        calculated_salary = Number(r.setting_daily_salary || 0);
+      }
+
+      if (r.salary_type === "mensuel" && r.check_in) {
+        calculated_salary = Math.round(Number(r.monthly_salary || 0) / 26);
+      }
+
+      return {
+        ...r,
+
+        status: computedStatus,
+
+        id: r.attendance_id || r.user_id,
+
+        late_minutes,
+
+        worked_hours: worked_hours.toFixed(2),
+
+        calculated_salary
+      };
+    });
+
+    res.json(records);
+  } catch (error) {
+    console.error("ERREUR ATTENDANCE TODAY :", error);
+
+    res.status(500).json({
+      error: "Erreur récupération pointage"
+    });
+  }
+});
+
+/* DELETE COMPANY */
+app.delete("/super-admin/companies/:id", async (req, res) => {
+  try {
+    const companyId = req.params.id;
+
+    await pool.query(
+      `
+        DELETE FROM attendance_records
+        WHERE user_id IN (
+          SELECT id
+          FROM users
+          WHERE company_id = $1
+        )
+        `,
+      [companyId]
+    );
+
+    await pool.query(
+      `
+        DELETE FROM users
+        WHERE company_id = $1
+        `,
+      [companyId]
+    );
+
+    await pool.query(
+      `
+        DELETE FROM subscriptions
+        WHERE company_id = $1
+        `,
+      [companyId]
+    );
+
+    await pool.query(
+      `
+        DELETE FROM companies
+        WHERE id = $1
+        `,
+      [companyId]
+    );
+
+    res.json({
+      success: true,
+      message: "Entreprise supprimée"
+    });
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      error: "Erreur suppression entreprise"
+    });
+  }
+});
+
+/* DELETE USER */
+app.delete("/super-admin/users/:id", async (req, res) => {
+  try {
+    const userId = req.params.id;
+
+    await pool.query(
+      `
+        DELETE FROM attendance_records
+        WHERE user_id = $1
+        `,
+      [userId]
+    );
+
+    await pool.query(
+      `
+        DELETE FROM users
+        WHERE id = $1
+        `,
+      [userId]
+    );
+
+    res.json({
+      success: true,
+      message: "Utilisateur supprimé"
+    });
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      error: "Erreur suppression utilisateur"
+    });
+  }
+});
+
+/* DELETE PLAN */
+app.delete("/super-admin/plans/:id", async (req, res) => {
+  try {
+    await pool.query(
+      `
+        DELETE FROM subscription_plans
+        WHERE id = $1
+        `,
+      [req.params.id]
+    );
+
+    res.json({
+      success: true,
+      message: "Plan supprimé"
+    });
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      error: "Erreur suppression plan"
+    });
+  }
+});
+
+/* SUPER ADMIN - GET COMPANIES */
+app.get("/super-admin/companies", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT *
+      FROM companies
+      ORDER BY id DESC
+    `);
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      error: "Erreur récupération entreprises"
+    });
+  }
+});
+
+/* SUPER ADMIN - GET USERS */
+app.get("/super-admin/users", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT *
+      FROM users
+      ORDER BY id DESC
+    `);
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      error: "Erreur récupération utilisateurs"
+    });
+  }
+});
+
+/* SUPER ADMIN - GET PLANS */
+app.get("/super-admin/plans", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT *
+      FROM subscription_plans
+      ORDER BY id DESC
+    `);
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      error: "Erreur récupération plans"
+    });
+  }
+});
+
+/* SUPER ADMIN - CREATE PLAN */
+app.post("/super-admin/plans", async (req, res) => {
+  try {
+    const {
+      name,
+      price_monthly,
+      max_users,
+      max_warehouses,
+      max_products,
+      trial_days
+    } = req.body;
+
+    const result = await pool.query(
+      `
+      INSERT INTO subscription_plans
+      (
+        name,
+        price_monthly,
+        max_users,
+        max_warehouses,
+        max_products,
+        trial_days
+      )
+      VALUES ($1,$2,$3,$4,$5,$6)
+      RETURNING *
+      `,
+      [name, price_monthly, max_users, max_warehouses, max_products, trial_days]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      error: "Erreur création plan"
+    });
+  }
+});
+
+/* SUPER ADMIN - UPDATE PLAN */
+app.put("/super-admin/plans/:id", async (req, res) => {
+  try {
+    const {
+      name,
+      price_monthly,
+      max_users,
+      max_warehouses,
+      max_products,
+      max_movements_monthly,
+      trial_days,
+      modules,
+      can_use_reports,
+      can_use_qr,
+      can_use_advanced_inventory,
+      can_use_documents,
+      can_use_chat,
+      can_use_ai
+    } = req.body;
+
+    const result = await pool.query(
+      `
+      UPDATE subscription_plans
+      SET
+        name = $1,
+        price_monthly = $2,
+        max_users = $3,
+        max_warehouses = $4,
+        max_products = $5,
+        max_movements_monthly = $6,
+        trial_days = $7,
+        modules = $8,
+        can_use_reports = $9,
+        can_use_qr = $10,
+        can_use_advanced_inventory = $11,
+        can_use_documents = $12,
+        can_use_chat = $13,
+        can_use_ai = $14
+      WHERE id = $15
+      RETURNING *
+      `,
+      [
+        name,
+        Number(price_monthly || 0),
+        Number(max_users || 0),
+        Number(max_warehouses || 0),
+        Number(max_products || 0),
+        Number(max_movements_monthly || 0),
+        Number(trial_days || 15),
+        modules || "",
+        can_use_reports === true,
+        can_use_qr === true,
+        can_use_advanced_inventory === true,
+        can_use_documents === true,
+        can_use_chat === true,
+        can_use_ai === true,
+        req.params.id
+      ]
+    );
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("ERREUR MODIFICATION PLAN :", error);
+    res.status(500).json({
+      error: "Erreur modification plan"
+    });
+  }
+});
+
+/* SUPER ADMIN - UPDATE COMPANY STATUS */
+app.put("/super-admin/companies/:id/status", async (req, res) => {
+  try {
+    const companyId = req.params.id;
+
+    const { status } = req.body;
+
+    const result = await pool.query(
+      `
+        UPDATE companies
+        SET subscription_status = $1
+        WHERE id = $2
+        RETURNING *
+        `,
+      [status, companyId]
+    );
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      error: "Erreur changement statut"
+    });
+  }
+});
+
+/* SUPER ADMIN - FREE ACCESS */
+app.put("/super-admin/subscriptions/:companyId/free", async (req, res) => {
+  try {
+    const companyId = req.params.companyId;
+
+    await pool.query(
+      `
+        UPDATE companies
+        SET
+          subscription_status = 'active',
+          trial_ends_at = NOW() + interval '30 days'
+        WHERE id = $1
+        `,
+      [companyId]
+    );
+
+    res.json({
+      success: true,
+      message: "Accès gratuit accordé"
+    });
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      error: "Erreur accès gratuit"
+    });
+  }
+});
+
+/* SUPER ADMIN - RENEW SUBSCRIPTION */
+app.put("/super-admin/subscriptions/:companyId/renew", async (req, res) => {
+  try {
+    const companyId = req.params.companyId;
+
+    const months = Number(req.body.months || 1);
+
+    await pool.query(
+      `
+        UPDATE companies
+        SET
+          subscription_status = 'active',
+          trial_ends_at =
+            COALESCE(
+              trial_ends_at,
+              NOW()
+            ) + ($1 || ' month')::interval
+        WHERE id = $2
+        `,
+      [months, companyId]
+    );
+
+    res.json({
+      success: true,
+      message: "Abonnement renouvelé"
+    });
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      error: "Erreur renouvellement"
+    });
+  }
+});
+
+/* CINETPAY PAYMENT */
+
+const axios = require("axios");
+
+app.post("/payments/create", async (req, res) => {
+  try {
+    const {
+      company_id,
+      plan_id,
+      amount,
+      customer_name,
+      customer_email,
+      customer_phone
+    } = req.body;
+
+    const transaction_id = "TRX-" + Date.now();
+
+    const response = await axios.post(
+      "https://api-checkout.cinetpay.com/v2/payment",
+      {
+        apikey: process.env.CINETPAY_API_KEY,
+
+        site_id: process.env.CINETPAY_SITE_ID,
+
+        transaction_id,
+
+        amount,
+
+        currency: "XOF",
+
+        description: "Abonnement Triangle WMS Pro",
+
+        customer_name,
+
+        customer_email,
+
+        customer_phone_number: customer_phone,
+
+        notify_url: "http://localhost:5050/payments/notify",
+
+        return_url: "http://localhost:3000/payment-success",
+
+        channels: "ALL"
+      }
+    );
+
+    res.json(response.data);
+  } catch (error) {
+    console.error("PAYMENT ERROR :", error.response?.data || error);
+
+    res.status(500).json({
+      error: "Erreur paiement"
+    });
+  }
+});
+
+/* ATTENDANCE QR SCAN */
+app.post("/attendance/scan", async (req, res) => {
+  try {
+    const { badge_code, action_type } = req.body;
+
+    if (!badge_code) {
+      return res.status(400).json({
+        error: "Badge QR manquant"
+      });
+    }
+
+    const userResult = await pool.query(
+      `
+      SELECT *
+      FROM users
+      WHERE badge_code = $1
+      LIMIT 1
+      `,
+      [badge_code]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({
+        error: "Employé introuvable"
+      });
+    }
+
+    const user = userResult.rows[0];
+
+    await pool.query(
+      `
+      INSERT INTO attendance_settings
+      (
+        user_id,
+        schedule_group,
+        salary_type,
+        hourly_rate,
+        daily_salary,
+        monthly_salary,
+        start_time,
+        end_time
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+      ON CONFLICT (user_id)
+      DO NOTHING
+      `,
+      [user.id, "Standard", "horaire", 1000, 8000, 200000, "08:00", "17:00"]
+    );
+
+    const existing = await pool.query(
+      `
+        SELECT *
+        FROM attendance_records
+        WHERE user_id = $1
+        AND work_date = CURRENT_DATE
+        LIMIT 1
+        `,
+      [user.id]
+    );
+
+    let result;
+    let action = "";
+
+    if (action_type === "checkin") {
+      if (existing.rows.length === 0) {
+        result = await pool.query(
+          `
+          INSERT INTO attendance_records
+          (
+            user_id,
+            work_date,
+            check_in,
+            status
+          )
+          VALUES
+          (
+            $1,
+            CURRENT_DATE,
+            NOW(),
+            'Présent'
+          )
+          RETURNING *
+          `,
+          [user.id]
+        );
+      } else {
+        result = await pool.query(
+          `
+          UPDATE attendance_records
+          SET status = CASE
+              WHEN check_out IS NOT NULL THEN 'Terminé'
+              WHEN break_out IS NOT NULL AND break_in IS NULL THEN 'En pause'
+              ELSE 'Présent'
+            END,
+            updated_at = CURRENT_TIMESTAMP
+          WHERE user_id = $1
+          AND work_date = CURRENT_DATE
+          RETURNING *
+          `,
+          [user.id]
+        );
+      }
+
+      action = "Début travail";
+    } else if (action_type === "pause_start") {
+      if (existing.rows.length === 0 || !existing.rows[0].check_in) {
+        return res.status(400).json({ error: "Début travail non pointé" });
+      }
+
+      if (existing.rows[0].break_out) {
+        return res.status(400).json({ error: "Début pause déjà pointé" });
+      }
+
+      result = await pool.query(
+        `
+        UPDATE attendance_records
+        SET break_out = NOW(),
+            status = 'En pause',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE user_id = $1
+        AND work_date = CURRENT_DATE
+        RETURNING *
+        `,
+        [user.id]
+      );
+
+      action = "Début pause";
+    } else if (action_type === "pause_end") {
+      if (existing.rows.length === 0 || !existing.rows[0].break_out) {
+        return res.status(400).json({ error: "Début pause non pointé" });
+      }
+
+      if (existing.rows[0].break_in) {
+        return res.status(400).json({ error: "Fin pause déjà pointée" });
+      }
+
+      result = await pool.query(
+        `
+        UPDATE attendance_records
+        SET break_in = NOW(),
+            status = 'Présent',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE user_id = $1
+        AND work_date = CURRENT_DATE
+        RETURNING *
+        `,
+        [user.id]
+      );
+
+      action = "Fin pause";
+    } else if (action_type === "checkout") {
+      if (existing.rows.length === 0 || !existing.rows[0].check_in) {
+        return res.status(400).json({ error: "Début travail non pointé" });
+      }
+
+      if (existing.rows[0].check_out) {
+        return res.status(400).json({ error: "Fin travail déjà pointée" });
+      }
+
+      result = await pool.query(
+        `
+        UPDATE attendance_records
+        SET check_out = NOW(),
+            status = 'Terminé',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE user_id = $1
+        AND work_date = CURRENT_DATE
+        RETURNING *
+        `,
+        [user.id]
+      );
+
+      action = "Fin travail";
+    } else {
+      return res.status(400).json({
+        error: "Action invalide"
+      });
+    }
+
+    res.json({
+      success: true,
+      user,
+      attendance: result.rows[0],
+      action
+    });
+  } catch (error) {
+    console.error("ERREUR ATTENDANCE SCAN :", error);
+
+    res.status(500).json({
+      error: "Erreur scan QR"
+    });
+  }
+});
 app.listen(5050, () => {
   console.log("Backend sécurisé démarré sur le port 5050");
 });
