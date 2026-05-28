@@ -145,6 +145,74 @@ async function logActivity(user_name, user_role, action, module, details) {
   }
 }
 
+async function ensureDefaultSubscriptionPlans() {
+  const defaultPlans = [
+    {
+      name: "Starter",
+      price_monthly: 5000,
+      max_users: 3,
+      max_warehouses: 1,
+      max_products: 200,
+      max_movements_monthly: 500,
+      trial_days: 15
+    },
+    {
+      name: "Standard",
+      price_monthly: 10000,
+      max_users: 10,
+      max_warehouses: 3,
+      max_products: 1000,
+      max_movements_monthly: 3000,
+      trial_days: 15
+    },
+    {
+      name: "Premium",
+      price_monthly: 15000,
+      max_users: 0,
+      max_warehouses: 0,
+      max_products: 0,
+      max_movements_monthly: 0,
+      trial_days: 15
+    }
+  ];
+
+  for (const plan of defaultPlans) {
+    await pool.query(
+      `INSERT INTO subscription_plans
+       (
+         name,
+         price_monthly,
+         max_users,
+         max_warehouses,
+         max_products,
+         max_movements_monthly,
+         trial_days,
+         modules,
+         can_use_reports,
+         can_use_qr,
+         can_use_advanced_inventory,
+         can_use_documents,
+         can_use_chat,
+         can_use_ai
+       )
+       SELECT $1,$2,$3,$4,$5,$6,$7,$8,true,true,true,true,true,true
+       WHERE NOT EXISTS (
+         SELECT 1 FROM subscription_plans WHERE name=$1
+       )`,
+      [
+        plan.name,
+        plan.price_monthly,
+        plan.max_users,
+        plan.max_warehouses,
+        plan.max_products,
+        plan.max_movements_monthly,
+        plan.trial_days,
+        "all"
+      ]
+    );
+  }
+}
+
 app.get("/", (req, res) => {
   res.send("Triangle WMS Backend sécurisé OK");
 });
@@ -3344,6 +3412,8 @@ app.delete("/partners/:id", authenticateToken, async (req, res) => {
 /* PLANS PUBLICS POUR INSCRIPTION */
 app.get("/public/plans", async (req, res) => {
   try {
+    await ensureDefaultSubscriptionPlans();
+
     const result = await pool.query(`
       SELECT
         id,
@@ -3362,6 +3432,7 @@ app.get("/public/plans", async (req, res) => {
         can_use_chat,
         can_use_ai
       FROM subscription_plans
+      WHERE name IN ('Starter', 'Standard', 'Premium')
       ORDER BY price_monthly ASC
     `);
 
