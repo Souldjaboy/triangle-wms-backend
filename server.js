@@ -32,13 +32,17 @@ const storage = multer.diskStorage({
 
 const upload = multer({ storage });
 
-const pool = new Pool({
-  user: "souleymanediallo",
-  host: "localhost",
-  database: "triangle_wms_db",
-  password: "",
-  port: 5432
-});
+const pool = process.env.DATABASE_URL
+  ? new Pool({
+      connectionString: process.env.DATABASE_URL
+    })
+  : new Pool({
+      user: "souleymanediallo",
+      host: "localhost",
+      database: "triangle_wms_db",
+      password: "",
+      port: 5432
+    });
 
 const JWT_SECRET = "triangle_wms_secret_key";
 
