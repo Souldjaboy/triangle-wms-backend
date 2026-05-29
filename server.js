@@ -775,6 +775,124 @@ app.post(
   }
 );
 
+app.put(
+  "/users/:id",
+  authenticateToken,
+  authorizeRoles("admin", "super_admin"),
+  async (req, res) => {
+    try {
+      const companyId = req.user.company_id;
+      const isSuperAdmin = req.user.is_super_admin === true;
+      const { id } = req.params;
+      const { fullname, email, password, role, phone, is_active } = req.body;
+
+      const values = [
+        fullname,
+        email,
+        role || "magasinier",
+        phone || "",
+        is_active !== false,
+      ];
+
+      let query = `
+        UPDATE users
+        SET fullname=$1,
+            email=$2,
+            role=$3,
+            phone=$4,
+            is_active=$5
+      `;
+
+      if (password && String(password).trim() !== "") {
+        values.push(password);
+        query += `, password=$${values.length}`;
+      }
+
+      values.push(id);
+      query += ` WHERE id=$${values.length}`;
+
+      if (!isSuperAdmin) {
+        values.push(companyId);
+        query += ` AND company_id=$${values.length}`;
+      }
+
+      query += ` RETURNING id, fullname, email, role, phone, is_active, badge_code, profile_image_url, company_id`;
+
+      const result = await pool.query(query, values);
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({ error: "Utilisateur introuvable" });
+      }
+
+      res.json(result.rows[0]);
+    } catch (error) {
+      console.error("ERREUR UPDATE USER :", error);
+      res.status(500).json({
+        error: error.message || "Erreur modification utilisateur"
+      });
+    }
+  }
+);
+
+app.delete(
+  "/users/:id",
+  authenticateToken,
+  authorizeRoles("admin", "super_admin"),
+  async (req, res) => {
+    try {
+      const companyId = req.user.company_id;
+      const isSuperAdmin = req.user.is_super_admin === true;
+      const { id } = req.params;
+
+      if (Number(req.user.id) === Number(id)) {
+        return res.status(400).json({
+          error: "Vous ne pouvez pas supprimer votre propre compte."
+        });
+      }
+
+      const values = [id];
+      let filter = "WHERE id=$1";
+
+      if (!isSuperAdmin) {
+        values.push(companyId);
+        filter += " AND company_id=$2";
+      }
+
+      await pool.query(
+        `DELETE FROM attendance_settings WHERE user_id=$1`,
+        [id]
+      );
+      await pool.query(
+        `DELETE FROM attendance_records WHERE user_id=$1`,
+        [id]
+      );
+      await pool.query(
+        `DELETE FROM attendance_history WHERE user_id=$1`,
+        [id]
+      );
+
+      const result = await pool.query(
+        `DELETE FROM users ${filter} RETURNING id, fullname, email`,
+        values
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({ error: "Utilisateur introuvable" });
+      }
+
+      res.json({
+        message: "Utilisateur supprimé",
+        user: result.rows[0]
+      });
+    } catch (error) {
+      console.error("ERREUR DELETE USER :", error);
+      res.status(500).json({
+        error: error.message || "Erreur suppression utilisateur"
+      });
+    }
+  }
+);
+
 /* PRODUITS SAAS */
 app.get("/products", authenticateToken, async (req, res) => {
   try {
