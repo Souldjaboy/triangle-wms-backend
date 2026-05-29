@@ -335,24 +335,59 @@ app.post("/register-saas", async (req, res) => {
       phone,
       address,
       password,
-      plan_id
+      plan_id,
+      plan_name,
+      plan_price
     } = req.body;
 
-    if (!company_name || !responsible_name || !email || !password || !plan_id) {
+    if (!company_name || !responsible_name || !email || !password) {
       return res.status(400).json({
         error: "Informations obligatoires manquantes."
       });
     }
 
-    const planResult = await pool.query(
-      `
-      SELECT *
-      FROM subscription_plans
-      WHERE id = $1
-      LIMIT 1
-      `,
-      [plan_id]
-    );
+    await ensureDefaultSubscriptionPlans();
+
+    let planResult;
+
+    if (Number.isInteger(Number(plan_id))) {
+      planResult = await pool.query(
+        `
+        SELECT *
+        FROM subscription_plans
+        WHERE id = $1
+        LIMIT 1
+        `,
+        [Number(plan_id)]
+      );
+    } else {
+      planResult = { rows: [] };
+    }
+
+    if (planResult.rows.length === 0 && plan_name) {
+      planResult = await pool.query(
+        `
+        SELECT *
+        FROM subscription_plans
+        WHERE LOWER(name) = LOWER($1)
+        LIMIT 1
+        `,
+        [plan_name]
+      );
+    }
+
+    if (planResult.rows.length === 0 && plan_price) {
+      planResult = await pool.query(
+        `
+        SELECT *
+        FROM subscription_plans
+        WHERE price_monthly = $1
+        ORDER BY id ASC
+        LIMIT 1
+        `,
+        [Number(plan_price)]
+      );
+    }
 
     if (planResult.rows.length === 0) {
       return res.status(404).json({
