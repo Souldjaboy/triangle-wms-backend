@@ -53,6 +53,9 @@ const pool = process.env.DATABASE_URL
     });
 
 const JWT_SECRET = "triangle_wms_secret_key";
+const SUPER_ADMIN_EMAILS = new Set([
+  "diallogcif@gmail.com"
+]);
 
 function getCompanyFilter(req) {
   const companyId = req.headers["x-company-id"];
@@ -541,6 +544,7 @@ app.post("/register-saas", async (req, res) => {
 app.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body;
+    const normalizedEmail = String(email || "").trim().toLowerCase();
 
     const result = await pool.query(
       `SELECT 
@@ -572,7 +576,15 @@ app.post("/login", async (req, res) => {
       return res.status(401).json({ error: "Mot de passe incorrect" });
     }
 
-    if (!user.is_super_admin) {
+    const isSuperAdmin =
+      user.is_super_admin === true ||
+      user.is_super_admin === "true" ||
+      user.is_super_admin === 1 ||
+      String(user.role || "").toLowerCase() === "super_admin" ||
+      SUPER_ADMIN_EMAILS.has(normalizedEmail) ||
+      SUPER_ADMIN_EMAILS.has(String(user.email || "").trim().toLowerCase());
+
+    if (!isSuperAdmin) {
       if (user.company_status === "suspended") {
         return res.status(403).json({
           error: "Entreprise suspendue. Veuillez contacter l’administration."
@@ -596,7 +608,7 @@ app.post("/login", async (req, res) => {
         email: user.email,
         role: user.role,
         company_id: user.company_id,
-        is_super_admin: user.is_super_admin || false
+        is_super_admin: isSuperAdmin
       },
       JWT_SECRET,
       { expiresIn: "1d" }
@@ -617,11 +629,11 @@ app.post("/login", async (req, res) => {
         id: user.id,
         fullname: user.fullname,
         email: user.email,
-        role: user.role,
+        role: isSuperAdmin ? "super_admin" : user.role,
         company_id: user.company_id,
         company_name: user.company_name || "",
         company_status: user.company_status || "",
-        is_super_admin: user.is_super_admin || false,
+        is_super_admin: isSuperAdmin,
         subscription_status: user.subscription_status || "",
         subscription_end_date: user.subscription_end_date || "",
         plan_name: user.plan_name || "",
