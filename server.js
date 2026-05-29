@@ -514,7 +514,11 @@ app.post("/register-saas", async (req, res) => {
     console.error("ERREUR REGISTER SAAS :", error);
 
     res.status(500).json({
-      error: "Erreur création entreprise SaaS"
+      error: error.message || "Erreur création entreprise SaaS",
+      code: error.code || "",
+      detail: error.detail || "",
+      table: error.table || "",
+      column: error.column || ""
     });
   }
 });
