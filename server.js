@@ -1033,9 +1033,15 @@ app.post("/products", authenticateToken, async (req, res) => {
   }
 });
 
-app.put("/products/:id", async (req, res) => {
+app.put(
+  "/products/:id",
+  authenticateToken,
+  authorizeRoles("admin", "super_admin"),
+  async (req, res) => {
   try {
     const { id } = req.params;
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
 
     const {
       reference,
@@ -1058,34 +1064,50 @@ app.put("/products/:id", async (req, res) => {
       user_role
     } = req.body;
 
+    const values = [
+      reference,
+      name,
+      category,
+      Number(stock || 0),
+      warehouse,
+      status,
+      unit || "pièce",
+      Number(weight || 0),
+      dimensions || "",
+      barcode || "",
+      description || "",
+      is_active !== false,
+      location_id || null,
+      location_code || "",
+      Number(minimum_stock || 5),
+      image_url || "",
+      id
+    ];
+
+    let query = `
+      UPDATE products
+      SET reference=$1, name=$2, category=$3, stock=$4, warehouse=$5,
+          status=$6, unit=$7, weight=$8, dimensions=$9, barcode=$10,
+          description=$11, is_active=$12, location_id=$13, location_code=$14,
+          minimum_stock=$15, image_url=$16
+      WHERE id=$17
+    `;
+
+    if (!isSuperAdmin) {
+      values.push(companyId);
+      query += ` AND company_id=$${values.length}`;
+    }
+
+    query += ` RETURNING *`;
+
     const result = await pool.query(
-      `UPDATE products
-       SET reference=$1, name=$2, category=$3, stock=$4, warehouse=$5,
-           status=$6, unit=$7, weight=$8, dimensions=$9, barcode=$10,
-           description=$11, is_active=$12, location_id=$13, location_code=$14,
-           minimum_stock=$15, image_url=$16
-       WHERE id=$17
-       RETURNING *`,
-      [
-        reference,
-        name,
-        category,
-        Number(stock || 0),
-        warehouse,
-        status,
-        unit || "pièce",
-        Number(weight || 0),
-        dimensions || "",
-        barcode || "",
-        description || "",
-        is_active !== false,
-        location_id || null,
-        location_code || "",
-        Number(minimum_stock || 5),
-        image_url || "",
-        id
-      ]
+      query,
+      values
     );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Produit introuvable" });
+    }
 
     await logActivity(
       user_name,
@@ -1102,9 +1124,29 @@ app.put("/products/:id", async (req, res) => {
   }
 });
 
-app.delete("/products/:id", async (req, res) => {
+app.delete(
+  "/products/:id",
+  authenticateToken,
+  authorizeRoles("admin", "super_admin"),
+  async (req, res) => {
   try {
-    await pool.query("DELETE FROM products WHERE id=$1", [req.params.id]);
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
+    const values = [req.params.id];
+    let query = "DELETE FROM products WHERE id=$1";
+
+    if (!isSuperAdmin) {
+      values.push(companyId);
+      query += " AND company_id=$2";
+    }
+
+    query += " RETURNING id";
+
+    const result = await pool.query(query, values);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Produit introuvable" });
+    }
 
     await logActivity(
       "Administrateur",
