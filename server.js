@@ -203,9 +203,23 @@ async function ensureDefaultSubscriptionPlans() {
          can_use_chat,
          can_use_ai
        )
-       SELECT $1,$2,$3,$4,$5,$6,$7,$8,true,true,true,true,true,true
+       SELECT
+         $1::varchar,
+         $2::numeric,
+         $3::integer,
+         $4::integer,
+         $5::integer,
+         $6::integer,
+         $7::integer,
+         $8::text,
+         true,
+         true,
+         true,
+         true,
+         true,
+         true
        WHERE NOT EXISTS (
-         SELECT 1 FROM subscription_plans WHERE name=$1
+         SELECT 1 FROM subscription_plans WHERE name=$1::varchar
        )`,
       [
         plan.name,
