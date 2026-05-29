@@ -1983,9 +1983,14 @@ app.delete("/warehouses/:id", authenticateToken, async (req, res) => {
 app.get("/locations", async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT locations.*, warehouses.name AS warehouse_name
+      `SELECT
+        locations.*,
+        warehouses.name AS warehouse_name,
+        COALESCE(locations.product_reference, products.reference, '') AS product_reference,
+        COALESCE(locations.product_name, products.name, '') AS product_name
        FROM locations
        LEFT JOIN warehouses ON locations.warehouse_id = warehouses.id
+       LEFT JOIN products ON locations.product_id = products.id
        ORDER BY locations.id DESC`
     );
 
@@ -1998,7 +2003,23 @@ app.get("/locations", async (req, res) => {
 
 app.post("/locations", async (req, res) => {
   try {
-    const { warehouse_id, zone, rayon, etagere, status } = req.body;
+    const {
+      warehouse_id,
+      zone,
+      rayon,
+      etagere,
+      status,
+      product_id,
+      product_reference,
+      product_name,
+      rayon_code,
+      case_code,
+      level_code,
+      bin_code,
+      bin_mode,
+      bin_group,
+      company_id
+    } = req.body;
 
     const warehouseResult = await pool.query(
       "SELECT * FROM warehouses WHERE id=$1",
@@ -2015,8 +2036,27 @@ app.post("/locations", async (req, res) => {
 
     const result = await pool.query(
       `INSERT INTO locations
-      (warehouse_id, warehouse_code, zone, rayon, etagere, emplacement_code, qr_code, status)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+      (
+        warehouse_id,
+        warehouse_code,
+        zone,
+        rayon,
+        etagere,
+        emplacement_code,
+        qr_code,
+        status,
+        product_id,
+        product_reference,
+        product_name,
+        rayon_code,
+        case_code,
+        level_code,
+        bin_code,
+        bin_mode,
+        bin_group,
+        company_id
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
       RETURNING *`,
       [
         warehouse_id,
@@ -2026,7 +2066,17 @@ app.post("/locations", async (req, res) => {
         etagere,
         emplacement_code,
         qr_code,
-        status || "Disponible"
+        status || "Disponible",
+        product_id || null,
+        product_reference || "",
+        product_name || "",
+        rayon_code || zone || "",
+        case_code || rayon || "",
+        level_code || etagere || "",
+        bin_code || "",
+        bin_mode || "single",
+        bin_group || "",
+        company_id || warehouse.company_id || null
       ]
     );
 
