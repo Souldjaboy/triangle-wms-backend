@@ -13,6 +13,14 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+app.use((req, res, next) => {
+  if (req.url.startsWith("/api/")) {
+    req.url = req.url.slice(4);
+  }
+
+  next();
+});
+
 if (!fs.existsSync("uploads")) {
   fs.mkdirSync("uploads");
 }
