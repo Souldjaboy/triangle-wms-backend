@@ -78,6 +78,18 @@ function isAdminUser(user) {
   );
 }
 
+function canValidateStockMovement(user) {
+  const role = normalizeRole(user?.role);
+  return (
+    user?.is_super_admin === true ||
+    role === "admin" ||
+    role === "super_admin" ||
+    role === "chef_entrepot" ||
+    role === "chef d'entrepôt" ||
+    role === "chef d'entrepot"
+  );
+}
+
 function authorizeRoles(...roles) {
   return (req, res, next) => {
     const allowed = roles.map(normalizeRole);
@@ -154,6 +166,45 @@ async function logActivity(user_name, user_role, action, module, details) {
   } catch (error) {
     console.error("Erreur activité :", error);
   }
+}
+
+async function createNotification({
+  user_id,
+  title,
+  message,
+  type,
+  company_id,
+  status = "unread",
+  priority = "normal",
+  related_entity_type = "",
+  related_entity_id = null,
+  action_url = "",
+  created_by = null,
+  assigned_to = null,
+  warehouse_id = null
+}) {
+  await pool.query(
+    `INSERT INTO notifications
+     (user_id, title, message, type, company_id, status, priority,
+      related_entity_type, related_entity_id, action_url, created_by,
+      assigned_to, warehouse_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+    [
+      user_id,
+      title,
+      message,
+      type,
+      company_id,
+      status,
+      priority,
+      related_entity_type,
+      related_entity_id,
+      action_url,
+      created_by,
+      assigned_to,
+      warehouse_id
+    ]
+  );
 }
 
 async function ensureDefaultSubscriptionPlans() {
@@ -1205,6 +1256,8 @@ app.post("/stock-movements", authenticateToken, async (req, res) => {
       quantity,
       source_warehouse,
       destination_warehouse,
+      location_code,
+      warehouse_id,
       reason,
       user_name,
       user_role
@@ -1230,8 +1283,10 @@ app.post("/stock-movements", authenticateToken, async (req, res) => {
     const result = await pool.query(
       `INSERT INTO stock_movements
       (type, product_reference, product_name, quantity, source_warehouse,
-       destination_warehouse, reason, status, company_id, created_by, created_by_name, created_by_role)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+       destination_warehouse, reason, status, company_id, created_by,
+       created_by_name, created_by_role, location_code, warehouse_id,
+       approval_status, original_quantity, final_quantity)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
       RETURNING *`,
       [
         type,
@@ -1245,7 +1300,12 @@ app.post("/stock-movements", authenticateToken, async (req, res) => {
         companyId,
         req.user.id,
         user_name || req.user.email || "Utilisateur",
-        user_role || req.user.role || "Non défini"
+        user_role || req.user.role || "Non défini",
+        location_code || product.location_code || "",
+        warehouse_id || null,
+        "En attente",
+        Number(quantity),
+        Number(quantity)
       ]
     );
 
@@ -1293,18 +1353,27 @@ app.post("/stock-movements", authenticateToken, async (req, res) => {
 
     for (const admin of adminUsers.rows) {
       if (admin.id !== req.user.id) {
-        await pool.query(
-          `INSERT INTO notifications
-           (user_id, title, message, type, company_id)
-           VALUES ($1,$2,$3,$4,$5)`,
-          [
-            admin.id,
-            "Mouvement stock à valider",
-            `${req.user.email || "Un utilisateur"} a créé une demande ${type} pour ${product_reference}.`,
-            "stock",
-            companyId
-          ]
-        );
+        await createNotification({
+          user_id: admin.id,
+          title: "Mouvement stock à valider",
+          message: `${
+            req.user.email || "Un utilisateur"
+          } a créé une demande ${type} pour ${product_reference}.`,
+          type:
+            type === "Transfert"
+              ? "transfer_pending"
+              : type === "Inventaire"
+              ? "inventory_adjustment_pending"
+              : "stock_movement_pending",
+          company_id: companyId,
+          priority: "high",
+          related_entity_type: "stock_movement",
+          related_entity_id: result.rows[0].id,
+          action_url: `/stocks?movement=${result.rows[0].id}`,
+          created_by: req.user.id,
+          assigned_to: admin.id,
+          warehouse_id: warehouse_id || null
+        });
       }
     }
 
@@ -1320,9 +1389,16 @@ app.put(
   authenticateToken,
   async (req, res) => {
     try {
+      if (!canValidateStockMovement(req.user)) {
+        return res.status(403).json({
+          error: "Accès refusé : vous ne pouvez pas valider ce mouvement."
+        });
+      }
+
       const { id } = req.params;
       const companyId = req.user.company_id;
       const isSuperAdmin = req.user.is_super_admin === true;
+      const { final_quantity, correction_note } = req.body || {};
 
       const movementResult = await pool.query(
         `SELECT * FROM stock_movements
@@ -1335,17 +1411,28 @@ app.put(
       if (!movement)
         return res.status(404).json({ error: "Mouvement introuvable" });
 
+      if (Number(movement.created_by) === Number(req.user.id)) {
+        return res.status(403).json({
+          error: "Vous ne pouvez pas valider votre propre demande."
+        });
+      }
+
       if (movement.status !== "En attente") {
         return res.status(400).json({ error: "Mouvement déjà traité" });
       }
+
+      const approvedQuantity =
+        final_quantity !== undefined && final_quantity !== null
+          ? Number(final_quantity)
+          : Number(movement.quantity);
 
       if (movement.type === "Entrée") {
         await pool.query(
           `UPDATE products SET stock = stock + $1
          WHERE reference = $2 ${isSuperAdmin ? "" : "AND company_id=$3"}`,
           isSuperAdmin
-            ? [movement.quantity, movement.product_reference]
-            : [movement.quantity, movement.product_reference, companyId]
+            ? [approvedQuantity, movement.product_reference]
+            : [approvedQuantity, movement.product_reference, companyId]
         );
       }
 
@@ -1354,8 +1441,8 @@ app.put(
           `UPDATE products SET stock = GREATEST(stock - $1, 0)
          WHERE reference = $2 ${isSuperAdmin ? "" : "AND company_id=$3"}`,
           isSuperAdmin
-            ? [movement.quantity, movement.product_reference]
-            : [movement.quantity, movement.product_reference, companyId]
+            ? [approvedQuantity, movement.product_reference]
+            : [approvedQuantity, movement.product_reference, companyId]
         );
       }
 
@@ -1378,8 +1465,8 @@ app.put(
           `UPDATE products SET stock = $1
          WHERE reference = $2 ${isSuperAdmin ? "" : "AND company_id=$3"}`,
           isSuperAdmin
-            ? [movement.quantity, movement.product_reference]
-            : [movement.quantity, movement.product_reference, companyId]
+            ? [approvedQuantity, movement.product_reference]
+            : [approvedQuantity, movement.product_reference, companyId]
         );
 
         await pool.query(
@@ -1395,10 +1482,32 @@ app.put(
 
       const updated = await pool.query(
         `UPDATE stock_movements
-       SET status='Validé', validated_by=$1, validated_at=CURRENT_TIMESTAMP
-       WHERE id=$2 ${isSuperAdmin ? "" : "AND company_id=$3"}
+       SET status='Validé',
+           approval_status='Validé',
+           final_quantity=$1,
+           validated_by=$2,
+           validated_at=CURRENT_TIMESTAMP,
+           modified_by=CASE WHEN $3::boolean THEN $2 ELSE modified_by END,
+           modified_at=CASE WHEN $3::boolean THEN CURRENT_TIMESTAMP ELSE modified_at END,
+           correction_note=$4
+       WHERE id=$5 ${isSuperAdmin ? "" : "AND company_id=$6"}
        RETURNING *`,
-        isSuperAdmin ? [req.user.id, id] : [req.user.id, id, companyId]
+        isSuperAdmin
+          ? [
+              approvedQuantity,
+              req.user.id,
+              approvedQuantity !== Number(movement.quantity),
+              correction_note || "",
+              id
+            ]
+          : [
+              approvedQuantity,
+              req.user.id,
+              approvedQuantity !== Number(movement.quantity),
+              correction_note || "",
+              id,
+              companyId
+            ]
       );
 
       await logActivity(
@@ -1410,18 +1519,20 @@ app.put(
       );
 
       if (movement.created_by) {
-        await pool.query(
-          `INSERT INTO notifications
-         (user_id, title, message, type, company_id)
-         VALUES ($1,$2,$3,$4,$5)`,
-          [
-            movement.created_by,
-            "Mouvement stock validé",
-            `Votre demande ${movement.type} pour ${movement.product_reference} a été validée.`,
-            "stock",
-            movement.company_id || companyId
-          ]
-        );
+        await createNotification({
+          user_id: movement.created_by,
+          title: "Mouvement stock validé",
+          message: `Votre demande ${movement.type} pour ${movement.product_reference} a été validée.`,
+          type: "stock_movement_validated",
+          company_id: movement.company_id || companyId,
+          priority: "normal",
+          related_entity_type: "stock_movement",
+          related_entity_id: Number(id),
+          action_url: `/stocks?movement=${id}`,
+          created_by: req.user.id,
+          assigned_to: movement.created_by,
+          warehouse_id: movement.warehouse_id || null
+        });
       }
 
       res.json(updated.rows[0]);
@@ -1434,8 +1545,15 @@ app.put(
 
 app.put("/stock-movements/:id/reject", authenticateToken, async (req, res) => {
   try {
+    if (!canValidateStockMovement(req.user)) {
+      return res.status(403).json({
+        error: "Accès refusé : vous ne pouvez pas refuser ce mouvement."
+      });
+    }
+
     const companyId = req.user.company_id;
     const isSuperAdmin = req.user.is_super_admin === true;
+    const { rejection_reason } = req.body || {};
 
     const movementResult = await pool.query(
       `SELECT * FROM stock_movements
@@ -1445,14 +1563,27 @@ app.put("/stock-movements/:id/reject", authenticateToken, async (req, res) => {
 
     const movement = movementResult.rows[0];
 
+    if (!movement)
+      return res.status(404).json({ error: "Mouvement introuvable" });
+
+    if (Number(movement.created_by) === Number(req.user.id)) {
+      return res.status(403).json({
+        error: "Vous ne pouvez pas refuser votre propre demande."
+      });
+    }
+
     const updated = await pool.query(
       `UPDATE stock_movements
-       SET status='Refusé', validated_by=$1, validated_at=CURRENT_TIMESTAMP
-       WHERE id=$2 ${isSuperAdmin ? "" : "AND company_id=$3"}
+       SET status='Refusé',
+           approval_status='Refusé',
+           rejection_reason=$1,
+           validated_by=$2,
+           validated_at=CURRENT_TIMESTAMP
+       WHERE id=$3 ${isSuperAdmin ? "" : "AND company_id=$4"}
        RETURNING *`,
       isSuperAdmin
-        ? [req.user.id, req.params.id]
-        : [req.user.id, req.params.id, companyId]
+        ? [rejection_reason || "", req.user.id, req.params.id]
+        : [rejection_reason || "", req.user.id, req.params.id, companyId]
     );
 
     if (movement?.type === "Inventaire") {
@@ -1476,18 +1607,20 @@ app.put("/stock-movements/:id/reject", authenticateToken, async (req, res) => {
     );
 
     if (movement?.created_by) {
-      await pool.query(
-        `INSERT INTO notifications
-         (user_id, title, message, type, company_id)
-         VALUES ($1,$2,$3,$4,$5)`,
-        [
-          movement.created_by,
-          "Mouvement stock refusé",
-          `Votre demande ${movement.type} pour ${movement.product_reference} a été refusée.`,
-          "stock",
-          movement.company_id || companyId
-        ]
-      );
+      await createNotification({
+        user_id: movement.created_by,
+        title: "Mouvement stock refusé",
+        message: `Votre demande ${movement.type} pour ${movement.product_reference} a été refusée.`,
+        type: "stock_movement_rejected",
+        company_id: movement.company_id || companyId,
+        priority: "high",
+        related_entity_type: "stock_movement",
+        related_entity_id: Number(req.params.id),
+        action_url: `/stocks?movement=${req.params.id}`,
+        created_by: req.user.id,
+        assigned_to: movement.created_by,
+        warehouse_id: movement.warehouse_id || null
+      });
     }
 
     res.json(updated.rows[0]);
@@ -1980,8 +2113,11 @@ app.delete("/warehouses/:id", authenticateToken, async (req, res) => {
   }
 });
 /* EMPLACEMENTS */
-app.get("/locations", async (req, res) => {
+app.get("/locations", authenticateToken, async (req, res) => {
   try {
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
+
     const result = await pool.query(
       `SELECT
         locations.*,
@@ -1991,7 +2127,9 @@ app.get("/locations", async (req, res) => {
        FROM locations
        LEFT JOIN warehouses ON locations.warehouse_id = warehouses.id
        LEFT JOIN products ON locations.product_id = products.id
+       ${isSuperAdmin ? "" : "WHERE locations.company_id=$1"}
        ORDER BY locations.id DESC`
+      , isSuperAdmin ? [] : [companyId]
     );
 
     res.json(result.rows);
@@ -2001,7 +2139,7 @@ app.get("/locations", async (req, res) => {
   }
 });
 
-app.post("/locations", async (req, res) => {
+app.post("/locations", authenticateToken, async (req, res) => {
   try {
     const {
       warehouse_id,
@@ -2076,7 +2214,7 @@ app.post("/locations", async (req, res) => {
         bin_code || "",
         bin_mode || "single",
         bin_group || "",
-        company_id || warehouse.company_id || null
+        company_id || req.user.company_id || warehouse.company_id || null
       ]
     );
 
@@ -2095,9 +2233,19 @@ app.post("/locations", async (req, res) => {
   }
 });
 
-app.delete("/locations/:id", async (req, res) => {
+app.delete("/locations/:id", authenticateToken, async (req, res) => {
   try {
-    await pool.query("DELETE FROM locations WHERE id=$1", [req.params.id]);
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
+    const values = [req.params.id];
+    let query = "DELETE FROM locations WHERE id=$1";
+
+    if (!isSuperAdmin) {
+      values.push(companyId);
+      query += " AND company_id=$2";
+    }
+
+    await pool.query(query, values);
 
     await logActivity(
       "Administrateur",
@@ -2111,6 +2259,192 @@ app.delete("/locations/:id", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Erreur suppression emplacement" });
+  }
+});
+
+app.get("/scan/resolve/:code", authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
+    let code = decodeURIComponent(req.params.code || "").trim();
+
+    try {
+      const parsedUrl = new URL(code);
+      code = parsedUrl.searchParams.get("location") || code;
+    } catch {}
+
+    const values = isSuperAdmin ? [code] : [code, companyId];
+
+    const locationResult = await pool.query(
+      `SELECT locations.*, warehouses.name AS warehouse_name
+       FROM locations
+       LEFT JOIN warehouses ON locations.warehouse_id = warehouses.id
+       WHERE locations.emplacement_code=$1 ${
+         isSuperAdmin ? "" : "AND locations.company_id=$2"
+       }
+       LIMIT 1`,
+      values
+    );
+
+    if (locationResult.rows.length > 0) {
+      const location = locationResult.rows[0];
+
+      const productsResult = await pool.query(
+        `SELECT *
+         FROM products
+         WHERE (
+           location_id=$1
+           OR location_code=$2
+           OR reference=$3
+         )
+         ${isSuperAdmin ? "" : "AND company_id=$4"}
+         ORDER BY id DESC`,
+        isSuperAdmin
+          ? [location.id, location.emplacement_code, location.product_reference || ""]
+          : [
+              location.id,
+              location.emplacement_code,
+              location.product_reference || "",
+              companyId
+            ]
+      );
+
+      const movementsResult = await pool.query(
+        `SELECT *
+         FROM stock_movements
+         WHERE (
+           location_code=$1
+           OR reason ILIKE $2
+           OR product_reference = ANY($3::text[])
+         )
+         ${isSuperAdmin ? "" : "AND company_id=$4"}
+         ORDER BY id DESC
+         LIMIT 20`,
+        isSuperAdmin
+          ? [
+              location.emplacement_code,
+              `%${location.emplacement_code}%`,
+              productsResult.rows.map((product) => product.reference)
+            ]
+          : [
+              location.emplacement_code,
+              `%${location.emplacement_code}%`,
+              productsResult.rows.map((product) => product.reference),
+              companyId
+            ]
+      );
+
+      return res.json({
+        type: "location",
+        code,
+        location,
+        products: productsResult.rows,
+        movements: movementsResult.rows,
+        alerts: productsResult.rows
+          .filter(
+            (product) =>
+              Number(product.stock || 0) <= Number(product.minimum_stock || 0)
+          )
+          .map((product) => ({
+            product_reference: product.reference,
+            product_name: product.name,
+            stock: product.stock,
+            minimum_stock: product.minimum_stock,
+            type: Number(product.stock || 0) <= 0 ? "out_of_stock" : "low_stock"
+          }))
+      });
+    }
+
+    const productResult = await pool.query(
+      `SELECT products.*, locations.emplacement_code, locations.rayon_code,
+              locations.case_code, locations.level_code, locations.bin_code,
+              locations.bin_mode, locations.warehouse_code
+       FROM products
+       LEFT JOIN locations ON products.location_id = locations.id
+       WHERE (products.reference=$1 OR products.barcode=$1)
+       ${isSuperAdmin ? "" : "AND products.company_id=$2"}
+       LIMIT 1`,
+      values
+    );
+
+    if (productResult.rows.length > 0) {
+      const product = productResult.rows[0];
+      const movementsResult = await pool.query(
+        `SELECT *
+         FROM stock_movements
+         WHERE product_reference=$1
+         ${isSuperAdmin ? "" : "AND company_id=$2"}
+         ORDER BY id DESC
+         LIMIT 20`,
+        isSuperAdmin ? [product.reference] : [product.reference, companyId]
+      );
+
+      return res.json({
+        type: "product",
+        code,
+        product,
+        movements: movementsResult.rows,
+        alerts:
+          Number(product.stock || 0) <= Number(product.minimum_stock || 0)
+            ? [
+                {
+                  product_reference: product.reference,
+                  product_name: product.name,
+                  stock: product.stock,
+                  minimum_stock: product.minimum_stock,
+                  type:
+                    Number(product.stock || 0) <= 0
+                      ? "out_of_stock"
+                      : "low_stock"
+                }
+              ]
+            : []
+      });
+    }
+
+    const userResult = await pool.query(
+      `SELECT id, fullname, email, role, badge_code, company_id
+       FROM users
+       WHERE (badge_code=$1 OR CAST(id AS TEXT)=$1)
+       ${isSuperAdmin ? "" : "AND company_id=$2"}
+       LIMIT 1`,
+      values
+    );
+
+    if (userResult.rows.length > 0) {
+      const employee = userResult.rows[0];
+      const todayResult = await pool.query(
+        `SELECT *
+         FROM attendance_records
+         WHERE user_id=$1 AND work_date=CURRENT_DATE
+         LIMIT 1`,
+        [employee.id]
+      );
+      const historyResult = await pool.query(
+        `SELECT *
+         FROM attendance_history
+         WHERE user_id=$1
+         ORDER BY id DESC
+         LIMIT 10`,
+        [employee.id]
+      );
+
+      return res.json({
+        type: "employee",
+        code,
+        employee,
+        today: todayResult.rows[0] || null,
+        history: historyResult.rows
+      });
+    }
+
+    res.status(404).json({
+      error: "QR code introuvable",
+      code
+    });
+  } catch (error) {
+    console.error("ERREUR RESOLUTION SCAN :", error);
+    res.status(500).json({ error: "Erreur résolution QR code" });
   }
 });
 
@@ -2129,34 +2463,47 @@ app.get("/activities", async (req, res) => {
 });
 
 /* ALERTES */
-app.get("/alerts", async (req, res) => {
+app.get("/alerts", authenticateToken, async (req, res) => {
   try {
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
+
     const stockFaible = await pool.query(
       `SELECT reference, name, stock, minimum_stock, warehouse, location_code
        FROM products
        WHERE stock > 0 AND stock <= minimum_stock
+       ${isSuperAdmin ? "" : "AND company_id=$1"}
        ORDER BY stock ASC`
+      , isSuperAdmin ? [] : [companyId]
     );
 
     const rupture = await pool.query(
       `SELECT reference, name, stock, minimum_stock, warehouse, location_code
        FROM products
        WHERE stock <= 0
+       ${isSuperAdmin ? "" : "AND company_id=$1"}
        ORDER BY name ASC`
+      , isSuperAdmin ? [] : [companyId]
     );
 
     const validations = await pool.query(
-      `SELECT id, type, product_reference, product_name, quantity, status, created_at
+      `SELECT id, type, product_reference, product_name, quantity, status,
+              location_code, source_warehouse, destination_warehouse, created_at
        FROM stock_movements
        WHERE status = 'En attente'
+       ${isSuperAdmin ? "" : "AND company_id=$1"}
        ORDER BY id DESC`
+      , isSuperAdmin ? [] : [companyId]
     );
 
     const refuses = await pool.query(
-      `SELECT id, type, product_reference, product_name, quantity, status, created_at
+      `SELECT id, type, product_reference, product_name, quantity, status,
+              location_code, source_warehouse, destination_warehouse, created_at
        FROM stock_movements
        WHERE status = 'Refusé'
+       ${isSuperAdmin ? "" : "AND company_id=$1"}
        ORDER BY id DESC`
+      , isSuperAdmin ? [] : [companyId]
     );
 
     res.json({
@@ -2521,11 +2868,18 @@ app.get("/notifications/:userId", authenticateToken, async (req, res) => {
   try {
     const companyId = req.user.company_id;
     const isSuperAdmin = req.user.is_super_admin === true;
+    const requestedUserId = Number(req.params.userId);
+
+    if (!isSuperAdmin && requestedUserId !== Number(req.user.id)) {
+      return res.status(403).json({
+        error: "Accès refusé aux notifications d'un autre utilisateur."
+      });
+    }
 
     let query = `
       SELECT *
       FROM notifications
-      WHERE user_id = $1
+      WHERE (user_id = $1 OR assigned_to = $1)
     `;
 
     let values = [req.params.userId];
@@ -2555,7 +2909,7 @@ app.put("/notifications/:id/read", authenticateToken, async (req, res) => {
 
     let query = `
       UPDATE notifications
-      SET is_read = true
+      SET is_read = true, status = 'read'
       WHERE id = $1
     `;
 
