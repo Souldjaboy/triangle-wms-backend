@@ -90,6 +90,11 @@ function canValidateStockMovement(user) {
   );
 }
 
+function isReadOnlyRole(user) {
+  const role = normalizeRole(user?.role);
+  return role === "direction" || role === "client";
+}
+
 function authorizeRoles(...roles) {
   return (req, res, next) => {
     const allowed = roles.map(normalizeRole);
@@ -210,7 +215,7 @@ async function createNotification({
 async function ensureDefaultSubscriptionPlans() {
   const defaultPlans = [
     {
-      name: "Starter",
+      name: "Essentiel",
       price_monthly: 5000,
       max_users: 3,
       max_warehouses: 1,
@@ -300,7 +305,7 @@ app.post("/upload-logo", upload.single("logo"), async (req, res) => {
       return res.status(400).json({ error: "Aucun fichier reçu" });
     }
 
-    const logoUrl = `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`;
+    const logoUrl = `/uploads/${req.file.filename}`;
 
     res.json({
       message: "Logo uploadé avec succès",
@@ -319,7 +324,7 @@ app.post("/upload-user-photo", upload.single("photo"), async (req, res) => {
       return res.status(400).json({ error: "Aucune photo reçue" });
     }
 
-    const photoUrl = `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`;
+    const photoUrl = `/uploads/${req.file.filename}`;
 
     res.json({
       message: "Photo utilisateur uploadée avec succès",
@@ -979,6 +984,10 @@ app.get("/products", authenticateToken, async (req, res) => {
 
 app.post("/products", authenticateToken, async (req, res) => {
   try {
+    if (isReadOnlyRole(req.user)) {
+      return res.status(403).json({ error: "Accès lecture seule." });
+    }
+
     const companyId = req.user.company_id;
     const isSuperAdmin = req.user.is_super_admin === true;
 
@@ -1090,6 +1099,10 @@ app.put(
   authorizeRoles("admin", "super_admin"),
   async (req, res) => {
   try {
+    if (isReadOnlyRole(req.user)) {
+      return res.status(403).json({ error: "Accès lecture seule." });
+    }
+
     const { id } = req.params;
     const companyId = req.user.company_id;
     const isSuperAdmin = req.user.is_super_admin === true;
@@ -1181,6 +1194,10 @@ app.delete(
   authorizeRoles("admin", "super_admin"),
   async (req, res) => {
   try {
+    if (isReadOnlyRole(req.user)) {
+      return res.status(403).json({ error: "Accès lecture seule." });
+    }
+
     const companyId = req.user.company_id;
     const isSuperAdmin = req.user.is_super_admin === true;
     const values = [req.params.id];
@@ -1246,6 +1263,10 @@ app.get("/stock-movements", authenticateToken, async (req, res) => {
 
 app.post("/stock-movements", authenticateToken, async (req, res) => {
   try {
+    if (isReadOnlyRole(req.user)) {
+      return res.status(403).json({ error: "Accès lecture seule." });
+    }
+
     const companyId = req.user.company_id;
     const isSuperAdmin = req.user.is_super_admin === true;
 
@@ -1258,6 +1279,7 @@ app.post("/stock-movements", authenticateToken, async (req, res) => {
       destination_warehouse,
       location_code,
       warehouse_id,
+      location_id,
       reason,
       user_name,
       user_role
@@ -1285,8 +1307,8 @@ app.post("/stock-movements", authenticateToken, async (req, res) => {
       (type, product_reference, product_name, quantity, source_warehouse,
        destination_warehouse, reason, status, company_id, created_by,
        created_by_name, created_by_role, location_code, warehouse_id,
-       approval_status, original_quantity, final_quantity)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+       approval_status, original_quantity, final_quantity, product_id, location_id)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
       RETURNING *`,
       [
         type,
@@ -1305,7 +1327,9 @@ app.post("/stock-movements", authenticateToken, async (req, res) => {
         warehouse_id || null,
         "En attente",
         Number(quantity),
-        Number(quantity)
+        Number(quantity),
+        product.id,
+        location_id || product.location_id || null
       ]
     );
 
@@ -1631,9 +1655,10 @@ app.put("/stock-movements/:id/reject", authenticateToken, async (req, res) => {
 });
 
 /* DOCUMENTS SAAS */
-app.get("/documents", async (req, res) => {
+app.get("/documents", authenticateToken, async (req, res) => {
   try {
-    const { companyId, isSuperAdmin } = getCompanyFilter(req);
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
 
     let query = `
       SELECT * FROM documents
@@ -1681,7 +1706,7 @@ app.get("/documents/:id", async (req, res) => {
   }
 });
 
-app.post("/documents", async (req, res) => {
+app.post("/documents", authenticateToken, async (req, res) => {
   try {
     const {
       document_type,
@@ -1718,9 +1743,10 @@ app.post("/documents", async (req, res) => {
         client_address,
         total_amount,
         observation,
-        created_by
+        created_by,
+        company_id
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
       RETURNING *`,
       [
         document_type,
@@ -1730,7 +1756,8 @@ app.post("/documents", async (req, res) => {
         client_address,
         total_amount,
         observation,
-        created_by || "Administrateur"
+        created_by || req.user.fullname || req.user.email || "Utilisateur",
+        req.user.company_id || null
       ]
     );
 
@@ -1797,7 +1824,7 @@ app.delete("/documents/:id", async (req, res) => {
 });
 
 /* GÉNÉRER DOCUMENT DEPUIS MOUVEMENT STOCK */
-app.post("/documents/from-movement/:id", async (req, res) => {
+app.post("/documents/from-movement/:id", authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -1809,9 +1836,13 @@ app.post("/documents/from-movement/:id", async (req, res) => {
       created_by
     } = req.body;
 
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
+
     const movementResult = await pool.query(
-      "SELECT * FROM stock_movements WHERE id=$1",
-      [id]
+      `SELECT * FROM stock_movements
+       WHERE id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}`,
+      isSuperAdmin ? [id] : [id, companyId]
     );
 
     const movement = movementResult.rows[0];
@@ -1871,9 +1902,14 @@ app.post("/documents/from-movement/:id", async (req, res) => {
         client_address,
         total_amount,
         observation,
-        created_by
+        created_by,
+        company_id,
+        related_entity_type,
+        related_entity_id,
+        warehouse_id,
+        status
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
       RETURNING *`,
       [
         finalType,
@@ -1883,7 +1919,12 @@ app.post("/documents/from-movement/:id", async (req, res) => {
         client_address || "",
         0,
         `Document généré depuis mouvement stock ID ${movement.id} - ${movement.type}`,
-        created_by || "Administrateur"
+        created_by || req.user.fullname || req.user.email || "Utilisateur",
+        movement.company_id || companyId,
+        "stock_movement",
+        movement.id,
+        movement.warehouse_id || null,
+        "Validé"
       ]
     );
 
@@ -2810,16 +2851,22 @@ app.post("/chat/messages", authenticateToken, async (req, res) => {
     if (receiver_id) {
       await pool.query(
         `INSERT INTO notifications
-         (user_id, title, message, type, company_id)
-         VALUES ($1,$2,$3,$4,$5)`,
+         (user_id, title, message, type, company_id, related_entity_type,
+          related_entity_id, action_url, created_by, assigned_to)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
         [
           receiver_id,
-          "Nouveau message",
+          message_type === "audio" ? "Nouveau vocal" : "Nouveau message",
           message_type === "audio"
             ? "Vous avez reçu un message vocal."
             : "Vous avez reçu un nouveau message interne.",
-          "message",
-          companyId
+          message_type === "audio" ? "chat_audio" : "chat_message",
+          companyId,
+          "conversation",
+          conversation_id,
+          `/chat?conversation=${conversation_id}`,
+          sender_id,
+          receiver_id
         ]
       );
     }
@@ -3585,8 +3632,9 @@ app.post("/ai/chat", async (req, res) => {
     }
 
     if (!process.env.OPENROUTER_API_KEY) {
-      return res.status(500).json({
-        error: "Clé OpenRouter manquante dans .env"
+      return res.json({
+        answer:
+          "Assistant IA non configuré. Ajoutez OPENROUTER_API_KEY dans le fichier .env. En attendant, je peux vous conseiller de vérifier les produits, stocks, mouvements, alertes, documents et rapports depuis le menu Triangle WMS Pro."
       });
     }
 
@@ -3734,7 +3782,7 @@ app.post("/chat/upload-audio", upload.single("audio"), async (req, res) => {
       });
     }
 
-    const audioUrl = `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`;
+    const audioUrl = `/uploads/${req.file.filename}`;
 
     res.json({
       message: "Audio uploadé avec succès",
@@ -4069,7 +4117,7 @@ app.get("/public/plans", async (req, res) => {
         can_use_chat,
         can_use_ai
       FROM subscription_plans
-      WHERE name IN ('Starter', 'Standard', 'Premium')
+      WHERE name IN ('Essentiel', 'Starter', 'Standard', 'Premium')
       ORDER BY price_monthly ASC
     `);
 
