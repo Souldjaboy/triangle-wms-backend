@@ -95,6 +95,50 @@ function isReadOnlyRole(user) {
   return role === "direction" || role === "client";
 }
 
+function canViewAllSalaries(user) {
+  const role = normalizeRole(user?.role);
+  return user?.is_super_admin === true || role === "super_admin" || role === "direction";
+}
+
+function canCreateMeeting(user) {
+  const role = normalizeRole(user?.role);
+  return (
+    user?.is_super_admin === true ||
+    role === "super_admin" ||
+    role === "admin" ||
+    role === "responsable_entrepot" ||
+    role === "chef_entrepot" ||
+    role === "direction"
+  );
+}
+
+function stripSalaryFields(row, requester) {
+  const canSeeSalary =
+    canViewAllSalaries(requester) || Number(row.id || row.user_id) === Number(requester?.id);
+
+  if (canSeeSalary) return row;
+
+  const sanitized = { ...row };
+  delete sanitized.hourly_rate;
+  delete sanitized.daily_rate;
+  delete sanitized.daily_salary;
+  delete sanitized.setting_daily_salary;
+  delete sanitized.monthly_salary;
+  delete sanitized.salary;
+  delete sanitized.salary_amount;
+  delete sanitized.calculated_salary;
+  sanitized.salary_type = sanitized.salary_type ? "masqué" : sanitized.salary_type;
+  return sanitized;
+}
+
+function publicUploadUrl(req, filename) {
+  const baseUrl =
+    process.env.PUBLIC_BASE_URL ||
+    `${req.protocol}://${req.get("host")}`;
+
+  return `${baseUrl.replace(/\/$/, "")}/api/uploads/${filename}`;
+}
+
 function authorizeRoles(...roles) {
   return (req, res, next) => {
     const allowed = roles.map(normalizeRole);
@@ -305,7 +349,7 @@ app.post("/upload-logo", upload.single("logo"), async (req, res) => {
       return res.status(400).json({ error: "Aucun fichier reçu" });
     }
 
-    const logoUrl = `/uploads/${req.file.filename}`;
+    const logoUrl = publicUploadUrl(req, req.file.filename);
 
     res.json({
       message: "Logo uploadé avec succès",
@@ -324,7 +368,7 @@ app.post("/upload-user-photo", upload.single("photo"), async (req, res) => {
       return res.status(400).json({ error: "Aucune photo reçue" });
     }
 
-    const photoUrl = `/uploads/${req.file.filename}`;
+    const photoUrl = publicUploadUrl(req, req.file.filename);
 
     res.json({
       message: "Photo utilisateur uploadée avec succès",
@@ -350,8 +394,16 @@ app.get("/company-settings", async (req, res) => {
   }
 });
 
-app.put("/company-settings", async (req, res) => {
+app.put(
+  "/company-settings",
+  authenticateToken,
+  authorizeRoles("admin", "super_admin"),
+  async (req, res) => {
   try {
+    if (isReadOnlyRole(req.user)) {
+      return res.status(403).json({ error: "Vous avez un accès lecture seule." });
+    }
+
     const { company_name, address, phone, email, website, logo_url, slogan } =
       req.body;
 
@@ -742,7 +794,7 @@ app.get("/users", authenticateToken, async (req, res) => {
       values
     );
 
-    res.json(result.rows);
+    res.json(result.rows.map((row) => stripSalaryFields(row, req.user)));
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Erreur lecture utilisateurs" });
@@ -2979,6 +3031,98 @@ app.put("/notifications/:id/read", authenticateToken, async (req, res) => {
     });
   }
 });
+
+app.post("/meetings", authenticateToken, async (req, res) => {
+  try {
+    if (!canCreateMeeting(req.user)) {
+      return res.status(403).json({
+        error: "Vous n'avez pas l'autorisation de créer une réunion."
+      });
+    }
+
+    const companyId = req.user.company_id;
+    const { title, conversation_id, participants = [] } = req.body;
+    const roomName = `triangle-wms-${companyId || "global"}-${Date.now()}-${Math.random()
+      .toString(36)
+      .slice(2, 8)}`;
+    const meetingUrl = `https://meet.jit.si/${roomName}`;
+
+    const meetingResult = await pool.query(
+      `INSERT INTO meetings
+       (title, room_name, meeting_url, conversation_id, created_by, company_id)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       RETURNING *`,
+      [
+        title || "Réunion Triangle WMS",
+        roomName,
+        meetingUrl,
+        conversation_id || null,
+        req.user.id,
+        companyId || null
+      ]
+    );
+
+    const meeting = meetingResult.rows[0];
+    const participantIds = Array.from(
+      new Set([req.user.id, ...participants.map((id) => Number(id)).filter(Boolean)])
+    );
+
+    for (const participantId of participantIds) {
+      await pool.query(
+        `INSERT INTO meeting_participants (meeting_id, user_id)
+         VALUES ($1,$2)
+         ON CONFLICT (meeting_id, user_id) DO NOTHING`,
+        [meeting.id, participantId]
+      );
+
+      if (participantId !== Number(req.user.id)) {
+        await createNotification({
+          user_id: participantId,
+          title: "Invitation réunion",
+          message: `${req.user.email || "Un utilisateur"} vous invite à une réunion.`,
+          type: "meeting_invitation",
+          company_id: companyId,
+          priority: "high",
+          related_entity_type: "meeting",
+          related_entity_id: meeting.id,
+          action_url: meetingUrl,
+          created_by: req.user.id,
+          assigned_to: participantId
+        });
+      }
+    }
+
+    res.status(201).json({
+      ...meeting,
+      participants: participantIds
+    });
+  } catch (error) {
+    console.error("ERREUR CREATION REUNION :", error);
+    res.status(500).json({ error: "Erreur création réunion" });
+  }
+});
+
+app.get("/meetings", authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
+
+    const result = await pool.query(
+      `SELECT m.*
+       FROM meetings m
+       LEFT JOIN meeting_participants mp ON mp.meeting_id = m.id
+       WHERE ($1::boolean = true OR m.company_id=$2)
+       AND ($1::boolean = true OR mp.user_id=$3 OR m.created_by=$3)
+       ORDER BY m.id DESC`,
+      [isSuperAdmin, companyId, req.user.id]
+    );
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR LECTURE REUNIONS :", error);
+    res.status(500).json({ error: "Erreur lecture réunions" });
+  }
+});
 /* POINTAGE INTELLIGENT */
 app.get("/attendance/schedule-groups", async (req, res) => {
   try {
@@ -2994,7 +3138,7 @@ app.get("/attendance/schedule-groups", async (req, res) => {
 });
 
 /* ATTENDANCE TODAY - AFFICHAGE POINTAGE */
-app.get("/attendance/today", async (req, res) => {
+app.get("/attendance/today", authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT
@@ -3077,14 +3221,14 @@ app.get("/attendance/today", async (req, res) => {
       };
     });
 
-    res.json(records);
+    res.json(records.map((row) => stripSalaryFields(row, req.user)));
   } catch (error) {
     console.error("ERREUR ATTENDANCE TODAY :", error);
     res.status(500).json({ error: "Erreur récupération pointage" });
   }
 });
 /* POINTAGES DU JOUR SAAS */
-app.get("/attendance/today", async (req, res) => {
+app.get("/attendance/today", authenticateToken, async (req, res) => {
   try {
     const { companyId, isSuperAdmin } = getCompanyFilter(req);
 
@@ -3115,8 +3259,21 @@ app.get("/attendance/today", async (req, res) => {
   }
 });
 
-app.get("/attendance/history/:userId", async (req, res) => {
+app.get("/attendance/history/:userId", authenticateToken, async (req, res) => {
   try {
+    const requestedUserId = Number(req.params.userId);
+    const role = normalizeRole(req.user.role);
+
+    if (
+      requestedUserId !== Number(req.user.id) &&
+      !canViewAllSalaries(req.user) &&
+      role !== "admin" &&
+      role !== "responsable_entrepot" &&
+      role !== "chef_entrepot"
+    ) {
+      return res.status(403).json({ error: "Accès refusé." });
+    }
+
     const result = await pool.query(
       `SELECT *
        FROM attendance_history
@@ -3132,7 +3289,7 @@ app.get("/attendance/history/:userId", async (req, res) => {
   }
 });
 
-app.post("/attendance/check", async (req, res) => {
+app.post("/attendance/check", authenticateToken, async (req, res) => {
   try {
     const { user_id, action_type, device_info, ip_address, location_info } =
       req.body;
@@ -3141,6 +3298,10 @@ app.post("/attendance/check", async (req, res) => {
       return res.status(400).json({
         error: "Utilisateur et type d'action obligatoires"
       });
+    }
+
+    if (Number(user_id) !== Number(req.user.id) && !canViewAllSalaries(req.user)) {
+      return res.status(403).json({ error: "Accès refusé." });
     }
 
     const existingResult = await pool.query(
@@ -3354,7 +3515,11 @@ app.put("/attendance/settings/schedule-groups/:id", async (req, res) => {
   }
 });
 
-app.put("/attendance/settings/users/:id", async (req, res) => {
+app.put(
+  "/attendance/settings/users/:id",
+  authenticateToken,
+  authorizeRoles("admin", "super_admin"),
+  async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -3373,19 +3538,22 @@ app.put("/attendance/settings/users/:id", async (req, res) => {
 
     const group = groupResult.rows[0] || null;
 
+    const canEditSalary = canViewAllSalaries(req.user);
+
     await pool.query(
       `UPDATE users
        SET schedule_group_id=$1,
-           payment_type=$2,
-           hourly_rate=$3,
-           daily_rate=$4
+           payment_type=CASE WHEN $6::boolean THEN $2 ELSE payment_type END,
+           hourly_rate=CASE WHEN $6::boolean THEN $3 ELSE hourly_rate END,
+           daily_rate=CASE WHEN $6::boolean THEN $4 ELSE daily_rate END
        WHERE id=$5`,
       [
         schedule_group_id || null,
         salary_type || "horaire",
         Number(hourly_rate || 0),
         Number(daily_rate || 0),
-        id
+        id,
+        canEditSalary
       ]
     );
 
@@ -3405,10 +3573,10 @@ app.put("/attendance/settings/users/:id", async (req, res) => {
        ON CONFLICT (user_id)
        DO UPDATE SET
          schedule_group=EXCLUDED.schedule_group,
-         salary_type=EXCLUDED.salary_type,
-         hourly_rate=EXCLUDED.hourly_rate,
-         daily_salary=EXCLUDED.daily_salary,
-         monthly_salary=EXCLUDED.monthly_salary,
+         salary_type=CASE WHEN $9::boolean THEN EXCLUDED.salary_type ELSE attendance_settings.salary_type END,
+         hourly_rate=CASE WHEN $9::boolean THEN EXCLUDED.hourly_rate ELSE attendance_settings.hourly_rate END,
+         daily_salary=CASE WHEN $9::boolean THEN EXCLUDED.daily_salary ELSE attendance_settings.daily_salary END,
+         monthly_salary=CASE WHEN $9::boolean THEN EXCLUDED.monthly_salary ELSE attendance_settings.monthly_salary END,
          start_time=EXCLUDED.start_time,
          end_time=EXCLUDED.end_time
        RETURNING *`,
@@ -3420,7 +3588,8 @@ app.put("/attendance/settings/users/:id", async (req, res) => {
         Number(daily_rate || 0),
         Number(monthly_salary || 0),
         group?.start_time || "08:00",
-        group?.end_time || "17:00"
+        group?.end_time || "17:00",
+        canEditSalary
       ]
     );
 
@@ -3445,7 +3614,7 @@ app.put("/attendance/settings/users/:id", async (req, res) => {
     );
 
     res.json({
-      ...userResult.rows[0],
+      ...stripSalaryFields(userResult.rows[0], req.user),
       attendance_settings: settingsResult.rows[0]
     });
   } catch (error) {
@@ -3638,6 +3807,25 @@ app.post("/ai/chat", async (req, res) => {
       });
     }
 
+    const companyId = user?.company_id || null;
+    const isSuperAdmin = user?.is_super_admin === true;
+    const contextValues = isSuperAdmin || !companyId ? [] : [companyId];
+    const companyClause = isSuperAdmin || !companyId ? "" : "WHERE company_id=$1";
+    const movementClause = isSuperAdmin || !companyId ? "" : "WHERE company_id=$1";
+    const productStats = await pool.query(
+      `SELECT COUNT(*)::int AS total,
+              COALESCE(SUM(stock),0)::int AS stock_total,
+              COUNT(*) FILTER (WHERE stock <= minimum_stock)::int AS alertes
+       FROM products ${companyClause}`,
+      contextValues
+    );
+    const movementStats = await pool.query(
+      `SELECT COUNT(*)::int AS total,
+              COUNT(*) FILTER (WHERE status='En attente')::int AS en_attente
+       FROM stock_movements ${movementClause}`,
+      contextValues
+    );
+
     const aiResponse = await fetch(
       "https://openrouter.ai/api/v1/chat/completions",
       {
@@ -3658,7 +3846,7 @@ app.post("/ai/chat", async (req, res) => {
             },
             {
               role: "user",
-              content: `Utilisateur connecté : ${user?.fullname || "Utilisateur"} | Rôle : ${user?.role || "non défini"}\n\nQuestion : ${message}`
+              content: `Utilisateur connecté : ${user?.fullname || "Utilisateur"} | Rôle : ${user?.role || "non défini"}\nContexte WMS réel résumé : produits=${productStats.rows[0]?.total || 0}, stock_total=${productStats.rows[0]?.stock_total || 0}, alertes_stock=${productStats.rows[0]?.alertes || 0}, mouvements=${movementStats.rows[0]?.total || 0}, mouvements_en_attente=${movementStats.rows[0]?.en_attente || 0}.\n\nQuestion : ${message}`
             }
           ]
         })
@@ -3774,7 +3962,7 @@ app.post("/subscriptions/renew", async (req, res) => {
 });
 
 /* UPLOAD AUDIO CHAT */
-app.post("/chat/upload-audio", upload.single("audio"), async (req, res) => {
+app.post("/chat/upload-audio", authenticateToken, upload.single("audio"), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({
@@ -3782,7 +3970,7 @@ app.post("/chat/upload-audio", upload.single("audio"), async (req, res) => {
       });
     }
 
-    const audioUrl = `/uploads/${req.file.filename}`;
+    const audioUrl = publicUploadUrl(req, req.file.filename);
 
     res.json({
       message: "Audio uploadé avec succès",
@@ -4484,7 +4672,7 @@ app.get("/attendance/today", async (req, res) => {
       };
     });
 
-    res.json(records);
+    res.json(records.map((row) => stripSalaryFields(row, req.user)));
   } catch (error) {
     console.error("ERREUR ATTENDANCE TODAY :", error);
 
