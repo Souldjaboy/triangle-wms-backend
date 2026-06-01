@@ -25,6 +25,12 @@ if (!fs.existsSync("uploads")) {
   fs.mkdirSync("uploads");
 }
 
+const productUploadDir = path.join(__dirname, "uploads", "products");
+
+if (!fs.existsSync(productUploadDir)) {
+  fs.mkdirSync(productUploadDir, { recursive: true });
+}
+
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
 const storage = multer.diskStorage({
@@ -39,6 +45,33 @@ const storage = multer.diskStorage({
 });
 
 const upload = multer({ storage });
+
+const productImageStorage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    cb(null, productUploadDir);
+  },
+  filename: function (req, file, cb) {
+    const ext = path.extname(file.originalname || "").toLowerCase();
+    const baseName = path
+      .basename(file.originalname || "product", ext)
+      .replace(/\s+/g, "-")
+      .replace(/[^a-zA-Z0-9-_]/g, "");
+    cb(null, `${Date.now()}-${baseName || "product"}${ext}`);
+  }
+});
+
+const uploadProductImage = multer({
+  storage: productImageStorage,
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: function (req, file, cb) {
+    const allowed = new Set(["image/jpeg", "image/jpg", "image/png", "image/webp"]);
+    if (!allowed.has(file.mimetype)) {
+      return cb(new Error("Format image non autorisé. Utilisez jpg, jpeg, png ou webp."));
+    }
+
+    cb(null, true);
+  }
+});
 
 const pool = process.env.DATABASE_URL
   ? new Pool({
@@ -129,12 +162,19 @@ function canAdjustPosPrice(user) {
 }
 
 function getEffectivePosPrice(product) {
-  return Number(
-    product.sale_price ||
-      product.pharmacy_price ||
-      product.wholesale_price ||
-      0
-  );
+  const candidates = [
+    product.sale_price,
+    product.pharmacy_price,
+    product.wholesale_price,
+    product.price
+  ];
+
+  for (const candidate of candidates) {
+    const value = Number(candidate || 0);
+    if (value > 0) return value;
+  }
+
+  return 0;
 }
 
 function productQrUrl(req, product) {
@@ -169,9 +209,11 @@ function stripSalaryFields(row, requester) {
 }
 
 function publicUploadUrl(req, filename) {
+  const forwardedProto = req.get("x-forwarded-proto") || req.protocol;
+  const host = req.get("host");
   const baseUrl =
     process.env.PUBLIC_BASE_URL ||
-    `${req.protocol}://${req.get("host")}`;
+    `${host?.includes("trianglewmspro.com") ? "https" : forwardedProto}://${host}`;
 
   return `${baseUrl.replace(/\/$/, "")}/api/uploads/${filename}`;
 }
@@ -416,6 +458,33 @@ app.post("/upload-user-photo", upload.single("photo"), async (req, res) => {
     res.status(500).json({ error: "Erreur upload photo utilisateur" });
   }
 });
+
+app.post(
+  "/upload-product-image",
+  authenticateToken,
+  uploadProductImage.single("image"),
+  async (req, res) => {
+    try {
+      if (isReadOnlyRole(req.user)) {
+        return res.status(403).json({ error: "Accès lecture seule." });
+      }
+
+      if (!req.file) {
+        return res.status(400).json({ error: "Aucune image reçue" });
+      }
+
+      const imageUrl = publicUploadUrl(req, `products/${req.file.filename}`);
+
+      res.status(201).json({
+        message: "Image produit uploadée avec succès",
+        image_url: imageUrl
+      });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: error.message || "Erreur upload image produit" });
+    }
+  }
+);
 
 /* PARAMÈTRES ENTREPRISE */
 app.get("/company-settings", async (req, res) => {
@@ -1758,7 +1827,7 @@ app.get("/pos/products/search", authenticateToken, async (req, res) => {
        FROM products
        LEFT JOIN locations ON products.location_id = locations.id
        WHERE products.is_active IS NOT FALSE
-       ${q ? `AND (products.name ILIKE $1 OR products.reference ILIKE $1 OR products.barcode ILIKE $1 OR products.sku ILIKE $1)` : ""}
+       ${q ? `AND (products.name ILIKE $1 OR products.reference ILIKE $1 OR products.barcode ILIKE $1 OR products.sku ILIKE $1 OR products.qr_code ILIKE $1)` : ""}
        ${isSuperAdmin ? "" : `AND products.company_id = $${q ? 2 : 1}`}
        ORDER BY products.name ASC
        LIMIT 40`,
@@ -3455,6 +3524,8 @@ app.get("/scan/resolve/:code", authenticateToken, async (req, res) => {
       code = decodeURIComponent(code);
     } catch {}
 
+    code = code.replace(/^Ref\s+/i, "").trim();
+
     const values = isSuperAdmin ? [code] : [code, companyId];
 
     const locationResult = await pool.query(
@@ -3575,7 +3646,8 @@ app.get("/scan/resolve/:code", authenticateToken, async (req, res) => {
         code,
         product: {
           ...product,
-          qr_url: productQrUrl(req, product)
+          qr_url: productQrUrl(req, product),
+          effective_sale_price: getEffectivePosPrice(product)
         },
         batches: batchesResult.rows,
         movements: movementsResult.rows,
