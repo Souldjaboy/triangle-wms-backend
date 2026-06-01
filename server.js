@@ -2816,7 +2816,7 @@ app.get("/pos/sales", authenticateToken, async (req, res) => {
 
     if (status) {
       values.push(status);
-      query += ` AND sales.status=$${values.length}`;
+      query += ` AND LOWER(sales.status)=LOWER($${values.length})`;
     }
 
     query += ` ORDER BY sales.id DESC LIMIT 300`;
@@ -3017,6 +3017,173 @@ app.post("/pos/payments", authenticateToken, async (req, res) => {
   } catch (error) {
     console.error("ERREUR POS PAYMENT :", error);
     res.status(500).json({ error: "Erreur paiement POS" });
+  }
+});
+
+app.get("/payments", authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
+    const result = await pool.query(
+      `SELECT pt.*, s.sale_number, s.customer_name
+       FROM payment_transactions pt
+       LEFT JOIN sales s ON s.id = pt.sale_id
+       WHERE 1=1 ${isSuperAdmin ? "" : "AND pt.company_id=$1"}
+       ORDER BY pt.id DESC
+       LIMIT 200`,
+      isSuperAdmin ? [] : [companyId]
+    );
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR LECTURE PAIEMENTS :", error);
+    res.status(500).json({ error: "Erreur lecture paiements" });
+  }
+});
+
+app.get("/payments/:id", authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
+    const result = await pool.query(
+      `SELECT pt.*, s.sale_number, s.customer_name
+       FROM payment_transactions pt
+       LEFT JOIN sales s ON s.id = pt.sale_id
+       WHERE pt.id=$1 ${isSuperAdmin ? "" : "AND pt.company_id=$2"}`,
+      isSuperAdmin ? [req.params.id] : [req.params.id, companyId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Paiement introuvable" });
+    }
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("ERREUR DETAIL PAIEMENT :", error);
+    res.status(500).json({ error: "Erreur détail paiement" });
+  }
+});
+
+app.post("/payments/initiate", authenticateToken, async (req, res) => {
+  try {
+    if (!canUsePos(req.user)) {
+      return res.status(403).json({ error: "Accès POS refusé." });
+    }
+
+    const {
+      sale_id = null,
+      payment_method = "Carte bancaire",
+      amount = 0,
+      currency = "FCFA",
+      customer_name = "",
+      customer_phone = ""
+    } = req.body;
+    const providerKey = providerKeyFromMethod(payment_method);
+    const providerReference = `MOCK-${providerKey.toUpperCase()}-${Date.now()}`;
+
+    const result = await pool.query(
+      `INSERT INTO payment_transactions
+       (company_id, sale_id, provider_key, payment_method, amount, currency,
+        status, provider_reference, external_reference, request_payload,
+        response_payload, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,'en attente',$7,$8,$9,$10,$11)
+       RETURNING *`,
+      [
+        req.user.company_id || null,
+        sale_id,
+        providerKey,
+        payment_method,
+        Number(amount || 0),
+        currency || "FCFA",
+        providerReference,
+        providerReference,
+        JSON.stringify({ sale_id, payment_method, amount, customer_name, customer_phone }),
+        JSON.stringify({
+          sandbox: true,
+          message: "Paiement sandbox initié. Utilisez confirmer pour simuler le fournisseur."
+        }),
+        req.user.id
+      ]
+    );
+
+    res.status(201).json({
+      transaction: result.rows[0],
+      status: "en attente",
+      provider_reference: providerReference,
+      sandbox: true,
+      message: "Paiement initié en mode sandbox."
+    });
+  } catch (error) {
+    console.error("ERREUR INIT PAIEMENT :", error);
+    res.status(500).json({ error: "Erreur initiation paiement" });
+  }
+});
+
+app.post("/payments/confirm", authenticateToken, async (req, res) => {
+  try {
+    const { transaction_id, provider_reference, status = "payé" } = req.body;
+    const transactionResult = await pool.query(
+      `SELECT *
+       FROM payment_transactions
+       WHERE ($1::int IS NOT NULL AND id=$1)
+          OR ($2::text <> '' AND provider_reference=$2)
+       ORDER BY id DESC
+       LIMIT 1`,
+      [transaction_id || null, provider_reference || ""]
+    );
+
+    if (transactionResult.rows.length === 0) {
+      return res.status(404).json({ error: "Transaction introuvable" });
+    }
+
+    const transaction = transactionResult.rows[0];
+    const nextStatus = status === "échoué" || status === "failed" ? "échoué" : "payé";
+
+    await pool.query(
+      `UPDATE payment_transactions
+       SET status=$1,
+           paid_at=CASE WHEN $1='payé' THEN CURRENT_TIMESTAMP ELSE paid_at END,
+           response_payload=$2,
+           updated_at=CURRENT_TIMESTAMP
+       WHERE id=$3`,
+      [
+        nextStatus,
+        JSON.stringify({ sandbox: true, confirmed_by: req.user.id, status: nextStatus }),
+        transaction.id
+      ]
+    );
+
+    await pool.query(
+      `UPDATE sale_payments SET status=$1 WHERE transaction_id=$2`,
+      [nextStatus, transaction.id]
+    );
+
+    let sale = null;
+    if (transaction.sale_id) {
+      const saleResult = await pool.query(
+        `UPDATE sales
+         SET payment_status=$1,
+             status=CASE WHEN $1='payé' THEN 'validée' ELSE status END,
+             amount_paid=CASE WHEN $1='payé' THEN total_amount ELSE amount_paid END,
+             amount_due=CASE WHEN $1='payé' THEN 0 ELSE amount_due END,
+             updated_at=CURRENT_TIMESTAMP
+         WHERE id=$2
+         RETURNING *`,
+        [nextStatus, transaction.sale_id]
+      );
+      sale = saleResult.rows[0] || null;
+    }
+
+    res.json({
+      ok: true,
+      status: nextStatus,
+      transaction_id: transaction.id,
+      provider_reference: transaction.provider_reference,
+      sale
+    });
+  } catch (error) {
+    console.error("ERREUR CONFIRMATION PAIEMENT :", error);
+    res.status(500).json({ error: "Erreur confirmation paiement" });
   }
 });
 
@@ -5196,8 +5363,10 @@ app.put(
 app.get("/attendance/settings/gps", authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      `INSERT INTO attendance_gps_settings (id, gps_required, allowed_radius_meters)
-       VALUES (1, false, 100)
+      `INSERT INTO attendance_gps_settings
+       (id, gps_required, site_name, allowed_radius_meters,
+        allow_remote_attendance, kiosk_mode, employee_scanner_access)
+       VALUES (1, false, '', 100, false, true, false)
        ON CONFLICT (id) DO UPDATE SET id=EXCLUDED.id
        RETURNING *`
     );
@@ -5217,27 +5386,37 @@ app.put(
     try {
       const {
         gps_required,
+        site_name,
         site_latitude,
         site_longitude,
-        allowed_radius_meters
+        allowed_radius_meters,
+        allow_remote_attendance,
+        kiosk_mode,
+        employee_scanner_access
       } = req.body;
 
       const result = await pool.query(
         `INSERT INTO attendance_gps_settings
-         (id, gps_required, site_latitude, site_longitude,
-          allowed_radius_meters, updated_by)
-         VALUES (1,$1,$2,$3,$4,$5)
+         (id, gps_required, site_name, site_latitude, site_longitude,
+          allowed_radius_meters, allow_remote_attendance, kiosk_mode,
+          employee_scanner_access, updated_by)
+         VALUES (1,$1,$2,$3,$4,$5,$6,$7,$8,$9)
          ON CONFLICT (id)
          DO UPDATE SET
            gps_required=EXCLUDED.gps_required,
+           site_name=EXCLUDED.site_name,
            site_latitude=EXCLUDED.site_latitude,
            site_longitude=EXCLUDED.site_longitude,
            allowed_radius_meters=EXCLUDED.allowed_radius_meters,
+           allow_remote_attendance=EXCLUDED.allow_remote_attendance,
+           kiosk_mode=EXCLUDED.kiosk_mode,
+           employee_scanner_access=EXCLUDED.employee_scanner_access,
            updated_by=EXCLUDED.updated_by,
            updated_at=CURRENT_TIMESTAMP
          RETURNING *`,
         [
           gps_required === true,
+          site_name || "",
           site_latitude === "" || site_latitude === null || site_latitude === undefined
             ? null
             : Number(site_latitude),
@@ -5245,6 +5424,9 @@ app.put(
             ? null
             : Number(site_longitude),
           Number(allowed_radius_meters || 100),
+          allow_remote_attendance === true,
+          kiosk_mode !== false,
+          employee_scanner_access === true,
           req.user.id
         ]
       );
@@ -6770,13 +6952,16 @@ app.post("/attendance/scan", async (req, res) => {
     const user = userResult.rows[0];
 
     const gpsSettingsResult = await pool.query(
-      `INSERT INTO attendance_gps_settings (id, gps_required, allowed_radius_meters)
-       VALUES (1, false, 100)
+      `INSERT INTO attendance_gps_settings
+       (id, gps_required, site_name, allowed_radius_meters,
+        allow_remote_attendance, kiosk_mode, employee_scanner_access)
+       VALUES (1, false, '', 100, false, true, false)
        ON CONFLICT (id) DO UPDATE SET id=EXCLUDED.id
        RETURNING *`
     );
     const gpsSettings = gpsSettingsResult.rows[0] || {};
     const gpsRequired = gpsSettings.gps_required === true;
+    const allowRemoteAttendance = gpsSettings.allow_remote_attendance === true;
     const lat = latitude === "" || latitude === null || latitude === undefined ? null : Number(latitude);
     const lon = longitude === "" || longitude === null || longitude === undefined ? null : Number(longitude);
     const gpsAccuracy = accuracy === "" || accuracy === null || accuracy === undefined ? null : Number(accuracy);
@@ -6813,7 +6998,7 @@ app.post("/attendance/scan", async (req, res) => {
       isInsideZone = distanceMeters <= allowedRadius;
     }
 
-    if (gpsRequired && !isInsideZone) {
+    if (gpsRequired && !allowRemoteAttendance && !isInsideZone) {
       return res.status(403).json({
         error: "Pointage refusé : vous êtes hors de la zone autorisée.",
         distance_meters: distanceMeters,
@@ -7013,7 +7198,15 @@ app.post("/attendance/scan", async (req, res) => {
       success: true,
       user,
       attendance: updatedAttendance.rows[0] || result.rows[0],
-      action
+      action,
+      gps: {
+        gps_required: gpsRequired,
+        site_name: gpsSettings.site_name || "",
+        distance_meters: distanceMeters,
+        allowed_radius_meters: allowedRadius,
+        is_inside_zone: isInsideZone,
+        allow_remote_attendance: allowRemoteAttendance
+      }
     });
   } catch (error) {
     console.error("ERREUR ATTENDANCE SCAN :", error);
