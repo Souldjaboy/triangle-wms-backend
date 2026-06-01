@@ -128,6 +128,18 @@ function canAdjustPosPrice(user) {
   return user?.is_super_admin === true || role === "super_admin" || role === "admin";
 }
 
+function productQrUrl(req, product) {
+  const forwardedProto = req.get("x-forwarded-proto") || req.protocol;
+  const host = req.get("host");
+  const baseUrl =
+    process.env.FRONTEND_PUBLIC_URL ||
+    process.env.NEXT_PUBLIC_FRONTEND_URL ||
+    process.env.PUBLIC_BASE_URL ||
+    `${host?.includes("trianglewmspro.com") ? "https" : forwardedProto}://${host}`;
+  const code = encodeURIComponent(product.reference || product.barcode || product.id);
+  return `${baseUrl.replace(/\/$/, "")}/scan/product/${code}`;
+}
+
 function stripSalaryFields(row, requester) {
   const canSeeSalary =
     canViewAllSalaries(requester) || Number(row.id || row.user_id) === Number(requester?.id);
@@ -1744,10 +1756,257 @@ app.get("/pos/products/search", authenticateToken, async (req, res) => {
       isSuperAdmin ? (q ? [search] : []) : q ? [search, companyId] : [companyId]
     );
 
-    res.json(result.rows);
+    res.json(
+      result.rows.map((product) => ({
+        ...product,
+        qr_url: productQrUrl(req, product),
+        effective_sale_price: Number(product.sale_price || product.pharmacy_price || 0)
+      }))
+    );
   } catch (error) {
     console.error("ERREUR POS SEARCH :", error);
     res.status(500).json({ error: "Erreur recherche produits POS" });
+  }
+});
+
+app.get("/pos/settings", authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.company_id;
+    const result = await pool.query(
+      `INSERT INTO pos_settings (company_id)
+       VALUES ($1)
+       ON CONFLICT (company_id) DO UPDATE SET company_id=EXCLUDED.company_id
+       RETURNING *`,
+      [companyId || null]
+    );
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("ERREUR POS SETTINGS :", error);
+    res.status(500).json({ error: "Erreur paramètres POS" });
+  }
+});
+
+app.put(
+  "/pos/settings",
+  authenticateToken,
+  authorizeRoles("admin", "super_admin"),
+  async (req, res) => {
+    try {
+      const companyId = req.user.company_id;
+      const {
+        pos_enabled,
+        default_tax_rate,
+        currency,
+        receipt_format,
+        printer_name,
+        allowed_payment_methods,
+        max_discount_rate
+      } = req.body;
+
+      const result = await pool.query(
+        `INSERT INTO pos_settings
+         (company_id, pos_enabled, default_tax_rate, currency, receipt_format,
+          printer_name, allowed_payment_methods, max_discount_rate)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+         ON CONFLICT (company_id)
+         DO UPDATE SET
+           pos_enabled=EXCLUDED.pos_enabled,
+           default_tax_rate=EXCLUDED.default_tax_rate,
+           currency=EXCLUDED.currency,
+           receipt_format=EXCLUDED.receipt_format,
+           printer_name=EXCLUDED.printer_name,
+           allowed_payment_methods=EXCLUDED.allowed_payment_methods,
+           max_discount_rate=EXCLUDED.max_discount_rate,
+           updated_at=CURRENT_TIMESTAMP
+         RETURNING *`,
+        [
+          companyId || null,
+          pos_enabled !== false,
+          Number(default_tax_rate || 0),
+          currency || "FCFA",
+          receipt_format || "80mm",
+          printer_name || "",
+          allowed_payment_methods || "",
+          Number(max_discount_rate || 0)
+        ]
+      );
+
+      res.json(result.rows[0]);
+    } catch (error) {
+      console.error("ERREUR UPDATE POS SETTINGS :", error);
+      res.status(500).json({ error: "Erreur modification paramètres POS" });
+    }
+  }
+);
+
+app.put(
+  "/pos/products/:id/settings",
+  authenticateToken,
+  authorizeRoles("admin", "super_admin"),
+  async (req, res) => {
+    try {
+      const companyId = req.user.company_id;
+      const isSuperAdmin = req.user.is_super_admin === true;
+      const {
+        purchase_price,
+        sale_price,
+        wholesale_price,
+        pharmacy_price,
+        tax_rate,
+        max_discount_rate,
+        barcode,
+        qr_code,
+        lot_number,
+        manufacture_date,
+        expiration_date,
+        supplier_id,
+        category,
+        subcategory,
+        blocked_for_sale,
+        expiration_tracking_enabled,
+        batch_tracking_enabled
+      } = req.body;
+
+      const result = await pool.query(
+        `UPDATE products
+         SET purchase_price=$1,
+             sale_price=$2,
+             wholesale_price=$3,
+             pharmacy_price=$4,
+             margin=($2 - $1),
+             tax_rate=$5,
+             max_discount_rate=$6,
+             barcode=$7,
+             qr_code=$8,
+             lot_number=$9,
+             manufacture_date=$10,
+             expiration_date=$11,
+             supplier_id=$12,
+             category=$13,
+             subcategory=$14,
+             blocked_for_sale=$15,
+             expiration_tracking_enabled=$16,
+             batch_tracking_enabled=$17,
+             updated_at=CURRENT_TIMESTAMP
+         WHERE id=$18 ${isSuperAdmin ? "" : "AND company_id=$19"}
+         RETURNING *`,
+        isSuperAdmin
+          ? [
+              Number(purchase_price || 0),
+              Number(sale_price || 0),
+              Number(wholesale_price || 0),
+              Number(pharmacy_price || 0),
+              Number(tax_rate || 0),
+              Number(max_discount_rate || 0),
+              barcode || "",
+              qr_code || "",
+              lot_number || "",
+              manufacture_date || null,
+              expiration_date || null,
+              supplier_id || null,
+              category || "",
+              subcategory || "",
+              blocked_for_sale === true,
+              expiration_tracking_enabled === true,
+              batch_tracking_enabled === true,
+              req.params.id
+            ]
+          : [
+              Number(purchase_price || 0),
+              Number(sale_price || 0),
+              Number(wholesale_price || 0),
+              Number(pharmacy_price || 0),
+              Number(tax_rate || 0),
+              Number(max_discount_rate || 0),
+              barcode || "",
+              qr_code || "",
+              lot_number || "",
+              manufacture_date || null,
+              expiration_date || null,
+              supplier_id || null,
+              category || "",
+              subcategory || "",
+              blocked_for_sale === true,
+              expiration_tracking_enabled === true,
+              batch_tracking_enabled === true,
+              req.params.id,
+              companyId
+            ]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({ error: "Produit introuvable" });
+      }
+
+      res.json({
+        ...result.rows[0],
+        qr_url: productQrUrl(req, result.rows[0])
+      });
+    } catch (error) {
+      console.error("ERREUR POS PRODUCT SETTINGS :", error);
+      res.status(500).json({ error: "Erreur paramètres produit POS" });
+    }
+  }
+);
+
+app.get("/pos/alerts", authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
+    const values = isSuperAdmin ? [] : [companyId];
+    const companyClause = isSuperAdmin ? "" : "AND company_id=$1";
+
+    const lowStock = await pool.query(
+      `SELECT 'stock_faible' AS type, id, reference, name, stock, minimum_stock
+       FROM products
+       WHERE stock > 0 AND stock <= minimum_stock ${companyClause}`,
+      values
+    );
+    const outStock = await pool.query(
+      `SELECT 'rupture' AS type, id, reference, name, stock, minimum_stock
+       FROM products
+       WHERE stock <= 0 ${companyClause}`,
+      values
+    );
+    const noPrice = await pool.query(
+      `SELECT 'prix_non_configure' AS type, id, reference, name, sale_price
+       FROM products
+       WHERE COALESCE(sale_price,0) <= 0 ${companyClause}`,
+      values
+    );
+    const blocked = await pool.query(
+      `SELECT 'produit_bloque' AS type, id, reference, name
+       FROM products
+       WHERE blocked_for_sale = true ${companyClause}`,
+      values
+    );
+    const batches = await pool.query(
+      `SELECT CASE
+          WHEN expiration_date < CURRENT_DATE THEN 'lot_expire'
+          WHEN expiration_date <= CURRENT_DATE + INTERVAL '7 days' THEN 'expire_7_jours'
+          WHEN expiration_date <= CURRENT_DATE + INTERVAL '30 days' THEN 'expire_30_jours'
+          WHEN expiration_date <= CURRENT_DATE + INTERVAL '90 days' THEN 'expire_90_jours'
+          ELSE 'lot'
+        END AS type,
+        id, lot_number, product_id, quantity_remaining, expiration_date
+       FROM product_batches
+       WHERE expiration_date IS NOT NULL
+       AND expiration_date <= CURRENT_DATE + INTERVAL '90 days'
+       ${companyClause}`,
+      values
+    );
+
+    res.json([
+      ...lowStock.rows,
+      ...outStock.rows,
+      ...noPrice.rows,
+      ...blocked.rows,
+      ...batches.rows
+    ]);
+  } catch (error) {
+    console.error("ERREUR POS ALERTS :", error);
+    res.status(500).json({ error: "Erreur alertes POS" });
   }
 });
 
@@ -1761,7 +2020,7 @@ app.get("/products/:id/batches", authenticateToken, async (req, res) => {
        FROM product_batches
        WHERE product_id=$1
        ${isSuperAdmin ? "" : "AND company_id=$2"}
-       ORDER BY expiration_date ASC NULLS LAST, id ASC`,
+       ORDER BY expiration_date ASC NULLS LAST, received_at ASC NULLS LAST, id ASC`,
       isSuperAdmin ? [req.params.id] : [req.params.id, companyId]
     );
 
@@ -1848,7 +2107,14 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
 
     let subtotal = 0;
     let taxAmount = 0;
-    const saleNumber = `SALE-${Date.now()}`;
+    const saleYear = new Date().getFullYear();
+    const saleCountResult = await client.query(
+      `SELECT COUNT(*)::int AS count
+       FROM sales
+       WHERE company_id=$1 AND EXTRACT(YEAR FROM created_at)=$2`,
+      [companyId, saleYear]
+    );
+    const saleNumber = `VENTE-${saleYear}-${String(Number(saleCountResult.rows[0]?.count || 0) + 1).padStart(6, "0")}`;
 
     const saleResult = await client.query(
       `INSERT INTO sales
@@ -1891,6 +2157,10 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
         throw new Error("Produit introuvable dans cette entreprise.");
       }
 
+      if (product.blocked_for_sale) {
+        throw new Error(`Produit bloqué à la vente : ${product.reference}.`);
+      }
+
       const quantity = Number(item.quantity || 1);
       const unitPrice = Number(item.unit_price ?? product.sale_price ?? 0);
       const itemDiscount = Number(item.discount_amount || 0);
@@ -1920,7 +2190,7 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
              AND quantity_remaining >= $3
              AND status='active'
              AND (expiration_date IS NULL OR expiration_date >= CURRENT_DATE)
-           ORDER BY expiration_date ASC NULLS LAST, id ASC
+           ORDER BY expiration_date ASC NULLS LAST, received_at ASC NULLS LAST, id ASC
            LIMIT 1
            FOR UPDATE`,
           [product.id, companyId, quantity]
@@ -2021,7 +2291,7 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
       [subtotal, taxAmount, totalAmount, sale.id]
     );
 
-    const receiptNumber = `REC-${Date.now()}`;
+    const receiptNumber = `REC-${saleYear}-${String(sale.id).padStart(6, "0")}`;
     const receiptResult = await client.query(
       `INSERT INTO receipts
        (company_id, sale_id, receipt_number, receipt_data, total_amount,
@@ -2097,15 +2367,44 @@ app.get("/pos/sales", authenticateToken, async (req, res) => {
   try {
     const companyId = req.user.company_id;
     const isSuperAdmin = req.user.is_super_admin === true;
+    const { q = "", date_from, date_to, payment_method, status } = req.query;
+    const values = [];
 
-    const result = await pool.query(
-      `SELECT *
-       FROM sales
-       ${isSuperAdmin ? "" : "WHERE company_id=$1"}
-       ORDER BY id DESC
-       LIMIT 200`,
-      isSuperAdmin ? [] : [companyId]
-    );
+    let query = `SELECT * FROM sales WHERE 1=1`;
+
+    if (!isSuperAdmin) {
+      values.push(companyId);
+      query += ` AND company_id=$${values.length}`;
+    }
+
+    if (q) {
+      values.push(`%${String(q)}%`);
+      query += ` AND (sale_number ILIKE $${values.length} OR customer_name ILIKE $${values.length} OR created_by_name ILIKE $${values.length})`;
+    }
+
+    if (date_from) {
+      values.push(date_from);
+      query += ` AND DATE(created_at) >= $${values.length}`;
+    }
+
+    if (date_to) {
+      values.push(date_to);
+      query += ` AND DATE(created_at) <= $${values.length}`;
+    }
+
+    if (payment_method) {
+      values.push(payment_method);
+      query += ` AND payment_method=$${values.length}`;
+    }
+
+    if (status) {
+      values.push(status);
+      query += ` AND status=$${values.length}`;
+    }
+
+    query += ` ORDER BY id DESC LIMIT 300`;
+
+    const result = await pool.query(query, values);
 
     res.json(result.rows);
   } catch (error) {
@@ -2134,8 +2433,16 @@ app.get("/pos/sales/:id", authenticateToken, async (req, res) => {
       "SELECT * FROM sale_items WHERE sale_id=$1 ORDER BY id ASC",
       [req.params.id]
     );
+    const receiptResult = await pool.query(
+      "SELECT * FROM receipts WHERE sale_id=$1 ORDER BY id DESC LIMIT 1",
+      [req.params.id]
+    );
 
-    res.json({ sale: saleResult.rows[0], items: itemsResult.rows });
+    res.json({
+      sale: saleResult.rows[0],
+      items: itemsResult.rows,
+      receipt: receiptResult.rows[0] || null
+    });
   } catch (error) {
     console.error("ERREUR POS SALE DETAIL :", error);
     res.status(500).json({ error: "Erreur détail vente POS" });
@@ -2336,6 +2643,85 @@ app.get("/pos/reports/payments", authenticateToken, async (req, res) => {
   } catch (error) {
     console.error("ERREUR RAPPORT POS PAIEMENTS :", error);
     res.status(500).json({ error: "Erreur rapport paiements POS" });
+  }
+});
+
+app.get("/super-admin/modules", authenticateToken, async (req, res) => {
+  try {
+    if (req.user.is_super_admin !== true && normalizeRole(req.user.role) !== "super_admin") {
+      return res.status(403).json({ error: "Accès super admin requis." });
+    }
+
+    const moduleKeys = [
+      "pos",
+      "ventes",
+      "achats",
+      "pointage",
+      "inventaire",
+      "ia",
+      "reunions",
+      "documents",
+      "rapports",
+      "transport",
+      "crm"
+    ];
+
+    const companiesResult = await pool.query(
+      "SELECT id, name FROM companies ORDER BY id ASC"
+    );
+    const modulesResult = await pool.query(
+      "SELECT * FROM company_modules ORDER BY company_id ASC, module_key ASC"
+    );
+
+    res.json({
+      module_keys: moduleKeys,
+      companies: companiesResult.rows.map((company) => ({
+        ...company,
+        modules: moduleKeys.reduce((acc, key) => {
+          const configured = modulesResult.rows.find(
+            (item) => Number(item.company_id) === Number(company.id) && item.module_key === key
+          );
+          acc[key] = configured ? configured.is_enabled === true : true;
+          return acc;
+        }, {})
+      }))
+    });
+  } catch (error) {
+    console.error("ERREUR SUPER ADMIN MODULES :", error);
+    res.status(500).json({ error: "Erreur lecture modules" });
+  }
+});
+
+app.put("/super-admin/modules/company/:companyId", authenticateToken, async (req, res) => {
+  try {
+    if (req.user.is_super_admin !== true && normalizeRole(req.user.role) !== "super_admin") {
+      return res.status(403).json({ error: "Accès super admin requis." });
+    }
+
+    const { modules = {} } = req.body;
+    const saved = [];
+
+    for (const [moduleKey, isEnabled] of Object.entries(modules)) {
+      const result = await pool.query(
+        `INSERT INTO company_modules
+         (company_id, module_key, is_enabled, updated_by)
+         VALUES ($1,$2,$3,$4)
+         ON CONFLICT (company_id, module_key)
+         DO UPDATE SET
+           is_enabled=EXCLUDED.is_enabled,
+           updated_by=EXCLUDED.updated_by,
+           updated_at=CURRENT_TIMESTAMP
+         RETURNING *`,
+        [req.params.companyId, moduleKey, isEnabled === true, req.user.id]
+      );
+
+      saved.push(result.rows[0]);
+    }
+
+    res.json(saved);
+  } catch (error) {
+    console.error("ERREUR UPDATE MODULES :", error);
+    res.status(500).json({ error: "Erreur modification modules" });
   }
 });
 
@@ -2996,7 +3382,9 @@ app.get("/scan/resolve/:code", authenticateToken, async (req, res) => {
 
     try {
       const parsedUrl = new URL(code);
-      code = parsedUrl.searchParams.get("location") || code;
+      const productMatch = parsedUrl.pathname.match(/\/scan\/product\/([^/]+)/);
+      code = parsedUrl.searchParams.get("location") || (productMatch ? productMatch[1] : code);
+      code = decodeURIComponent(code);
     } catch {}
 
     const values = isSuperAdmin ? [code] : [code, companyId];
@@ -3087,7 +3475,7 @@ app.get("/scan/resolve/:code", authenticateToken, async (req, res) => {
               locations.bin_mode, locations.warehouse_code
        FROM products
        LEFT JOIN locations ON products.location_id = locations.id
-       WHERE (products.reference=$1 OR products.barcode=$1)
+       WHERE (products.reference=$1 OR products.barcode=$1 OR products.sku=$1 OR products.qr_code=$1)
        ${isSuperAdmin ? "" : "AND products.company_id=$2"}
        LIMIT 1`,
       values
@@ -3095,6 +3483,15 @@ app.get("/scan/resolve/:code", authenticateToken, async (req, res) => {
 
     if (productResult.rows.length > 0) {
       const product = productResult.rows[0];
+      const batchesResult = await pool.query(
+        `SELECT *
+         FROM product_batches
+         WHERE product_id=$1
+         ${isSuperAdmin ? "" : "AND company_id=$2"}
+         ORDER BY expiration_date ASC NULLS LAST, received_at ASC NULLS LAST, id ASC
+         LIMIT 20`,
+        isSuperAdmin ? [product.id] : [product.id, companyId]
+      );
       const movementsResult = await pool.query(
         `SELECT *
          FROM stock_movements
@@ -3108,7 +3505,11 @@ app.get("/scan/resolve/:code", authenticateToken, async (req, res) => {
       return res.json({
         type: "product",
         code,
-        product,
+        product: {
+          ...product,
+          qr_url: productQrUrl(req, product)
+        },
+        batches: batchesResult.rows,
         movements: movementsResult.rows,
         alerts:
           Number(product.stock || 0) <= Number(product.minimum_stock || 0)
