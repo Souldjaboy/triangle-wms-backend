@@ -6,6 +6,7 @@ const QRCode = require("qrcode");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
+const crypto = require("crypto");
 require("dotenv").config();
 
 const app = express();
@@ -190,6 +191,63 @@ function optionalNumber(value) {
   if (value === "" || value === null || value === undefined) return null;
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
+}
+
+function paymentCryptoKey() {
+  return crypto
+    .createHash("sha256")
+    .update(process.env.PAYMENT_SETTINGS_SECRET || process.env.JWT_SECRET || "triangle-wms-payment-secret")
+    .digest();
+}
+
+function encryptPaymentSecret(value) {
+  if (!value) return "";
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", paymentCryptoKey(), iv);
+  const encrypted = Buffer.concat([cipher.update(String(value), "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `${iv.toString("hex")}:${tag.toString("hex")}:${encrypted.toString("hex")}`;
+}
+
+function decryptPaymentSecret(value) {
+  if (!value || !String(value).includes(":")) return "";
+  try {
+    const [ivHex, tagHex, encryptedHex] = String(value).split(":");
+    const decipher = crypto.createDecipheriv(
+      "aes-256-gcm",
+      paymentCryptoKey(),
+      Buffer.from(ivHex, "hex")
+    );
+    decipher.setAuthTag(Buffer.from(tagHex, "hex"));
+    return Buffer.concat([
+      decipher.update(Buffer.from(encryptedHex, "hex")),
+      decipher.final()
+    ]).toString("utf8");
+  } catch {
+    return "";
+  }
+}
+
+function maskSecret(value) {
+  if (!value) return "";
+  return "••••••••";
+}
+
+function isExternalPaymentMethod(method) {
+  return ["Carte bancaire", "Orange Money", "Moov Money", "Wave"].includes(String(method || ""));
+}
+
+function providerKeyFromMethod(method) {
+  const normalized = String(method || "").toLowerCase();
+  if (normalized.includes("carte")) return "card";
+  if (normalized.includes("orange")) return "orange_money";
+  if (normalized.includes("moov")) return "moov_money";
+  if (normalized.includes("wave")) return "wave";
+  if (normalized.includes("virement")) return "bank_transfer";
+  if (normalized.includes("chèque") || normalized.includes("cheque")) return "check";
+  if (normalized.includes("mixte")) return "mixed";
+  if (normalized.includes("crédit") || normalized.includes("credit")) return "customer_credit";
+  return "cash";
 }
 
 function productQrUrl(req, product) {
@@ -2106,6 +2164,118 @@ app.get("/pos/alerts", authenticateToken, async (req, res) => {
   }
 });
 
+app.get("/pos/payment-settings", authenticateToken, async (req, res) => {
+  try {
+    if (!canAdjustPosPrice(req.user)) {
+      return res.status(403).json({ error: "Accès admin requis." });
+    }
+
+    const companyId = req.user.company_id;
+    const result = await pool.query(
+      `SELECT id, company_id, provider_key, public_key, secret_key_encrypted,
+              merchant_number, orange_money_account, moov_money_account,
+              wave_account, currency, mode, webhook_url, is_active, updated_at
+       FROM payment_settings
+       WHERE company_id=$1
+       ORDER BY provider_key ASC`,
+      [companyId || null]
+    );
+
+    res.json(
+      result.rows.map((row) => ({
+        ...row,
+        secret_key: maskSecret(row.secret_key_encrypted),
+        secret_key_encrypted: undefined
+      }))
+    );
+  } catch (error) {
+    console.error("ERREUR PAYMENT SETTINGS :", error);
+    res.status(500).json({ error: "Erreur paramètres paiement" });
+  }
+});
+
+app.put("/pos/payment-settings", authenticateToken, async (req, res) => {
+  try {
+    if (!canAdjustPosPrice(req.user)) {
+      return res.status(403).json({ error: "Accès admin requis." });
+    }
+
+    const companyId = req.user.company_id;
+    const {
+      provider_key,
+      public_key,
+      secret_key,
+      merchant_number,
+      orange_money_account,
+      moov_money_account,
+      wave_account,
+      currency = "FCFA",
+      mode = "test",
+      webhook_url,
+      is_active
+    } = req.body;
+
+    if (!provider_key) {
+      return res.status(400).json({ error: "Fournisseur obligatoire." });
+    }
+
+    const existing = await pool.query(
+      "SELECT secret_key_encrypted FROM payment_settings WHERE company_id=$1 AND provider_key=$2 LIMIT 1",
+      [companyId || null, provider_key]
+    );
+    const secretValue =
+      secret_key && secret_key !== "••••••••"
+        ? encryptPaymentSecret(secret_key)
+        : existing.rows[0]?.secret_key_encrypted || "";
+
+    const result = await pool.query(
+      `INSERT INTO payment_settings
+       (company_id, provider_key, public_key, secret_key_encrypted,
+        merchant_number, orange_money_account, moov_money_account,
+        wave_account, currency, mode, webhook_url, is_active,
+        created_by, updated_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13)
+       ON CONFLICT (company_id, provider_key)
+       DO UPDATE SET
+         public_key=EXCLUDED.public_key,
+         secret_key_encrypted=EXCLUDED.secret_key_encrypted,
+         merchant_number=EXCLUDED.merchant_number,
+         orange_money_account=EXCLUDED.orange_money_account,
+         moov_money_account=EXCLUDED.moov_money_account,
+         wave_account=EXCLUDED.wave_account,
+         currency=EXCLUDED.currency,
+         mode=EXCLUDED.mode,
+         webhook_url=EXCLUDED.webhook_url,
+         is_active=EXCLUDED.is_active,
+         updated_by=EXCLUDED.updated_by,
+         updated_at=CURRENT_TIMESTAMP
+       RETURNING id, company_id, provider_key, public_key, merchant_number,
+                 orange_money_account, moov_money_account, wave_account,
+                 currency, mode, webhook_url, is_active, updated_at`,
+      [
+        companyId || null,
+        provider_key,
+        public_key || "",
+        secretValue,
+        merchant_number || "",
+        orange_money_account || "",
+        moov_money_account || "",
+        wave_account || "",
+        currency || "FCFA",
+        mode === "production" ? "production" : "test",
+        webhook_url || "",
+        is_active === true,
+        req.user.id
+      ]
+    );
+
+    res.json({ ...result.rows[0], secret_key: maskSecret(secretValue) });
+  } catch (error) {
+    console.error("ERREUR UPDATE PAYMENT SETTINGS :", error);
+    res.status(500).json({ error: "Erreur sauvegarde paramètres paiement" });
+  }
+});
+
 app.get("/products/:id/batches", authenticateToken, async (req, res) => {
   try {
     const companyId = req.user.company_id;
@@ -2192,7 +2362,10 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
       tax_enabled = false,
       payment_method = "Espèces",
       payment_status = "payé",
-      warehouse_id = null
+      warehouse_id = null,
+      amount_received = 0,
+      change_due = 0,
+      remaining_amount = 0
     } = req.body;
 
     if (!Array.isArray(items) || items.length === 0) {
@@ -2220,6 +2393,11 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
     );
     const saleNumber = `VENTE-${saleYear}-${String(Number(saleCountResult.rows[0]?.count || 0) + 1).padStart(6, "0")}`;
 
+    const providerKey = providerKeyFromMethod(payment_method);
+    const requestedPaymentStatus = isExternalPaymentMethod(payment_method)
+      ? "en attente"
+      : payment_status;
+
     const saleResult = await client.query(
       `INSERT INTO sales
        (company_id, warehouse_id, sale_number, customer_name, customer_phone,
@@ -2235,8 +2413,8 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
         customer_phone || "",
         Number(discount_amount || 0),
         payment_method,
-        payment_status,
-        payment_status === "payé" ? "validée" : "en attente",
+        requestedPaymentStatus,
+        requestedPaymentStatus === "payé" ? "validée" : "en attente",
         req.user.id,
         req.user.email || "Utilisateur",
         req.user.role || ""
@@ -2388,13 +2566,88 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
     }
 
     const totalAmount = Math.max(subtotal - Number(discount_amount || 0) + taxAmount, 0);
+    const paidAmount = Number(amount_received || 0);
+    const dueAmount = Math.max(
+      remaining_amount || totalAmount - paidAmount,
+      0
+    );
 
     const updatedSale = await client.query(
       `UPDATE sales
-       SET subtotal=$1, tax_amount=$2, total_amount=$3, updated_at=CURRENT_TIMESTAMP
-       WHERE id=$4
+       SET subtotal=$1,
+           tax_amount=$2,
+           total_amount=$3,
+           amount_paid=$4,
+           amount_due=$5,
+           change_due=$6,
+           provider=$7,
+           payment_status=$8,
+           status=$9,
+           updated_at=CURRENT_TIMESTAMP
+       WHERE id=$10
        RETURNING *`,
-      [subtotal, taxAmount, totalAmount, sale.id]
+      [
+        subtotal,
+        taxAmount,
+        totalAmount,
+        paidAmount,
+        dueAmount,
+        Number(change_due || 0),
+        providerKey,
+        requestedPaymentStatus,
+        requestedPaymentStatus === "payé" ? "validée" : "en attente",
+        sale.id
+      ]
+    );
+
+    const transactionReference = `${providerKey.toUpperCase()}-${saleNumber}`;
+    const transactionResult = await client.query(
+      `INSERT INTO payment_transactions
+       (company_id, sale_id, provider_key, payment_method, amount, currency,
+        status, provider_reference, external_reference, request_payload,
+        response_payload, created_by)
+       VALUES ($1,$2,$3,$4,$5,'FCFA',$6,$7,$8,$9,$10,$11)
+       RETURNING *`,
+      [
+        companyId,
+        sale.id,
+        providerKey,
+        payment_method,
+        totalAmount,
+        requestedPaymentStatus,
+        transactionReference,
+        saleNumber,
+        JSON.stringify({ sale_id: sale.id, payment_method, amount: totalAmount }),
+        JSON.stringify({
+          message: isExternalPaymentMethod(payment_method)
+            ? "Transaction créée. Connecter le fournisseur marchand pour finaliser le paiement réel."
+            : "Paiement manuel enregistré."
+        }),
+        req.user.id
+      ]
+    );
+
+    await client.query(
+      `UPDATE sales
+       SET transaction_id=$1, payment_reference=$2
+       WHERE id=$3`,
+      [transactionResult.rows[0].id, transactionReference, sale.id]
+    );
+
+    await client.query(
+      `INSERT INTO sale_payments
+       (company_id, sale_id, transaction_id, payment_method, amount, currency,
+        status, created_by)
+       VALUES ($1,$2,$3,$4,$5,'FCFA',$6,$7)`,
+      [
+        companyId,
+        sale.id,
+        transactionResult.rows[0].id,
+        payment_method,
+        paidAmount || totalAmount,
+        requestedPaymentStatus,
+        req.user.id
+      ]
     );
 
     const receiptNumber = `REC-${saleYear}-${String(sale.id).padStart(6, "0")}`;
@@ -2453,7 +2706,7 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
         totalAmount,
         payment_method,
         saleNumber,
-        payment_status,
+        requestedPaymentStatus,
         `Paiement POS ${saleNumber}`,
         sale.id,
         receiptResult.rows[0].id
@@ -2466,7 +2719,9 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
       sale: updatedSale.rows[0],
       items: saleItems,
       receipt: receiptResult.rows[0],
-      company_settings: companySettingsResult.rows[0] || null
+      company_settings: companySettingsResult.rows[0] || null,
+      payment_transaction: transactionResult.rows[0],
+      payment_required: isExternalPaymentMethod(payment_method)
     });
   } catch (error) {
     await client.query("ROLLBACK");
@@ -2748,6 +3003,107 @@ app.post("/pos/payments", authenticateToken, async (req, res) => {
     console.error("ERREUR POS PAYMENT :", error);
     res.status(500).json({ error: "Erreur paiement POS" });
   }
+});
+
+async function handlePaymentWebhook(req, res, providerKey) {
+  try {
+    const payload = req.body || {};
+    const reference =
+      payload.provider_reference ||
+      payload.payment_reference ||
+      payload.reference ||
+      payload.transaction_id ||
+      payload.external_reference ||
+      "";
+    const status =
+      payload.status === "paid" || payload.status === "success" || payload.status === "payé"
+        ? "payé"
+        : payload.status || "en attente";
+
+    const transactionResult = await pool.query(
+      `SELECT *
+       FROM payment_transactions
+       WHERE provider_key=$1
+       AND (
+         provider_reference=$2
+         OR external_reference=$2
+         OR CAST(id AS TEXT)=$2
+       )
+       ORDER BY id DESC
+       LIMIT 1`,
+      [providerKey, String(reference)]
+    );
+
+    if (transactionResult.rows.length === 0) {
+      return res.status(404).json({ error: "Transaction introuvable" });
+    }
+
+    const transaction = transactionResult.rows[0];
+
+    await pool.query(
+      `UPDATE payment_transactions
+       SET status=$1,
+           response_payload=$2,
+           paid_at=CASE WHEN $1='payé' THEN CURRENT_TIMESTAMP ELSE paid_at END,
+           updated_at=CURRENT_TIMESTAMP
+       WHERE id=$3`,
+      [status, JSON.stringify(payload), transaction.id]
+    );
+
+    await pool.query(
+      `UPDATE sale_payments
+       SET status=$1
+       WHERE transaction_id=$2`,
+      [status, transaction.id]
+    );
+
+    const saleUpdate = await pool.query(
+      `UPDATE sales
+       SET payment_status=$1,
+           status=CASE WHEN $1='payé' THEN 'validée' ELSE status END,
+           amount_paid=CASE WHEN $1='payé' THEN total_amount ELSE amount_paid END,
+           amount_due=CASE WHEN $1='payé' THEN 0 ELSE amount_due END,
+           updated_at=CURRENT_TIMESTAMP
+       WHERE id=$2
+       RETURNING *`,
+      [status, transaction.sale_id]
+    );
+
+    if (status === "payé" && saleUpdate.rows[0]) {
+      await createNotification({
+        user_id: saleUpdate.rows[0].created_by,
+        title: "Paiement POS confirmé",
+        message: `Paiement confirmé pour ${saleUpdate.rows[0].sale_number}.`,
+        type: "payment_validated",
+        company_id: saleUpdate.rows[0].company_id,
+        related_entity_type: "sale",
+        related_entity_id: saleUpdate.rows[0].id,
+        action_url: `/pos/recus?sale=${saleUpdate.rows[0].id}`,
+        created_by: saleUpdate.rows[0].created_by
+      });
+    }
+
+    res.json({ ok: true, status, sale: saleUpdate.rows[0] || null });
+  } catch (error) {
+    console.error("ERREUR WEBHOOK PAIEMENT :", error);
+    res.status(500).json({ error: "Erreur webhook paiement" });
+  }
+}
+
+app.post("/payments/webhook/card", async (req, res) => {
+  await handlePaymentWebhook(req, res, "card");
+});
+
+app.post("/payments/webhook/orange-money", async (req, res) => {
+  await handlePaymentWebhook(req, res, "orange_money");
+});
+
+app.post("/payments/webhook/moov-money", async (req, res) => {
+  await handlePaymentWebhook(req, res, "moov_money");
+});
+
+app.post("/payments/webhook/wave", async (req, res) => {
+  await handlePaymentWebhook(req, res, "wave");
 });
 
 app.get("/pos/reports/products", authenticateToken, async (req, res) => {
