@@ -128,6 +128,15 @@ function canAdjustPosPrice(user) {
   return user?.is_super_admin === true || role === "super_admin" || role === "admin";
 }
 
+function getEffectivePosPrice(product) {
+  return Number(
+    product.sale_price ||
+      product.pharmacy_price ||
+      product.wholesale_price ||
+      0
+  );
+}
+
 function productQrUrl(req, product) {
   const forwardedProto = req.get("x-forwarded-proto") || req.protocol;
   const host = req.get("host");
@@ -1760,7 +1769,7 @@ app.get("/pos/products/search", authenticateToken, async (req, res) => {
       result.rows.map((product) => ({
         ...product,
         qr_url: productQrUrl(req, product),
-        effective_sale_price: Number(product.sale_price || product.pharmacy_price || 0)
+        effective_sale_price: getEffectivePosPrice(product)
       }))
     );
   } catch (error) {
@@ -1773,8 +1782,8 @@ app.get("/pos/settings", authenticateToken, async (req, res) => {
   try {
     const companyId = req.user.company_id;
     const result = await pool.query(
-      `INSERT INTO pos_settings (company_id)
-       VALUES ($1)
+      `INSERT INTO pos_settings (company_id, default_tax_rate)
+       VALUES ($1, 18)
        ON CONFLICT (company_id) DO UPDATE SET company_id=EXCLUDED.company_id
        RETURNING *`,
       [companyId || null]
@@ -1803,6 +1812,10 @@ app.put(
         allowed_payment_methods,
         max_discount_rate
       } = req.body;
+      const taxRate =
+        default_tax_rate === "" || default_tax_rate === null || default_tax_rate === undefined
+          ? 18
+          : Number(default_tax_rate);
 
       const result = await pool.query(
         `INSERT INTO pos_settings
@@ -1823,7 +1836,7 @@ app.put(
         [
           companyId || null,
           pos_enabled !== false,
-          Number(default_tax_rate || 0),
+          taxRate,
           currency || "FCFA",
           receipt_format || "80mm",
           printer_name || "",
@@ -2105,6 +2118,14 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
 
     await client.query("BEGIN");
 
+    const settingsResult = await client.query(
+      `INSERT INTO pos_settings (company_id, default_tax_rate)
+       VALUES ($1, 18)
+       ON CONFLICT (company_id) DO UPDATE SET company_id=EXCLUDED.company_id
+       RETURNING *`,
+      [companyId || null]
+    );
+    const posSettings = settingsResult.rows[0] || {};
     let subtotal = 0;
     let taxAmount = 0;
     const saleYear = new Date().getFullYear();
@@ -2162,11 +2183,12 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
       }
 
       const quantity = Number(item.quantity || 1);
-      const unitPrice = Number(item.unit_price ?? product.sale_price ?? 0);
+      const expectedPrice = getEffectivePosPrice(product);
+      const unitPrice = Number(item.unit_price ?? expectedPrice);
       const itemDiscount = Number(item.discount_amount || 0);
 
       if (!canAdjustPosPrice(req.user)) {
-        if (unitPrice !== Number(product.sale_price || 0) || itemDiscount > 0) {
+        if (unitPrice !== expectedPrice || itemDiscount > 0) {
           throw new Error("Vous n'avez pas le droit de modifier le prix ou la remise.");
         }
       }
@@ -2213,7 +2235,8 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
         }
       }
 
-      const lineTax = tax_enabled ? (unitPrice * quantity * Number(product.tax_rate || 0)) / 100 : 0;
+      const taxRate = Number(product.tax_rate || posSettings.default_tax_rate || 18);
+      const lineTax = tax_enabled ? (unitPrice * quantity * taxRate) / 100 : 0;
       const lineTotal = unitPrice * quantity - itemDiscount + lineTax;
       subtotal += unitPrice * quantity - itemDiscount;
       taxAmount += lineTax;
@@ -2245,7 +2268,7 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
           quantity,
           unitPrice,
           itemDiscount,
-          Number(product.tax_rate || 0),
+          taxRate,
           lineTotal,
           warehouse_id || product.warehouse_id || null,
           product.location_id || null
@@ -2292,6 +2315,9 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
     );
 
     const receiptNumber = `REC-${saleYear}-${String(sale.id).padStart(6, "0")}`;
+    const companySettingsResult = await client.query(
+      "SELECT * FROM company_settings ORDER BY id ASC LIMIT 1"
+    );
     const receiptResult = await client.query(
       `INSERT INTO receipts
        (company_id, sale_id, receipt_number, receipt_data, total_amount,
@@ -2302,7 +2328,11 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
         companyId,
         sale.id,
         receiptNumber,
-        JSON.stringify({ sale: updatedSale.rows[0], items: saleItems }),
+        JSON.stringify({
+          sale: updatedSale.rows[0],
+          items: saleItems,
+          company_settings: companySettingsResult.rows[0] || null
+        }),
         totalAmount,
         payment_method,
         payment_status,
@@ -2352,7 +2382,8 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
     res.status(201).json({
       sale: updatedSale.rows[0],
       items: saleItems,
-      receipt: receiptResult.rows[0]
+      receipt: receiptResult.rows[0],
+      company_settings: companySettingsResult.rows[0] || null
     });
   } catch (error) {
     await client.query("ROLLBACK");
@@ -2367,10 +2398,22 @@ app.get("/pos/sales", authenticateToken, async (req, res) => {
   try {
     const companyId = req.user.company_id;
     const isSuperAdmin = req.user.is_super_admin === true;
-    const { q = "", date_from, date_to, payment_method, status } = req.query;
+    const {
+      q = "",
+      date_from,
+      date_to,
+      payment_method,
+      status,
+      product = "",
+      cashier = "",
+      cash_register_id
+    } = req.query;
     const values = [];
 
-    let query = `SELECT * FROM sales WHERE 1=1`;
+    let query = `SELECT DISTINCT sales.*
+                 FROM sales
+                 LEFT JOIN sale_items ON sale_items.sale_id = sales.id
+                 WHERE 1=1`;
 
     if (!isSuperAdmin) {
       values.push(companyId);
@@ -2379,30 +2422,51 @@ app.get("/pos/sales", authenticateToken, async (req, res) => {
 
     if (q) {
       values.push(`%${String(q)}%`);
-      query += ` AND (sale_number ILIKE $${values.length} OR customer_name ILIKE $${values.length} OR created_by_name ILIKE $${values.length})`;
+      query += ` AND (sales.sale_number ILIKE $${values.length}
+                      OR sales.customer_name ILIKE $${values.length}
+                      OR sales.created_by_name ILIKE $${values.length}
+                      OR sale_items.product_name ILIKE $${values.length}
+                      OR sale_items.product_reference ILIKE $${values.length})`;
+    }
+
+    if (product) {
+      values.push(`%${String(product)}%`);
+      query += ` AND (sale_items.product_name ILIKE $${values.length}
+                      OR sale_items.product_reference ILIKE $${values.length}
+                      OR sale_items.barcode ILIKE $${values.length})`;
+    }
+
+    if (cashier) {
+      values.push(`%${String(cashier)}%`);
+      query += ` AND sales.created_by_name ILIKE $${values.length}`;
+    }
+
+    if (cash_register_id) {
+      values.push(cash_register_id);
+      query += ` AND sales.cash_register_id=$${values.length}`;
     }
 
     if (date_from) {
       values.push(date_from);
-      query += ` AND DATE(created_at) >= $${values.length}`;
+      query += ` AND DATE(sales.created_at) >= $${values.length}`;
     }
 
     if (date_to) {
       values.push(date_to);
-      query += ` AND DATE(created_at) <= $${values.length}`;
+      query += ` AND DATE(sales.created_at) <= $${values.length}`;
     }
 
     if (payment_method) {
       values.push(payment_method);
-      query += ` AND payment_method=$${values.length}`;
+      query += ` AND sales.payment_method=$${values.length}`;
     }
 
     if (status) {
       values.push(status);
-      query += ` AND status=$${values.length}`;
+      query += ` AND sales.status=$${values.length}`;
     }
 
-    query += ` ORDER BY id DESC LIMIT 300`;
+    query += ` ORDER BY sales.id DESC LIMIT 300`;
 
     const result = await pool.query(query, values);
 
@@ -2437,11 +2501,15 @@ app.get("/pos/sales/:id", authenticateToken, async (req, res) => {
       "SELECT * FROM receipts WHERE sale_id=$1 ORDER BY id DESC LIMIT 1",
       [req.params.id]
     );
+    const companySettingsResult = await pool.query(
+      "SELECT * FROM company_settings ORDER BY id ASC LIMIT 1"
+    );
 
     res.json({
       sale: saleResult.rows[0],
       items: itemsResult.rows,
-      receipt: receiptResult.rows[0] || null
+      receipt: receiptResult.rows[0] || null,
+      company_settings: companySettingsResult.rows[0] || null
     });
   } catch (error) {
     console.error("ERREUR POS SALE DETAIL :", error);

@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS pos_settings (
   id SERIAL PRIMARY KEY,
   company_id INTEGER UNIQUE,
   pos_enabled BOOLEAN DEFAULT true,
-  default_tax_rate NUMERIC(6,2) DEFAULT 0,
+  default_tax_rate NUMERIC(6,2) DEFAULT 18,
   currency VARCHAR(20) DEFAULT 'FCFA',
   receipt_format VARCHAR(50) DEFAULT '80mm',
   printer_name VARCHAR(255) DEFAULT '',
@@ -53,3 +53,7 @@ CREATE INDEX IF NOT EXISTS idx_products_blocked_for_sale ON products(blocked_for
 UPDATE products
 SET qr_code = reference
 WHERE (qr_code IS NULL OR qr_code = '') AND reference IS NOT NULL;
+
+UPDATE pos_settings
+SET default_tax_rate = 18
+WHERE default_tax_rate IS NULL;
