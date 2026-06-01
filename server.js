@@ -177,6 +177,21 @@ function getEffectivePosPrice(product) {
   return 0;
 }
 
+function normalizeProductLookupCode(value) {
+  return String(value || "")
+    .trim()
+    .replace(/^https?:\/\/[^/]+\/scan\/product\//i, "")
+    .replace(/^Ref\s*[-_]*\s*/i, "")
+    .replace(/[^a-zA-Z0-9]/g, "")
+    .toLowerCase();
+}
+
+function optionalNumber(value) {
+  if (value === "" || value === null || value === undefined) return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
 function productQrUrl(req, product) {
   const forwardedProto = req.get("x-forwarded-proto") || req.protocol;
   const host = req.get("host");
@@ -1819,6 +1834,7 @@ app.get("/pos/products/search", authenticateToken, async (req, res) => {
     const isSuperAdmin = req.user.is_super_admin === true;
     const q = String(req.query.q || "").trim();
     const search = `%${q}%`;
+    const normalizedSearch = normalizeProductLookupCode(q);
 
     const result = await pool.query(
       `SELECT products.*, locations.emplacement_code, locations.rayon_code,
@@ -1827,11 +1843,27 @@ app.get("/pos/products/search", authenticateToken, async (req, res) => {
        FROM products
        LEFT JOIN locations ON products.location_id = locations.id
        WHERE products.is_active IS NOT FALSE
-       ${q ? `AND (products.name ILIKE $1 OR products.reference ILIKE $1 OR products.barcode ILIKE $1 OR products.sku ILIKE $1 OR products.qr_code ILIKE $1)` : ""}
-       ${isSuperAdmin ? "" : `AND products.company_id = $${q ? 2 : 1}`}
+       ${q ? `AND (
+          products.name ILIKE $1
+          OR products.reference ILIKE $1
+          OR products.barcode ILIKE $1
+          OR products.sku ILIKE $1
+          OR products.qr_code ILIKE $1
+          OR regexp_replace(lower(regexp_replace(COALESCE(products.reference,''), '^ref\\s*[-_]*\\s*', '', 'i')), '[^a-z0-9]', '', 'g') = $2
+          OR regexp_replace(lower(COALESCE(products.barcode,'')), '[^a-z0-9]', '', 'g') = $2
+          OR regexp_replace(lower(COALESCE(products.sku,'')), '[^a-z0-9]', '', 'g') = $2
+          OR regexp_replace(lower(COALESCE(products.qr_code,'')), '[^a-z0-9]', '', 'g') = $2
+       )` : ""}
+       ${isSuperAdmin ? "" : `AND products.company_id = $${q ? 3 : 1}`}
        ORDER BY products.name ASC
        LIMIT 40`,
-      isSuperAdmin ? (q ? [search] : []) : q ? [search, companyId] : [companyId]
+      isSuperAdmin
+        ? q
+          ? [search, normalizedSearch]
+          : []
+        : q
+          ? [search, normalizedSearch, companyId]
+          : [companyId]
     );
 
     res.json(
@@ -1949,24 +1981,44 @@ app.put(
         expiration_tracking_enabled,
         batch_tracking_enabled
       } = req.body;
+      const valuesBase = [
+        optionalNumber(purchase_price),
+        optionalNumber(sale_price),
+        optionalNumber(wholesale_price),
+        optionalNumber(pharmacy_price),
+        optionalNumber(tax_rate),
+        optionalNumber(max_discount_rate),
+        barcode === undefined ? null : String(barcode),
+        qr_code === undefined ? null : String(qr_code),
+        lot_number === undefined ? null : String(lot_number),
+        manufacture_date || null,
+        expiration_date || null,
+        supplier_id || null,
+        category === undefined ? null : String(category),
+        subcategory === undefined ? null : String(subcategory),
+        blocked_for_sale === true,
+        expiration_tracking_enabled === true,
+        batch_tracking_enabled === true,
+        req.params.id
+      ];
 
       const result = await pool.query(
         `UPDATE products
-         SET purchase_price=$1,
-             sale_price=$2,
-             wholesale_price=$3,
-             pharmacy_price=$4,
-             margin=($2 - $1),
-             tax_rate=$5,
-             max_discount_rate=$6,
-             barcode=$7,
-             qr_code=$8,
-             lot_number=$9,
+         SET purchase_price=COALESCE($1, purchase_price),
+             sale_price=COALESCE($2, sale_price),
+             wholesale_price=COALESCE($3, wholesale_price),
+             pharmacy_price=COALESCE($4, pharmacy_price),
+             margin=(COALESCE($2, sale_price) - COALESCE($1, purchase_price)),
+             tax_rate=COALESCE($5, tax_rate),
+             max_discount_rate=COALESCE($6, max_discount_rate),
+             barcode=COALESCE($7, barcode),
+             qr_code=COALESCE(NULLIF($8, ''), qr_code),
+             lot_number=COALESCE($9, lot_number),
              manufacture_date=$10,
              expiration_date=$11,
-             supplier_id=$12,
-             category=$13,
-             subcategory=$14,
+             supplier_id=COALESCE($12, supplier_id),
+             category=COALESCE($13, category),
+             subcategory=COALESCE($14, subcategory),
              blocked_for_sale=$15,
              expiration_tracking_enabled=$16,
              batch_tracking_enabled=$17,
@@ -1974,47 +2026,8 @@ app.put(
          WHERE id=$18 ${isSuperAdmin ? "" : "AND company_id=$19"}
          RETURNING *`,
         isSuperAdmin
-          ? [
-              Number(purchase_price || 0),
-              Number(sale_price || 0),
-              Number(wholesale_price || 0),
-              Number(pharmacy_price || 0),
-              Number(tax_rate || 0),
-              Number(max_discount_rate || 0),
-              barcode || "",
-              qr_code || "",
-              lot_number || "",
-              manufacture_date || null,
-              expiration_date || null,
-              supplier_id || null,
-              category || "",
-              subcategory || "",
-              blocked_for_sale === true,
-              expiration_tracking_enabled === true,
-              batch_tracking_enabled === true,
-              req.params.id
-            ]
-          : [
-              Number(purchase_price || 0),
-              Number(sale_price || 0),
-              Number(wholesale_price || 0),
-              Number(pharmacy_price || 0),
-              Number(tax_rate || 0),
-              Number(max_discount_rate || 0),
-              barcode || "",
-              qr_code || "",
-              lot_number || "",
-              manufacture_date || null,
-              expiration_date || null,
-              supplier_id || null,
-              category || "",
-              subcategory || "",
-              blocked_for_sale === true,
-              expiration_tracking_enabled === true,
-              batch_tracking_enabled === true,
-              req.params.id,
-              companyId
-            ]
+          ? valuesBase
+          : [...valuesBase, companyId]
       );
 
       if (result.rows.length === 0) {
@@ -2023,7 +2036,8 @@ app.put(
 
       res.json({
         ...result.rows[0],
-        qr_url: productQrUrl(req, result.rows[0])
+        qr_url: productQrUrl(req, result.rows[0]),
+        effective_sale_price: getEffectivePosPrice(result.rows[0])
       });
     } catch (error) {
       console.error("ERREUR POS PRODUCT SETTINGS :", error);
@@ -3525,6 +3539,7 @@ app.get("/scan/resolve/:code", authenticateToken, async (req, res) => {
     } catch {}
 
     code = code.replace(/^Ref\s+/i, "").trim();
+    const normalizedCode = normalizeProductLookupCode(code);
 
     const values = isSuperAdmin ? [code] : [code, companyId];
 
@@ -3608,16 +3623,26 @@ app.get("/scan/resolve/:code", authenticateToken, async (req, res) => {
       });
     }
 
+    const productValues = isSuperAdmin ? [code, normalizedCode] : [code, normalizedCode, companyId];
     const productResult = await pool.query(
       `SELECT products.*, locations.emplacement_code, locations.rayon_code,
               locations.case_code, locations.level_code, locations.bin_code,
               locations.bin_mode, locations.warehouse_code
        FROM products
        LEFT JOIN locations ON products.location_id = locations.id
-       WHERE (products.reference=$1 OR products.barcode=$1 OR products.sku=$1 OR products.qr_code=$1)
-       ${isSuperAdmin ? "" : "AND products.company_id=$2"}
+       WHERE (
+         products.reference ILIKE $1
+         OR products.barcode ILIKE $1
+         OR products.sku ILIKE $1
+         OR products.qr_code ILIKE $1
+         OR regexp_replace(lower(regexp_replace(COALESCE(products.reference,''), '^ref\\s*[-_]*\\s*', '', 'i')), '[^a-z0-9]', '', 'g') = $2
+         OR regexp_replace(lower(COALESCE(products.barcode,'')), '[^a-z0-9]', '', 'g') = $2
+         OR regexp_replace(lower(COALESCE(products.sku,'')), '[^a-z0-9]', '', 'g') = $2
+         OR regexp_replace(lower(COALESCE(products.qr_code,'')), '[^a-z0-9]', '', 'g') = $2
+       )
+       ${isSuperAdmin ? "" : "AND products.company_id=$3"}
        LIMIT 1`,
-      values
+      productValues
     );
 
     if (productResult.rows.length > 0) {
