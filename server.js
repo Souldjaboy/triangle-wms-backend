@@ -2187,9 +2187,12 @@ app.get("/pos/payment-settings", authenticateToken, async (req, res) => {
 
     const companyId = req.user.company_id;
     const result = await pool.query(
-      `SELECT id, company_id, provider_key, public_key, secret_key_encrypted,
-              merchant_number, orange_money_account, moov_money_account,
-              wave_account, currency, mode, webhook_url, is_active, updated_at
+      `SELECT id, company_id, provider_key, provider, public_key,
+              secret_key_encrypted, client_id, client_secret_encrypted,
+              merchant_id, merchant_number, merchant_account,
+              orange_money_account, moov_money_account, wave_account,
+              webhook_secret_encrypted, currency, mode, webhook_url,
+              is_active, connection_status, last_checked_at, updated_at
        FROM payment_settings
        WHERE company_id=$1
        ORDER BY provider_key ASC`,
@@ -2200,7 +2203,11 @@ app.get("/pos/payment-settings", authenticateToken, async (req, res) => {
       result.rows.map((row) => ({
         ...row,
         secret_key: maskSecret(row.secret_key_encrypted),
-        secret_key_encrypted: undefined
+        client_secret: maskSecret(row.client_secret_encrypted),
+        webhook_secret: maskSecret(row.webhook_secret_encrypted),
+        secret_key_encrypted: undefined,
+        client_secret_encrypted: undefined,
+        webhook_secret_encrypted: undefined
       }))
     );
   } catch (error) {
@@ -2218,12 +2225,18 @@ app.put("/pos/payment-settings", authenticateToken, async (req, res) => {
     const companyId = req.user.company_id;
     const {
       provider_key,
+      provider,
       public_key,
       secret_key,
+      client_id,
+      client_secret,
+      merchant_id,
       merchant_number,
+      merchant_account,
       orange_money_account,
       moov_money_account,
       wave_account,
+      webhook_secret,
       currency = "FCFA",
       mode = "test",
       webhook_url,
@@ -2235,47 +2248,74 @@ app.put("/pos/payment-settings", authenticateToken, async (req, res) => {
     }
 
     const existing = await pool.query(
-      "SELECT secret_key_encrypted FROM payment_settings WHERE company_id=$1 AND provider_key=$2 LIMIT 1",
+      `SELECT secret_key_encrypted, client_secret_encrypted,
+              webhook_secret_encrypted
+       FROM payment_settings
+       WHERE company_id=$1 AND provider_key=$2
+       LIMIT 1`,
       [companyId || null, provider_key]
     );
     const secretValue =
       secret_key && secret_key !== "••••••••"
         ? encryptPaymentSecret(secret_key)
         : existing.rows[0]?.secret_key_encrypted || "";
+    const clientSecretValue =
+      client_secret && client_secret !== "••••••••"
+        ? encryptPaymentSecret(client_secret)
+        : existing.rows[0]?.client_secret_encrypted || "";
+    const webhookSecretValue =
+      webhook_secret && webhook_secret !== "••••••••"
+        ? encryptPaymentSecret(webhook_secret)
+        : existing.rows[0]?.webhook_secret_encrypted || "";
 
     const result = await pool.query(
       `INSERT INTO payment_settings
-       (company_id, provider_key, public_key, secret_key_encrypted,
-        merchant_number, orange_money_account, moov_money_account,
-        wave_account, currency, mode, webhook_url, is_active,
+       (company_id, provider_key, provider, public_key, secret_key_encrypted,
+        client_id, client_secret_encrypted, merchant_id, merchant_number,
+        merchant_account, orange_money_account, moov_money_account,
+        wave_account, webhook_secret_encrypted, currency, mode, webhook_url, is_active,
         created_by, updated_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$19)
        ON CONFLICT (company_id, provider_key)
        DO UPDATE SET
+         provider=EXCLUDED.provider,
          public_key=EXCLUDED.public_key,
          secret_key_encrypted=EXCLUDED.secret_key_encrypted,
+         client_id=EXCLUDED.client_id,
+         client_secret_encrypted=EXCLUDED.client_secret_encrypted,
+         merchant_id=EXCLUDED.merchant_id,
          merchant_number=EXCLUDED.merchant_number,
+         merchant_account=EXCLUDED.merchant_account,
          orange_money_account=EXCLUDED.orange_money_account,
          moov_money_account=EXCLUDED.moov_money_account,
          wave_account=EXCLUDED.wave_account,
+         webhook_secret_encrypted=EXCLUDED.webhook_secret_encrypted,
          currency=EXCLUDED.currency,
          mode=EXCLUDED.mode,
          webhook_url=EXCLUDED.webhook_url,
          is_active=EXCLUDED.is_active,
          updated_by=EXCLUDED.updated_by,
          updated_at=CURRENT_TIMESTAMP
-       RETURNING id, company_id, provider_key, public_key, merchant_number,
+       RETURNING id, company_id, provider_key, provider, public_key,
+                 client_id, merchant_id, merchant_number, merchant_account,
                  orange_money_account, moov_money_account, wave_account,
-                 currency, mode, webhook_url, is_active, updated_at`,
+                 currency, mode, webhook_url, is_active,
+                 connection_status, last_checked_at, updated_at`,
       [
         companyId || null,
         provider_key,
+        provider || provider_key,
         public_key || "",
         secretValue,
+        client_id || "",
+        clientSecretValue,
+        merchant_id || "",
         merchant_number || "",
+        merchant_account || "",
         orange_money_account || "",
         moov_money_account || "",
         wave_account || "",
+        webhookSecretValue,
         currency || "FCFA",
         mode === "production" ? "production" : "test",
         webhook_url || "",
@@ -2288,6 +2328,39 @@ app.put("/pos/payment-settings", authenticateToken, async (req, res) => {
   } catch (error) {
     console.error("ERREUR UPDATE PAYMENT SETTINGS :", error);
     res.status(500).json({ error: "Erreur sauvegarde paramètres paiement" });
+  }
+});
+
+app.post("/pos/payment-settings/test", authenticateToken, async (req, res) => {
+  try {
+    if (!canAdjustPosPrice(req.user)) {
+      return res.status(403).json({ error: "Accès admin requis." });
+    }
+
+    const { provider_key } = req.body;
+    const companyId = req.user.company_id;
+
+    const result = await pool.query(
+      `UPDATE payment_settings
+       SET connection_status='OK',
+           last_checked_at=CURRENT_TIMESTAMP,
+           updated_at=CURRENT_TIMESTAMP
+       WHERE company_id=$1 AND provider_key=$2
+       RETURNING provider_key, connection_status, last_checked_at`,
+      [companyId || null, provider_key]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Paramètres fournisseur introuvables." });
+    }
+
+    res.json({
+      ...result.rows[0],
+      message: "Connexion sandbox OK. Les API production seront branchées avec les identifiants officiels."
+    });
+  } catch (error) {
+    console.error("ERREUR TEST PAYMENT SETTINGS :", error);
+    res.status(500).json({ error: "Erreur test connexion paiement" });
   }
 });
 
@@ -2619,9 +2692,9 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
     const transactionResult = await client.query(
       `INSERT INTO payment_transactions
        (company_id, sale_id, provider_key, payment_method, amount, currency,
-        status, provider_reference, external_reference, request_payload,
-        response_payload, created_by)
-       VALUES ($1,$2,$3,$4,$5,'FCFA',$6,$7,$8,$9,$10,$11)
+        status, provider_reference, external_reference, phone_number,
+        request_payload, response_payload, provider_response, created_by)
+       VALUES ($1,$2,$3,$4,$5,'FCFA',$6,$7,$8,$9,$10,$11,$11,$12)
        RETURNING *`,
       [
         companyId,
@@ -2632,6 +2705,7 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
         requestedPaymentStatus,
         transactionReference,
         saleNumber,
+        customer_phone || "",
         JSON.stringify({ sale_id: sale.id, payment_method, amount: totalAmount }),
         JSON.stringify({
           message: isExternalPaymentMethod(payment_method)
@@ -3084,9 +3158,9 @@ app.post("/payments/initiate", authenticateToken, async (req, res) => {
     const result = await pool.query(
       `INSERT INTO payment_transactions
        (company_id, sale_id, provider_key, payment_method, amount, currency,
-        status, provider_reference, external_reference, request_payload,
-        response_payload, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,'en attente',$7,$8,$9,$10,$11)
+        status, provider_reference, external_reference, phone_number,
+        request_payload, response_payload, provider_response, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,'pending',$7,$8,$9,$10,$11,$11,$12)
        RETURNING *`,
       [
         req.user.company_id || null,
@@ -3097,6 +3171,7 @@ app.post("/payments/initiate", authenticateToken, async (req, res) => {
         currency || "FCFA",
         providerReference,
         providerReference,
+        customer_phone || "",
         JSON.stringify({ sale_id, payment_method, amount, customer_name, customer_phone }),
         JSON.stringify({
           sandbox: true,
@@ -3137,13 +3212,17 @@ app.post("/payments/confirm", authenticateToken, async (req, res) => {
     }
 
     const transaction = transactionResult.rows[0];
-    const nextStatus = status === "échoué" || status === "failed" ? "échoué" : "payé";
+    const nextStatus =
+      status === "échoué" || status === "failed" || status === "fail"
+        ? "failed"
+        : "paid";
 
     await pool.query(
       `UPDATE payment_transactions
        SET status=$1,
-           paid_at=CASE WHEN $1='payé' THEN CURRENT_TIMESTAMP ELSE paid_at END,
+           paid_at=CASE WHEN $1='paid' THEN CURRENT_TIMESTAMP ELSE paid_at END,
            response_payload=$2,
+           provider_response=$2,
            updated_at=CURRENT_TIMESTAMP
        WHERE id=$3`,
       [
@@ -3163,9 +3242,9 @@ app.post("/payments/confirm", authenticateToken, async (req, res) => {
       const saleResult = await pool.query(
         `UPDATE sales
          SET payment_status=$1,
-             status=CASE WHEN $1='payé' THEN 'validée' ELSE status END,
-             amount_paid=CASE WHEN $1='payé' THEN total_amount ELSE amount_paid END,
-             amount_due=CASE WHEN $1='payé' THEN 0 ELSE amount_due END,
+             status=CASE WHEN $1='paid' THEN 'validée' ELSE status END,
+             amount_paid=CASE WHEN $1='paid' THEN total_amount ELSE amount_paid END,
+             amount_due=CASE WHEN $1='paid' THEN 0 ELSE amount_due END,
              updated_at=CURRENT_TIMESTAMP
          WHERE id=$2
          RETURNING *`,
@@ -3185,6 +3264,82 @@ app.post("/payments/confirm", authenticateToken, async (req, res) => {
     console.error("ERREUR CONFIRMATION PAIEMENT :", error);
     res.status(500).json({ error: "Erreur confirmation paiement" });
   }
+});
+
+async function updateSandboxPayment(req, res, nextStatus) {
+  try {
+    const { transaction_id, provider_reference } = req.body;
+    const transactionResult = await pool.query(
+      `SELECT *
+       FROM payment_transactions
+       WHERE ($1::int IS NOT NULL AND id=$1)
+          OR ($2::text <> '' AND provider_reference=$2)
+       ORDER BY id DESC
+       LIMIT 1`,
+      [transaction_id || null, provider_reference || ""]
+    );
+
+    if (transactionResult.rows.length === 0) {
+      return res.status(404).json({ error: "Transaction introuvable" });
+    }
+
+    const transaction = transactionResult.rows[0];
+
+    await pool.query(
+      `UPDATE payment_transactions
+       SET status=$1,
+           paid_at=CASE WHEN $1='paid' THEN CURRENT_TIMESTAMP ELSE paid_at END,
+           response_payload=$2,
+           provider_response=$2,
+           updated_at=CURRENT_TIMESTAMP
+       WHERE id=$3`,
+      [
+        nextStatus,
+        JSON.stringify({ sandbox: true, status: nextStatus, confirmed_by: req.user.id }),
+        transaction.id
+      ]
+    );
+
+    await pool.query(
+      `UPDATE sale_payments SET status=$1 WHERE transaction_id=$2`,
+      [nextStatus, transaction.id]
+    );
+
+    let sale = null;
+    if (transaction.sale_id) {
+      const saleResult = await pool.query(
+        `UPDATE sales
+         SET payment_status=$1,
+             status=CASE WHEN $1='paid' THEN 'validée' ELSE status END,
+             amount_paid=CASE WHEN $1='paid' THEN total_amount ELSE amount_paid END,
+             amount_due=CASE WHEN $1='paid' THEN 0 ELSE amount_due END,
+             updated_at=CURRENT_TIMESTAMP
+         WHERE id=$2
+         RETURNING *`,
+        [nextStatus, transaction.sale_id]
+      );
+      sale = saleResult.rows[0] || null;
+    }
+
+    res.json({
+      ok: true,
+      status: nextStatus,
+      transaction_id: transaction.id,
+      provider_reference: transaction.provider_reference,
+      sale
+    });
+  } catch (error) {
+    console.error("ERREUR SANDBOX PAIEMENT :", error);
+    res.status(500).json({ error: "Erreur sandbox paiement" });
+  }
+}
+
+app.post("/payments/sandbox/success", authenticateToken, async (req, res) => {
+  return updateSandboxPayment(req, res, "paid");
+});
+
+app.post("/payments/sandbox/fail", authenticateToken, async (req, res) => {
+  return updateSandboxPayment(req, res, "failed");
 });
 
 async function handlePaymentWebhook(req, res, providerKey) {
