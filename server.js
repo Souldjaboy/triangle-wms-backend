@@ -112,6 +112,22 @@ function canCreateMeeting(user) {
   );
 }
 
+function canUsePos(user) {
+  const role = normalizeRole(user?.role);
+  return (
+    user?.is_super_admin === true ||
+    role === "super_admin" ||
+    role === "admin" ||
+    role === "caissier" ||
+    role === "vendeur"
+  );
+}
+
+function canAdjustPosPrice(user) {
+  const role = normalizeRole(user?.role);
+  return user?.is_super_admin === true || role === "super_admin" || role === "admin";
+}
+
 function stripSalaryFields(row, requester) {
   const canSeeSalary =
     canViewAllSalaries(requester) || Number(row.id || row.user_id) === Number(requester?.id);
@@ -1703,6 +1719,623 @@ app.put("/stock-movements/:id/reject", authenticateToken, async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Erreur refus mouvement" });
+  }
+});
+
+/* POS / CAISSE */
+app.get("/pos/products/search", authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
+    const q = String(req.query.q || "").trim();
+    const search = `%${q}%`;
+
+    const result = await pool.query(
+      `SELECT products.*, locations.emplacement_code, locations.rayon_code,
+              locations.case_code, locations.level_code, locations.bin_code,
+              locations.warehouse_code
+       FROM products
+       LEFT JOIN locations ON products.location_id = locations.id
+       WHERE products.is_active IS NOT FALSE
+       ${q ? `AND (products.name ILIKE $1 OR products.reference ILIKE $1 OR products.barcode ILIKE $1 OR products.sku ILIKE $1)` : ""}
+       ${isSuperAdmin ? "" : `AND products.company_id = $${q ? 2 : 1}`}
+       ORDER BY products.name ASC
+       LIMIT 40`,
+      isSuperAdmin ? (q ? [search] : []) : q ? [search, companyId] : [companyId]
+    );
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR POS SEARCH :", error);
+    res.status(500).json({ error: "Erreur recherche produits POS" });
+  }
+});
+
+app.get("/products/:id/batches", authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
+
+    const result = await pool.query(
+      `SELECT *
+       FROM product_batches
+       WHERE product_id=$1
+       ${isSuperAdmin ? "" : "AND company_id=$2"}
+       ORDER BY expiration_date ASC NULLS LAST, id ASC`,
+      isSuperAdmin ? [req.params.id] : [req.params.id, companyId]
+    );
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR LOTS PRODUIT :", error);
+    res.status(500).json({ error: "Erreur lecture lots produit" });
+  }
+});
+
+app.post("/products/:id/batches", authenticateToken, async (req, res) => {
+  try {
+    if (isReadOnlyRole(req.user)) {
+      return res.status(403).json({ error: "Vous avez un accès lecture seule." });
+    }
+
+    const companyId = req.user.company_id;
+    const {
+      lot_number,
+      supplier_id,
+      quantity_initial,
+      purchase_price,
+      sale_price,
+      expiration_date,
+      warehouse_id,
+      location_id,
+      status
+    } = req.body;
+
+    const result = await pool.query(
+      `INSERT INTO product_batches
+       (company_id, lot_number, product_id, supplier_id, quantity_initial,
+        quantity_remaining, purchase_price, sale_price, expiration_date,
+        warehouse_id, location_id, status)
+       VALUES ($1,$2,$3,$4,$5,$5,$6,$7,$8,$9,$10,$11)
+       RETURNING *`,
+      [
+        companyId,
+        lot_number,
+        req.params.id,
+        supplier_id || null,
+        Number(quantity_initial || 0),
+        Number(purchase_price || 0),
+        Number(sale_price || 0),
+        expiration_date || null,
+        warehouse_id || null,
+        location_id || null,
+        status || "active"
+      ]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error("ERREUR AJOUT LOT :", error);
+    res.status(500).json({ error: "Erreur ajout lot produit" });
+  }
+});
+
+app.post("/pos/sales", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    if (!canUsePos(req.user)) {
+      return res.status(403).json({ error: "Accès POS refusé." });
+    }
+
+    const companyId = req.user.company_id;
+    const {
+      customer_name,
+      customer_phone,
+      items = [],
+      discount_amount = 0,
+      tax_enabled = false,
+      payment_method = "Espèces",
+      payment_status = "payé",
+      warehouse_id = null
+    } = req.body;
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "Panier vide." });
+    }
+
+    await client.query("BEGIN");
+
+    let subtotal = 0;
+    let taxAmount = 0;
+    const saleNumber = `SALE-${Date.now()}`;
+
+    const saleResult = await client.query(
+      `INSERT INTO sales
+       (company_id, warehouse_id, sale_number, customer_name, customer_phone,
+        subtotal, discount_amount, tax_amount, total_amount, payment_method,
+        payment_status, status, created_by, created_by_name, created_by_role)
+       VALUES ($1,$2,$3,$4,$5,0,$6,0,0,$7,$8,$9,$10,$11,$12)
+       RETURNING *`,
+      [
+        companyId,
+        warehouse_id,
+        saleNumber,
+        customer_name || "",
+        customer_phone || "",
+        Number(discount_amount || 0),
+        payment_method,
+        payment_status,
+        payment_status === "payé" ? "validée" : "en attente",
+        req.user.id,
+        req.user.email || "Utilisateur",
+        req.user.role || ""
+      ]
+    );
+
+    const sale = saleResult.rows[0];
+    const saleItems = [];
+
+    for (const item of items) {
+      const productResult = await client.query(
+        `SELECT *
+         FROM products
+         WHERE id=$1 AND company_id=$2
+         FOR UPDATE`,
+        [item.product_id, companyId]
+      );
+
+      const product = productResult.rows[0];
+
+      if (!product) {
+        throw new Error("Produit introuvable dans cette entreprise.");
+      }
+
+      const quantity = Number(item.quantity || 1);
+      const unitPrice = Number(item.unit_price ?? product.sale_price ?? 0);
+      const itemDiscount = Number(item.discount_amount || 0);
+
+      if (!canAdjustPosPrice(req.user)) {
+        if (unitPrice !== Number(product.sale_price || 0) || itemDiscount > 0) {
+          throw new Error("Vous n'avez pas le droit de modifier le prix ou la remise.");
+        }
+      }
+
+      if (Number(product.stock || 0) < quantity) {
+        throw new Error(`Stock insuffisant pour ${product.reference}.`);
+      }
+
+      if (product.expiration_date && new Date(product.expiration_date) < new Date()) {
+        throw new Error(`Produit expiré : ${product.reference}.`);
+      }
+
+      let batch = null;
+
+      if (product.batch_tracking_enabled || product.expiration_tracking_enabled) {
+        const batchResult = await client.query(
+          `SELECT *
+           FROM product_batches
+           WHERE product_id=$1
+             AND company_id=$2
+             AND quantity_remaining >= $3
+             AND status='active'
+             AND (expiration_date IS NULL OR expiration_date >= CURRENT_DATE)
+           ORDER BY expiration_date ASC NULLS LAST, id ASC
+           LIMIT 1
+           FOR UPDATE`,
+          [product.id, companyId, quantity]
+        );
+
+        batch = batchResult.rows[0] || null;
+
+        if (!batch && product.batch_tracking_enabled) {
+          throw new Error(`Aucun lot disponible pour ${product.reference}.`);
+        }
+
+        if (batch) {
+          await client.query(
+            `UPDATE product_batches
+             SET quantity_remaining = quantity_remaining - $1,
+                 updated_at=CURRENT_TIMESTAMP
+             WHERE id=$2`,
+            [quantity, batch.id]
+          );
+        }
+      }
+
+      const lineTax = tax_enabled ? (unitPrice * quantity * Number(product.tax_rate || 0)) / 100 : 0;
+      const lineTotal = unitPrice * quantity - itemDiscount + lineTax;
+      subtotal += unitPrice * quantity - itemDiscount;
+      taxAmount += lineTax;
+
+      await client.query(
+        `UPDATE products
+         SET stock = stock - $1,
+             updated_at=CURRENT_TIMESTAMP
+         WHERE id=$2`,
+        [quantity, product.id]
+      );
+
+      const itemResult = await client.query(
+        `INSERT INTO sale_items
+         (sale_id, company_id, product_id, product_reference, product_name,
+          barcode, lot_number, batch_id, quantity, unit_price, discount_amount,
+          tax_rate, total_price, warehouse_id, location_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+         RETURNING *`,
+        [
+          sale.id,
+          companyId,
+          product.id,
+          product.reference,
+          product.name,
+          product.barcode || "",
+          batch?.lot_number || product.lot_number || "",
+          batch?.id || null,
+          quantity,
+          unitPrice,
+          itemDiscount,
+          Number(product.tax_rate || 0),
+          lineTotal,
+          warehouse_id || product.warehouse_id || null,
+          product.location_id || null
+        ]
+      );
+
+      saleItems.push(itemResult.rows[0]);
+
+      await client.query(
+        `INSERT INTO stock_movements
+         (type, product_reference, product_name, quantity, source_warehouse,
+          destination_warehouse, reason, status, company_id, created_by,
+          created_by_name, created_by_role, location_code, warehouse_id,
+          approval_status, original_quantity, final_quantity, product_id, location_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'Validé',$8,$9,$10,$11,$12,$13,'Validé',$4,$4,$14,$15)`,
+        [
+          "Sortie",
+          product.reference,
+          product.name,
+          quantity,
+          product.warehouse || "",
+          "",
+          `Vente POS ${saleNumber}`,
+          companyId,
+          req.user.id,
+          req.user.email || "Caissier",
+          req.user.role || "caissier",
+          product.location_code || "",
+          warehouse_id || product.warehouse_id || null,
+          product.id,
+          product.location_id || null
+        ]
+      );
+    }
+
+    const totalAmount = Math.max(subtotal - Number(discount_amount || 0) + taxAmount, 0);
+
+    const updatedSale = await client.query(
+      `UPDATE sales
+       SET subtotal=$1, tax_amount=$2, total_amount=$3, updated_at=CURRENT_TIMESTAMP
+       WHERE id=$4
+       RETURNING *`,
+      [subtotal, taxAmount, totalAmount, sale.id]
+    );
+
+    const receiptNumber = `REC-${Date.now()}`;
+    const receiptResult = await client.query(
+      `INSERT INTO receipts
+       (company_id, sale_id, receipt_number, receipt_data, total_amount,
+        payment_method, payment_status, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       RETURNING *`,
+      [
+        companyId,
+        sale.id,
+        receiptNumber,
+        JSON.stringify({ sale: updatedSale.rows[0], items: saleItems }),
+        totalAmount,
+        payment_method,
+        payment_status,
+        req.user.id
+      ]
+    );
+
+    await client.query(
+      `INSERT INTO documents
+       (document_type, document_number, client_name, total_amount,
+        observation, created_by, company_id, related_entity_type,
+        related_entity_id, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      [
+        "Reçu POS",
+        receiptNumber,
+        customer_name || "",
+        totalAmount,
+        `Reçu généré depuis vente POS ${saleNumber}`,
+        req.user.email || "Caissier",
+        companyId,
+        "sale",
+        sale.id,
+        "Validé"
+      ]
+    );
+
+    await client.query(
+      `INSERT INTO payments
+       (company_id, amount, currency, payment_method, payment_reference,
+        status, notes, paid_at, sale_id, receipt_id, payment_status)
+       VALUES ($1,$2,'FCFA',$3,$4,$5,$6,CURRENT_TIMESTAMP,$7,$8,$5)`,
+      [
+        companyId,
+        totalAmount,
+        payment_method,
+        saleNumber,
+        payment_status,
+        `Paiement POS ${saleNumber}`,
+        sale.id,
+        receiptResult.rows[0].id
+      ]
+    );
+
+    await client.query("COMMIT");
+
+    res.status(201).json({
+      sale: updatedSale.rows[0],
+      items: saleItems,
+      receipt: receiptResult.rows[0]
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("ERREUR POS SALE :", error);
+    res.status(500).json({ error: error.message || "Erreur validation vente POS" });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/pos/sales", authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
+
+    const result = await pool.query(
+      `SELECT *
+       FROM sales
+       ${isSuperAdmin ? "" : "WHERE company_id=$1"}
+       ORDER BY id DESC
+       LIMIT 200`,
+      isSuperAdmin ? [] : [companyId]
+    );
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR POS SALES :", error);
+    res.status(500).json({ error: "Erreur lecture ventes POS" });
+  }
+});
+
+app.get("/pos/sales/:id", authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
+
+    const saleResult = await pool.query(
+      `SELECT *
+       FROM sales
+       WHERE id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}`,
+      isSuperAdmin ? [req.params.id] : [req.params.id, companyId]
+    );
+
+    if (saleResult.rows.length === 0) {
+      return res.status(404).json({ error: "Vente introuvable" });
+    }
+
+    const itemsResult = await pool.query(
+      "SELECT * FROM sale_items WHERE sale_id=$1 ORDER BY id ASC",
+      [req.params.id]
+    );
+
+    res.json({ sale: saleResult.rows[0], items: itemsResult.rows });
+  } catch (error) {
+    console.error("ERREUR POS SALE DETAIL :", error);
+    res.status(500).json({ error: "Erreur détail vente POS" });
+  }
+});
+
+app.post("/pos/sales/:id/cancel", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    if (!canAdjustPosPrice(req.user)) {
+      return res.status(403).json({ error: "Seul un admin peut annuler une vente." });
+    }
+
+    const companyId = req.user.company_id;
+    const { reason } = req.body;
+
+    await client.query("BEGIN");
+
+    const saleResult = await client.query(
+      "SELECT * FROM sales WHERE id=$1 AND company_id=$2 FOR UPDATE",
+      [req.params.id, companyId]
+    );
+    const sale = saleResult.rows[0];
+
+    if (!sale) throw new Error("Vente introuvable");
+    if (sale.status === "annulée") throw new Error("Vente déjà annulée");
+
+    const itemsResult = await client.query("SELECT * FROM sale_items WHERE sale_id=$1", [sale.id]);
+
+    for (const item of itemsResult.rows) {
+      await client.query("UPDATE products SET stock = stock + $1 WHERE id=$2", [
+        item.quantity,
+        item.product_id
+      ]);
+
+      if (item.batch_id) {
+        await client.query(
+          "UPDATE product_batches SET quantity_remaining = quantity_remaining + $1 WHERE id=$2",
+          [item.quantity, item.batch_id]
+        );
+      }
+    }
+
+    const updated = await client.query(
+      `UPDATE sales
+       SET status='annulée', cancelled_by=$1, cancelled_at=CURRENT_TIMESTAMP,
+           cancel_reason=$2
+       WHERE id=$3
+       RETURNING *`,
+      [req.user.id, reason || "", sale.id]
+    );
+
+    await client.query("COMMIT");
+    res.json(updated.rows[0]);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("ERREUR ANNULATION POS :", error);
+    res.status(500).json({ error: "Erreur annulation vente" });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/pos/receipts/:id", authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM receipts WHERE id=$1",
+      [req.params.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Reçu introuvable" });
+    }
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("ERREUR RECU POS :", error);
+    res.status(500).json({ error: "Erreur lecture reçu" });
+  }
+});
+
+app.get("/pos/reports/daily", authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
+    const date = req.query.date || new Date().toISOString().slice(0, 10);
+
+    const sales = await pool.query(
+      `SELECT COUNT(*)::int AS sales_count,
+              COALESCE(SUM(total_amount),0)::numeric AS revenue
+       FROM sales
+       WHERE DATE(created_at)=$1
+       ${isSuperAdmin ? "" : "AND company_id=$2"}`,
+      isSuperAdmin ? [date] : [date, companyId]
+    );
+
+    const payments = await pool.query(
+      `SELECT payment_method, COUNT(*)::int AS count,
+              COALESCE(SUM(total_amount),0)::numeric AS total
+       FROM sales
+       WHERE DATE(created_at)=$1
+       ${isSuperAdmin ? "" : "AND company_id=$2"}
+       GROUP BY payment_method
+       ORDER BY total DESC`,
+      isSuperAdmin ? [date] : [date, companyId]
+    );
+
+    res.json({
+      date,
+      totals: sales.rows[0],
+      payments: payments.rows
+    });
+  } catch (error) {
+    console.error("ERREUR RAPPORT POS DAILY :", error);
+    res.status(500).json({ error: "Erreur rapport POS journalier" });
+  }
+});
+
+app.post("/pos/payments", authenticateToken, async (req, res) => {
+  try {
+    if (!canUsePos(req.user)) {
+      return res.status(403).json({ error: "Accès POS refusé." });
+    }
+
+    const {
+      sale_id,
+      amount,
+      payment_method = "Espèces",
+      payment_status = "payé",
+      notes = ""
+    } = req.body;
+
+    const result = await pool.query(
+      `INSERT INTO payments
+       (company_id, amount, currency, payment_method, status, notes,
+        paid_at, sale_id, payment_status)
+       VALUES ($1,$2,'FCFA',$3,$4,$5,CURRENT_TIMESTAMP,$6,$4)
+       RETURNING *`,
+      [
+        req.user.company_id || null,
+        Number(amount || 0),
+        payment_method,
+        payment_status,
+        notes,
+        sale_id || null
+      ]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error("ERREUR POS PAYMENT :", error);
+    res.status(500).json({ error: "Erreur paiement POS" });
+  }
+});
+
+app.get("/pos/reports/products", authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
+
+    const result = await pool.query(
+      `SELECT product_reference, product_name,
+              SUM(quantity)::int AS quantity_sold,
+              COALESCE(SUM(total_price),0)::numeric AS total
+       FROM sale_items
+       ${isSuperAdmin ? "" : "WHERE company_id=$1"}
+       GROUP BY product_reference, product_name
+       ORDER BY quantity_sold DESC
+       LIMIT 50`,
+      isSuperAdmin ? [] : [companyId]
+    );
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR RAPPORT POS PRODUITS :", error);
+    res.status(500).json({ error: "Erreur rapport produits POS" });
+  }
+});
+
+app.get("/pos/reports/payments", authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
+
+    const result = await pool.query(
+      `SELECT payment_method, payment_status,
+              COUNT(*)::int AS count,
+              COALESCE(SUM(total_amount),0)::numeric AS total
+       FROM sales
+       ${isSuperAdmin ? "" : "WHERE company_id=$1"}
+       GROUP BY payment_method, payment_status
+       ORDER BY total DESC`,
+      isSuperAdmin ? [] : [companyId]
+    );
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR RAPPORT POS PAIEMENTS :", error);
+    res.status(500).json({ error: "Erreur rapport paiements POS" });
   }
 });
 
