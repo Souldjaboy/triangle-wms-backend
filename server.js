@@ -250,6 +250,21 @@ function providerKeyFromMethod(method) {
   return "cash";
 }
 
+function calculateDistanceMeters(lat1, lon1, lat2, lon2) {
+  const toRad = (value) => (Number(value) * Math.PI) / 180;
+  const earthRadiusMeters = 6371000;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) *
+      Math.cos(toRad(lat2)) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return earthRadiusMeters * c;
+}
+
 function productQrUrl(req, product) {
   const forwardedProto = req.get("x-forwarded-proto") || req.protocol;
   const host = req.get("host");
@@ -5178,6 +5193,70 @@ app.put(
   }
 });
 
+app.get("/attendance/settings/gps", authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `INSERT INTO attendance_gps_settings (id, gps_required, allowed_radius_meters)
+       VALUES (1, false, 100)
+       ON CONFLICT (id) DO UPDATE SET id=EXCLUDED.id
+       RETURNING *`
+    );
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erreur lecture paramètres GPS pointage" });
+  }
+});
+
+app.put(
+  "/attendance/settings/gps",
+  authenticateToken,
+  authorizeRoles("admin", "super_admin"),
+  async (req, res) => {
+    try {
+      const {
+        gps_required,
+        site_latitude,
+        site_longitude,
+        allowed_radius_meters
+      } = req.body;
+
+      const result = await pool.query(
+        `INSERT INTO attendance_gps_settings
+         (id, gps_required, site_latitude, site_longitude,
+          allowed_radius_meters, updated_by)
+         VALUES (1,$1,$2,$3,$4,$5)
+         ON CONFLICT (id)
+         DO UPDATE SET
+           gps_required=EXCLUDED.gps_required,
+           site_latitude=EXCLUDED.site_latitude,
+           site_longitude=EXCLUDED.site_longitude,
+           allowed_radius_meters=EXCLUDED.allowed_radius_meters,
+           updated_by=EXCLUDED.updated_by,
+           updated_at=CURRENT_TIMESTAMP
+         RETURNING *`,
+        [
+          gps_required === true,
+          site_latitude === "" || site_latitude === null || site_latitude === undefined
+            ? null
+            : Number(site_latitude),
+          site_longitude === "" || site_longitude === null || site_longitude === undefined
+            ? null
+            : Number(site_longitude),
+          Number(allowed_radius_meters || 100),
+          req.user.id
+        ]
+      );
+
+      res.json(result.rows[0]);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Erreur sauvegarde paramètres GPS pointage" });
+    }
+  }
+);
+
 /* LISTE GROUPES HORAIRES */
 app.get("/attendance/groups", async (req, res) => {
   try {
@@ -6664,7 +6743,7 @@ app.post("/payments/create", async (req, res) => {
 /* ATTENDANCE QR SCAN */
 app.post("/attendance/scan", async (req, res) => {
   try {
-    const { badge_code, action_type } = req.body;
+    const { badge_code, action_type, latitude, longitude, accuracy } = req.body;
 
     if (!badge_code) {
       return res.status(400).json({
@@ -6689,6 +6768,58 @@ app.post("/attendance/scan", async (req, res) => {
     }
 
     const user = userResult.rows[0];
+
+    const gpsSettingsResult = await pool.query(
+      `INSERT INTO attendance_gps_settings (id, gps_required, allowed_radius_meters)
+       VALUES (1, false, 100)
+       ON CONFLICT (id) DO UPDATE SET id=EXCLUDED.id
+       RETURNING *`
+    );
+    const gpsSettings = gpsSettingsResult.rows[0] || {};
+    const gpsRequired = gpsSettings.gps_required === true;
+    const lat = latitude === "" || latitude === null || latitude === undefined ? null : Number(latitude);
+    const lon = longitude === "" || longitude === null || longitude === undefined ? null : Number(longitude);
+    const gpsAccuracy = accuracy === "" || accuracy === null || accuracy === undefined ? null : Number(accuracy);
+    const siteLat = gpsSettings.site_latitude === null || gpsSettings.site_latitude === undefined ? null : Number(gpsSettings.site_latitude);
+    const siteLon = gpsSettings.site_longitude === null || gpsSettings.site_longitude === undefined ? null : Number(gpsSettings.site_longitude);
+    const allowedRadius = Number(gpsSettings.allowed_radius_meters || 100);
+
+    if (gpsRequired && (lat === null || lon === null || !Number.isFinite(lat) || !Number.isFinite(lon))) {
+      return res.status(403).json({
+        error: "Pointage refusé : localisation obligatoire."
+      });
+    }
+
+    if (gpsRequired && (siteLat === null || siteLon === null || !Number.isFinite(siteLat) || !Number.isFinite(siteLon))) {
+      return res.status(403).json({
+        error: "Pointage refusé : impossible d’obtenir votre position."
+      });
+    }
+
+    let distanceMeters = null;
+    let isInsideZone = null;
+
+    if (
+      lat !== null &&
+      lon !== null &&
+      Number.isFinite(lat) &&
+      Number.isFinite(lon) &&
+      siteLat !== null &&
+      siteLon !== null &&
+      Number.isFinite(siteLat) &&
+      Number.isFinite(siteLon)
+    ) {
+      distanceMeters = calculateDistanceMeters(siteLat, siteLon, lat, lon);
+      isInsideZone = distanceMeters <= allowedRadius;
+    }
+
+    if (gpsRequired && !isInsideZone) {
+      return res.status(403).json({
+        error: "Pointage refusé : vous êtes hors de la zone autorisée.",
+        distance_meters: distanceMeters,
+        allowed_radius_meters: allowedRadius
+      });
+    }
 
     await pool.query(
       `
@@ -6840,10 +6971,48 @@ app.post("/attendance/scan", async (req, res) => {
       });
     }
 
+    const updatedAttendance = await pool.query(
+      `UPDATE attendance_records
+       SET latitude=$1,
+           longitude=$2,
+           accuracy=$3,
+           distance_meters=$4,
+           is_inside_zone=$5,
+           updated_at=CURRENT_TIMESTAMP
+       WHERE id=$6
+       RETURNING *`,
+      [
+        lat,
+        lon,
+        gpsAccuracy,
+        distanceMeters,
+        isInsideZone,
+        result.rows[0].id
+      ]
+    );
+
+    await pool.query(
+      `INSERT INTO attendance_history
+       (user_id, action_type, device_info, location_info,
+        latitude, longitude, accuracy, distance_meters, is_inside_zone)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [
+        user.id,
+        action_type,
+        "QR",
+        lat !== null && lon !== null ? `${lat},${lon}` : "",
+        lat,
+        lon,
+        gpsAccuracy,
+        distanceMeters,
+        isInsideZone
+      ]
+    );
+
     res.json({
       success: true,
       user,
-      attendance: result.rows[0],
+      attendance: updatedAttendance.rows[0] || result.rows[0],
       action
     });
   } catch (error) {
