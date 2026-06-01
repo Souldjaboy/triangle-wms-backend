@@ -5605,6 +5605,316 @@ app.put("/attendance/assign-user/:id", async (req, res) => {
   }
 });
 
+function assistantScope(user, values) {
+  const isSuperAdmin =
+    user?.is_super_admin === true ||
+    user?.is_super_admin === "true" ||
+    user?.is_super_admin === 1 ||
+    String(user?.role || "").toLowerCase() === "super_admin";
+  const companyId = user?.company_id || null;
+
+  if (isSuperAdmin || !companyId) {
+    return "";
+  }
+
+  values.push(companyId);
+  return `company_id=$${values.length}`;
+}
+
+function chooseAssistantTools(message) {
+  const text = String(message || "").toLowerCase();
+  const tools = new Set();
+
+  if (/produit|products?/.test(text)) tools.add("get_products");
+  if (/stock|reste|rupture|faible/.test(text)) tools.add("get_stock");
+  if (/mouvement|entrée|sortie|transfert|dernier/.test(text)) tools.add("get_last_movement");
+  if (/vente|caisse|pos|vendu|aujourd/.test(text)) tools.add("get_sales_today");
+  if (/alerte|rupture|faible/.test(text)) tools.add("get_alerts");
+  if (/utilisateur|employé|user|personnel/.test(text)) tools.add("get_users");
+  if (/inventaire/.test(text)) tools.add("get_inventory");
+  if (/document|reçu|bon|rapport/.test(text)) tools.add("get_documents");
+  if (/entrepôt|entrepot|warehouse/.test(text)) tools.add("get_warehouses");
+  if (/emplacement|location|rayon|bin/.test(text)) tools.add("get_locations");
+
+  if (/combien de produits|nombre de produits/.test(text)) tools.add("get_products");
+  if (/combien de stock|stock total|stock reste/.test(text)) tools.add("get_stock");
+  if (/dernier mouvement/.test(text)) tools.add("get_last_movement");
+
+  if (tools.size === 0) {
+    tools.add("get_stock");
+    tools.add("get_last_movement");
+    tools.add("get_alerts");
+  }
+
+  return Array.from(tools);
+}
+
+async function runAssistantTool(toolName, user) {
+  const values = [];
+  const scope = assistantScope(user, values);
+  const where = scope ? `WHERE ${scope}` : "";
+  const andScope = scope ? `AND ${scope}` : "";
+
+  if (toolName === "get_products") {
+    const summary = await pool.query(
+      `SELECT COUNT(*)::int AS total FROM products ${where}`,
+      values
+    );
+    const rows = await pool.query(
+      `SELECT id, reference, name, category, stock, minimum_stock, warehouse,
+              location_code, sale_price, created_at
+       FROM products ${where}
+       ORDER BY id DESC
+       LIMIT 20`,
+      values
+    );
+    return { summary: summary.rows[0], rows: rows.rows };
+  }
+
+  if (toolName === "get_stock") {
+    const result = await pool.query(
+      `SELECT COUNT(*)::int AS total_products,
+              COALESCE(SUM(stock),0)::numeric AS total_stock,
+              COUNT(*) FILTER (WHERE stock <= 0)::int AS out_of_stock,
+              COUNT(*) FILTER (WHERE stock > 0 AND stock <= minimum_stock)::int AS low_stock
+       FROM products ${where}`,
+      values
+    );
+    return result.rows[0];
+  }
+
+  if (toolName === "get_last_movement") {
+    const result = await pool.query(
+      `SELECT id, type, product_reference, product_name, quantity, status,
+              created_by_name, created_by_role, source_warehouse,
+              destination_warehouse, created_at
+       FROM stock_movements ${where}
+       ORDER BY created_at DESC NULLS LAST, id DESC
+       LIMIT 5`,
+      values
+    );
+    return result.rows;
+  }
+
+  if (toolName === "get_sales_today") {
+    const result = await pool.query(
+      `SELECT id, sale_number, customer_name, total_amount, amount_paid,
+              amount_due, payment_method, payment_status, status,
+              created_by_name, created_at
+       FROM sales
+       WHERE DATE(created_at)=CURRENT_DATE ${andScope}
+       ORDER BY id DESC
+       LIMIT 50`,
+      values
+    );
+    const total = await pool.query(
+      `SELECT COUNT(*)::int AS sales_count,
+              COALESCE(SUM(total_amount),0)::numeric AS total_amount,
+              COALESCE(SUM(amount_paid),0)::numeric AS amount_paid,
+              COALESCE(SUM(amount_due),0)::numeric AS amount_due
+       FROM sales
+       WHERE DATE(created_at)=CURRENT_DATE ${andScope}`,
+      values
+    );
+    return { summary: total.rows[0], rows: result.rows };
+  }
+
+  if (toolName === "get_alerts") {
+    const result = await pool.query(
+      `SELECT id, reference, name, stock, minimum_stock,
+              CASE
+                WHEN stock <= 0 THEN 'rupture'
+                WHEN stock <= minimum_stock THEN 'stock faible'
+                ELSE 'ok'
+              END AS alert_type
+       FROM products
+       WHERE (stock <= 0 OR stock <= minimum_stock) ${andScope}
+       ORDER BY stock ASC, id DESC
+       LIMIT 30`,
+      values
+    );
+    return result.rows;
+  }
+
+  if (toolName === "get_users") {
+    const result = await pool.query(
+      `SELECT id, fullname, email, role, is_active, company_id, warehouse_id,
+              created_at
+       FROM users ${where}
+       ORDER BY id DESC
+       LIMIT 50`,
+      values
+    );
+    return result.rows;
+  }
+
+  if (toolName === "get_inventory") {
+    const result = await pool.query(
+      `SELECT id, product_reference, product_name, old_quantity, new_quantity,
+              difference, status, created_by_name, created_at
+       FROM inventory_history ${where}
+       ORDER BY created_at DESC NULLS LAST, id DESC
+       LIMIT 50`,
+      values
+    );
+    return result.rows;
+  }
+
+  if (toolName === "get_documents") {
+    const result = await pool.query(
+      `SELECT id, document_type, document_number, client_name, total_amount,
+              status, created_by, created_at
+       FROM documents ${where}
+       ORDER BY created_at DESC NULLS LAST, id DESC
+       LIMIT 50`,
+      values
+    );
+    return result.rows;
+  }
+
+  if (toolName === "get_warehouses") {
+    const result = await pool.query(
+      `SELECT id, name, code, location, manager, status, created_at
+       FROM warehouses ${where}
+       ORDER BY id DESC
+       LIMIT 50`,
+      values
+    );
+    return result.rows;
+  }
+
+  if (toolName === "get_locations") {
+    const result = await pool.query(
+      `SELECT id, emplacement_code, warehouse_id, warehouse_code, rayon_code,
+              case_code, level_code, bin_code, product_reference,
+              product_name, status, created_at
+       FROM locations ${where}
+       ORDER BY id DESC
+       LIMIT 50`,
+      values
+    );
+    return result.rows;
+  }
+
+  return null;
+}
+
+function buildLocalAssistantAnswer(message, toolResults) {
+  const lines = ["Voici les informations WMS trouvées :"];
+
+  for (const item of toolResults) {
+    if (item.tool === "get_products") {
+      lines.push(`- Produits : ${item.data?.summary?.total || 0} produit(s).`);
+    } else if (item.tool === "get_stock") {
+      lines.push(
+        `- Stock total : ${Number(item.data?.total_stock || 0).toLocaleString("fr-FR", { maximumFractionDigits: 0 })}. Ruptures : ${item.data?.out_of_stock || 0}. Stocks faibles : ${item.data?.low_stock || 0}.`
+      );
+    } else if (item.tool === "get_last_movement") {
+      const first = Array.isArray(item.data) ? item.data[0] : null;
+      lines.push(
+        first
+          ? `- Dernier mouvement : ${first.type || "-"} ${first.product_reference || ""} (${first.quantity || 0}) le ${first.created_at ? new Date(first.created_at).toLocaleString("fr-FR") : "-"}`
+          : "- Aucun mouvement trouvé."
+      );
+    } else if (item.tool === "get_sales_today") {
+      lines.push(
+        `- Ventes aujourd’hui : ${item.data?.summary?.sales_count || 0} vente(s), total ${Number(item.data?.summary?.total_amount || 0).toLocaleString("fr-FR", { maximumFractionDigits: 0 })} FCFA.`
+      );
+    } else if (item.tool === "get_alerts") {
+      lines.push(`- Alertes stock : ${Array.isArray(item.data) ? item.data.length : 0} élément(s).`);
+    } else if (item.tool === "get_users") {
+      lines.push(`- Utilisateurs : ${Array.isArray(item.data) ? item.data.length : 0} affiché(s).`);
+    } else if (item.tool === "get_inventory") {
+      lines.push(`- Inventaires : ${Array.isArray(item.data) ? item.data.length : 0} ligne(s) récente(s).`);
+    } else if (item.tool === "get_documents") {
+      lines.push(`- Documents : ${Array.isArray(item.data) ? item.data.length : 0} document(s) récent(s).`);
+    } else if (item.tool === "get_warehouses") {
+      lines.push(`- Entrepôts : ${Array.isArray(item.data) ? item.data.length : 0} affiché(s).`);
+    } else if (item.tool === "get_locations") {
+      lines.push(`- Emplacements : ${Array.isArray(item.data) ? item.data.length : 0} affiché(s).`);
+    }
+  }
+
+  lines.push("");
+  lines.push(`Question : ${message}`);
+  return lines.join("\n");
+}
+
+app.post("/assistant/query", authenticateToken, async (req, res) => {
+  try {
+    const { message } = req.body;
+
+    if (!message || String(message).trim() === "") {
+      return res.status(400).json({ error: "Message obligatoire" });
+    }
+
+    const selectedTools = chooseAssistantTools(message);
+    const toolResults = [];
+
+    for (const tool of selectedTools) {
+      const data = await runAssistantTool(tool, req.user);
+      toolResults.push({ tool, data });
+    }
+
+    if (!process.env.OPENROUTER_API_KEY) {
+      return res.json({
+        answer: buildLocalAssistantAnswer(message, toolResults),
+        tools_used: selectedTools,
+        data: toolResults
+      });
+    }
+
+    const aiResponse = await fetch(
+      "https://openrouter.ai/api/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+          "Content-Type": "application/json",
+          "HTTP-Referer": "https://trianglewmspro.com",
+          "X-Title": "Triangle WMS Pro"
+        },
+        body: JSON.stringify({
+          model: "openrouter/auto",
+          messages: [
+            {
+              role: "system",
+              content:
+                "Tu es l'assistant IA connecté au WMS Triangle WMS Pro. Réponds en français simple et professionnel. Utilise uniquement les données fournies par les outils internes. Si une liste est longue, résume les éléments importants. Ne dis jamais que tu n'as pas accès aux données quand des résultats d'outils sont fournis."
+            },
+            {
+              role: "user",
+              content: `Question utilisateur : ${message}\n\nOutils exécutés : ${selectedTools.join(", ")}\n\nRésultats JSON :\n${JSON.stringify(toolResults, null, 2)}`
+            }
+          ]
+        })
+      }
+    );
+
+    const payload = await aiResponse.json();
+
+    if (!aiResponse.ok) {
+      return res.json({
+        answer: buildLocalAssistantAnswer(message, toolResults),
+        tools_used: selectedTools,
+        data: toolResults,
+        warning: "OpenRouter indisponible, réponse locale générée depuis les données WMS."
+      });
+    }
+
+    res.json({
+      answer:
+        payload?.choices?.[0]?.message?.content ||
+        buildLocalAssistantAnswer(message, toolResults),
+      tools_used: selectedTools,
+      data: toolResults
+    });
+  } catch (error) {
+    console.error("ERREUR ASSISTANT QUERY :", error);
+    res.status(500).json({ error: "Erreur assistant IA connecté WMS" });
+  }
+});
+
 /* ASSISTANT IA OPENROUTER */
 app.post("/ai/chat", async (req, res) => {
   try {
