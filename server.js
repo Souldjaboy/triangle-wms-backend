@@ -234,7 +234,7 @@ function maskSecret(value) {
 }
 
 function isExternalPaymentMethod(method) {
-  return ["Carte bancaire", "Orange Money", "Moov Money", "Wave"].includes(String(method || ""));
+  return ["Carte bancaire", "Orange Money", "Moov Money", "Wave", "Virement"].includes(String(method || ""));
 }
 
 function providerKeyFromMethod(method) {
