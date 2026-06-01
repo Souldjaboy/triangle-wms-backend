@@ -6330,6 +6330,9 @@ app.put("/super-admin/users/:id/password", async (req, res) => {
 app.get("/dashboard-stats", async (req, res) => {
   try {
     const totalProduits = await pool.query("SELECT COUNT(*) FROM products");
+    const totalStock = await pool.query(
+      "SELECT COALESCE(SUM(stock), 0) AS total FROM products"
+    );
     const totalEntrepots = await pool.query("SELECT COUNT(*) FROM warehouses");
     const totalEmplacements = await pool.query(
       "SELECT COUNT(*) FROM locations"
@@ -6361,6 +6364,7 @@ app.get("/dashboard-stats", async (req, res) => {
 
     res.json({
       total_produits: Number(totalProduits.rows[0].count),
+      total_stock: Number(totalStock.rows[0].total),
       total_entrepots: Number(totalEntrepots.rows[0].count),
       total_emplacements: Number(totalEmplacements.rows[0].count),
       total_utilisateurs: Number(totalUsers.rows[0].count),
