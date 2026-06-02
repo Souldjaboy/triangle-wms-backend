@@ -265,6 +265,52 @@ function calculateDistanceMeters(lat1, lon1, lat2, lon2) {
   return earthRadiusMeters * c;
 }
 
+function canManageAttendanceSites(user) {
+  const role = normalizeRole(user?.role);
+  return user?.is_super_admin === true || role === "super_admin" || role === "admin" || role === "admin_entreprise";
+}
+
+function normalizeAttendanceGpsStatus(value) {
+  const status = String(value || "").toLowerCase();
+  if (status === "mobile") return "mobile";
+  if (status.includes("hors")) return "hors_zone";
+  if (status.includes("refus")) return "refusé";
+  if (status.includes("autor")) return "hors_zone_autorisé";
+  return status || "accepté";
+}
+
+async function getAllowedAttendanceSitesForUser(user) {
+  const companyId = user.company_id || null;
+  const assignedResult = await pool.query(
+    `SELECT s.*
+     FROM attendance_sites s
+     INNER JOIN employee_attendance_sites eas
+       ON eas.attendance_site_id=s.id
+     WHERE eas.user_id=$1
+       AND s.actif=true
+       AND ($2::int IS NULL OR s.company_id=$2 OR s.company_id IS NULL)
+     ORDER BY s.nom_du_site ASC`,
+    [user.id, companyId]
+  );
+
+  if (assignedResult.rows.length > 0) return assignedResult.rows;
+
+  if (user.primary_attendance_site_id) {
+    const primaryResult = await pool.query(
+      `SELECT *
+       FROM attendance_sites
+       WHERE id=$1
+         AND actif=true
+         AND ($2::int IS NULL OR company_id=$2 OR company_id IS NULL)
+       LIMIT 1`,
+      [user.primary_attendance_site_id, companyId]
+    );
+    if (primaryResult.rows.length > 0) return primaryResult.rows;
+  }
+
+  return [];
+}
+
 function productQrUrl(req, product) {
   const forwardedProto = req.get("x-forwarded-proto") || req.protocol;
   const host = req.get("host");
@@ -5854,8 +5900,9 @@ app.get("/attendance/settings/gps", authenticateToken, async (req, res) => {
     const result = await pool.query(
       `INSERT INTO attendance_gps_settings
        (id, gps_required, site_name, allowed_radius_meters,
-        allow_remote_attendance, kiosk_mode, employee_scanner_access)
-       VALUES (1, false, '', 100, false, true, false)
+        allow_remote_attendance, kiosk_mode, employee_scanner_access,
+        allow_out_of_zone_global)
+       VALUES (1, false, '', 100, false, true, false, false)
        ON CONFLICT (id) DO UPDATE SET id=EXCLUDED.id
        RETURNING *`
     );
@@ -5870,7 +5917,7 @@ app.get("/attendance/settings/gps", authenticateToken, async (req, res) => {
 app.put(
   "/attendance/settings/gps",
   authenticateToken,
-  authorizeRoles("admin", "super_admin"),
+  authorizeRoles("admin", "admin_entreprise", "super_admin"),
   async (req, res) => {
     try {
       const {
@@ -5880,6 +5927,7 @@ app.put(
         site_longitude,
         allowed_radius_meters,
         allow_remote_attendance,
+        allow_out_of_zone_global,
         kiosk_mode,
         employee_scanner_access
       } = req.body;
@@ -5887,9 +5935,9 @@ app.put(
       const result = await pool.query(
         `INSERT INTO attendance_gps_settings
          (id, gps_required, site_name, site_latitude, site_longitude,
-          allowed_radius_meters, allow_remote_attendance, kiosk_mode,
-          employee_scanner_access, updated_by)
-         VALUES (1,$1,$2,$3,$4,$5,$6,$7,$8,$9)
+          allowed_radius_meters, allow_remote_attendance, allow_out_of_zone_global,
+          kiosk_mode, employee_scanner_access, updated_by)
+         VALUES (1,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
          ON CONFLICT (id)
          DO UPDATE SET
            gps_required=EXCLUDED.gps_required,
@@ -5898,6 +5946,7 @@ app.put(
            site_longitude=EXCLUDED.site_longitude,
            allowed_radius_meters=EXCLUDED.allowed_radius_meters,
            allow_remote_attendance=EXCLUDED.allow_remote_attendance,
+           allow_out_of_zone_global=EXCLUDED.allow_out_of_zone_global,
            kiosk_mode=EXCLUDED.kiosk_mode,
            employee_scanner_access=EXCLUDED.employee_scanner_access,
            updated_by=EXCLUDED.updated_by,
@@ -5914,6 +5963,7 @@ app.put(
             : Number(site_longitude),
           Number(allowed_radius_meters || 100),
           allow_remote_attendance === true,
+          allow_out_of_zone_global === true,
           kiosk_mode !== false,
           employee_scanner_access === true,
           req.user.id
@@ -5927,6 +5977,282 @@ app.put(
     }
   }
 );
+
+app.get("/attendance-sites", authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.company_id || null;
+    const isManager = canManageAttendanceSites(req.user);
+
+    if (isManager) {
+      const result = await pool.query(
+        `SELECT *
+         FROM attendance_sites
+         WHERE ($1::int IS NULL OR company_id=$1 OR $2::boolean=true)
+         ORDER BY actif DESC, nom_du_site ASC`,
+        [companyId, req.user.is_super_admin === true]
+      );
+      return res.json(result.rows);
+    }
+
+    const sites = await getAllowedAttendanceSitesForUser(req.user);
+    res.json(sites);
+  } catch (error) {
+    console.error("ERREUR ATTENDANCE SITES :", error);
+    res.status(500).json({ error: "Erreur lecture sites de pointage" });
+  }
+});
+
+app.post("/attendance-sites", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageAttendanceSites(req.user)) {
+      return res.status(403).json({ error: "Accès refusé." });
+    }
+
+    const {
+      nom_du_site,
+      latitude,
+      longitude,
+      rayon_autorise_metre = 100,
+      actif = true,
+      company_id
+    } = req.body;
+
+    if (!nom_du_site || latitude === undefined || longitude === undefined) {
+      return res.status(400).json({ error: "Nom, latitude et longitude sont obligatoires." });
+    }
+
+    const companyId = req.user.is_super_admin === true
+      ? company_id || req.user.company_id || null
+      : req.user.company_id;
+
+    const result = await pool.query(
+      `INSERT INTO attendance_sites
+       (company_id, nom_du_site, latitude, longitude, rayon_autorise_metre, actif)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       RETURNING *`,
+      [
+        companyId,
+        nom_du_site,
+        Number(latitude),
+        Number(longitude),
+        Number(rayon_autorise_metre || 100),
+        actif !== false
+      ]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error("ERREUR CREATION SITE POINTAGE :", error);
+    res.status(500).json({ error: "Erreur création site de pointage" });
+  }
+});
+
+app.put("/attendance-sites/:id", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageAttendanceSites(req.user)) {
+      return res.status(403).json({ error: "Accès refusé." });
+    }
+
+    const companyId = req.user.company_id || null;
+    const isSuperAdmin = req.user.is_super_admin === true;
+    const {
+      nom_du_site,
+      latitude,
+      longitude,
+      rayon_autorise_metre,
+      actif
+    } = req.body;
+
+    const result = await pool.query(
+      `UPDATE attendance_sites
+       SET nom_du_site=$1,
+           latitude=$2,
+           longitude=$3,
+           rayon_autorise_metre=$4,
+           actif=$5,
+           updated_at=CURRENT_TIMESTAMP
+       WHERE id=$6 ${isSuperAdmin ? "" : "AND company_id=$7"}
+       RETURNING *`,
+      isSuperAdmin
+        ? [
+            nom_du_site || "",
+            Number(latitude),
+            Number(longitude),
+            Number(rayon_autorise_metre || 100),
+            actif !== false,
+            req.params.id
+          ]
+        : [
+            nom_du_site || "",
+            Number(latitude),
+            Number(longitude),
+            Number(rayon_autorise_metre || 100),
+            actif !== false,
+            req.params.id,
+            companyId
+          ]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Site de pointage introuvable." });
+    }
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("ERREUR UPDATE SITE POINTAGE :", error);
+    res.status(500).json({ error: "Erreur modification site de pointage" });
+  }
+});
+
+app.delete("/attendance-sites/:id", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageAttendanceSites(req.user)) {
+      return res.status(403).json({ error: "Accès refusé." });
+    }
+
+    const companyId = req.user.company_id || null;
+    const isSuperAdmin = req.user.is_super_admin === true;
+    const result = await pool.query(
+      `UPDATE attendance_sites
+       SET actif=false, updated_at=CURRENT_TIMESTAMP
+       WHERE id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}
+       RETURNING *`,
+      isSuperAdmin ? [req.params.id] : [req.params.id, companyId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Site de pointage introuvable." });
+    }
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("ERREUR DELETE SITE POINTAGE :", error);
+    res.status(500).json({ error: "Erreur désactivation site de pointage" });
+  }
+});
+
+app.get("/employees/:id/attendance-sites", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageAttendanceSites(req.user) && String(req.user.id) !== String(req.params.id)) {
+      return res.status(403).json({ error: "Accès refusé." });
+    }
+
+    const userResult = await pool.query(
+      `SELECT id, company_id, primary_attendance_site_id, employee_mobile, allow_out_of_zone
+       FROM users
+       WHERE id=$1 ${req.user.is_super_admin === true ? "" : "AND company_id=$2"}`,
+      req.user.is_super_admin === true ? [req.params.id] : [req.params.id, req.user.company_id]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: "Employé introuvable." });
+    }
+
+    const sitesResult = await pool.query(
+      `SELECT s.*
+       FROM attendance_sites s
+       INNER JOIN employee_attendance_sites eas ON eas.attendance_site_id=s.id
+       WHERE eas.user_id=$1
+       ORDER BY s.nom_du_site ASC`,
+      [req.params.id]
+    );
+
+    res.json({
+      user: userResult.rows[0],
+      sites: sitesResult.rows
+    });
+  } catch (error) {
+    console.error("ERREUR EMPLOYEE SITES :", error);
+    res.status(500).json({ error: "Erreur lecture affectations sites" });
+  }
+});
+
+app.put("/employees/:id/attendance-sites", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    if (!canManageAttendanceSites(req.user)) {
+      return res.status(403).json({ error: "Accès refusé." });
+    }
+
+    const { site_ids = [], primary_attendance_site_id = null, employee_mobile = false, allow_out_of_zone = false } = req.body;
+    const companyId = req.user.company_id || null;
+    const isSuperAdmin = req.user.is_super_admin === true;
+
+    await client.query("BEGIN");
+
+    const userResult = await client.query(
+      `SELECT * FROM users WHERE id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"} FOR UPDATE`,
+      isSuperAdmin ? [req.params.id] : [req.params.id, companyId]
+    );
+
+    if (userResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Employé introuvable." });
+    }
+
+    const user = userResult.rows[0];
+    const cleanSiteIds = Array.isArray(site_ids)
+      ? [...new Set(site_ids.map((id) => Number(id)).filter((id) => Number.isFinite(id)))]
+      : [];
+
+    await client.query("DELETE FROM employee_attendance_sites WHERE user_id=$1", [user.id]);
+
+    for (const siteId of cleanSiteIds) {
+      const siteResult = await client.query(
+        `SELECT id, company_id
+         FROM attendance_sites
+         WHERE id=$1 AND actif=true ${isSuperAdmin ? "" : "AND company_id=$2"}
+         LIMIT 1`,
+        isSuperAdmin ? [siteId] : [siteId, user.company_id]
+      );
+      if (siteResult.rows.length === 0) continue;
+
+      await client.query(
+        `INSERT INTO employee_attendance_sites
+         (user_id, attendance_site_id, company_id)
+         VALUES ($1,$2,$3)
+         ON CONFLICT (user_id, attendance_site_id) DO NOTHING`,
+        [user.id, siteId, user.company_id]
+      );
+    }
+
+    const primarySiteId = primary_attendance_site_id
+      ? Number(primary_attendance_site_id)
+      : cleanSiteIds[0] || null;
+
+    await client.query(
+      `UPDATE users
+       SET primary_attendance_site_id=$1,
+           employee_mobile=$2,
+           allow_out_of_zone=$3
+       WHERE id=$4`,
+      [primarySiteId, employee_mobile === true, allow_out_of_zone === true, user.id]
+    );
+
+    await client.query(
+      `INSERT INTO attendance_settings
+       (user_id, primary_attendance_site_id, employee_mobile, allow_out_of_zone)
+       VALUES ($1,$2,$3,$4)
+       ON CONFLICT (user_id)
+       DO UPDATE SET
+         primary_attendance_site_id=EXCLUDED.primary_attendance_site_id,
+         employee_mobile=EXCLUDED.employee_mobile,
+         allow_out_of_zone=EXCLUDED.allow_out_of_zone,
+         updated_at=CURRENT_TIMESTAMP`,
+      [user.id, primarySiteId, employee_mobile === true, allow_out_of_zone === true]
+    );
+
+    await client.query("COMMIT");
+    res.json({ ok: true });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("ERREUR SAVE EMPLOYEE SITES :", error);
+    res.status(500).json({ error: "Erreur sauvegarde affectations sites" });
+  } finally {
+    client.release();
+  }
+});
 
 /* LISTE GROUPES HORAIRES */
 app.get("/attendance/groups", async (req, res) => {
@@ -7757,20 +8083,31 @@ app.post("/attendance/scan", async (req, res) => {
     const gpsSettingsResult = await pool.query(
       `INSERT INTO attendance_gps_settings
        (id, gps_required, site_name, allowed_radius_meters,
-        allow_remote_attendance, kiosk_mode, employee_scanner_access)
-       VALUES (1, false, '', 100, false, true, false)
+        allow_remote_attendance, kiosk_mode, employee_scanner_access,
+        allow_out_of_zone_global)
+       VALUES (1, false, '', 100, false, true, false, false)
        ON CONFLICT (id) DO UPDATE SET id=EXCLUDED.id
        RETURNING *`
     );
     const gpsSettings = gpsSettingsResult.rows[0] || {};
     const gpsRequired = gpsSettings.gps_required === true;
-    const allowRemoteAttendance = gpsSettings.allow_remote_attendance === true;
+    const allowRemoteAttendance = gpsSettings.allow_remote_attendance === true || gpsSettings.allow_out_of_zone_global === true;
     const lat = latitude === "" || latitude === null || latitude === undefined ? null : Number(latitude);
     const lon = longitude === "" || longitude === null || longitude === undefined ? null : Number(longitude);
     const gpsAccuracy = accuracy === "" || accuracy === null || accuracy === undefined ? null : Number(accuracy);
-    const siteLat = gpsSettings.site_latitude === null || gpsSettings.site_latitude === undefined ? null : Number(gpsSettings.site_latitude);
-    const siteLon = gpsSettings.site_longitude === null || gpsSettings.site_longitude === undefined ? null : Number(gpsSettings.site_longitude);
-    const allowedRadius = Number(gpsSettings.allowed_radius_meters || 100);
+    const userAttendanceSettings = await pool.query(
+      `SELECT primary_attendance_site_id, employee_mobile, allow_out_of_zone
+       FROM attendance_settings
+       WHERE user_id=$1
+       LIMIT 1`,
+      [user.id]
+    );
+    const employeeMobile = user.employee_mobile === true || userAttendanceSettings.rows[0]?.employee_mobile === true;
+    const allowOutOfZoneForUser = user.allow_out_of_zone === true || userAttendanceSettings.rows[0]?.allow_out_of_zone === true;
+    const allowedSites = await getAllowedAttendanceSitesForUser({
+      ...user,
+      primary_attendance_site_id: user.primary_attendance_site_id || userAttendanceSettings.rows[0]?.primary_attendance_site_id
+    });
 
     if (gpsRequired && (lat === null || lon === null || !Number.isFinite(lat) || !Number.isFinite(lon))) {
       return res.status(403).json({
@@ -7778,34 +8115,56 @@ app.post("/attendance/scan", async (req, res) => {
       });
     }
 
-    if (gpsRequired && (siteLat === null || siteLon === null || !Number.isFinite(siteLat) || !Number.isFinite(siteLon))) {
+    if (gpsRequired && !employeeMobile && allowedSites.length === 0) {
       return res.status(403).json({
-        error: "Pointage refusé : impossible d’obtenir votre position."
+        error: "Pointage refusé : aucun site de pointage autorisé."
       });
     }
 
     let distanceMeters = null;
     let isInsideZone = null;
+    let detectedSite = null;
+    let allowedRadius = Number(gpsSettings.allowed_radius_meters || 100);
+    let gpsStatus = "accepté";
 
     if (
       lat !== null &&
       lon !== null &&
       Number.isFinite(lat) &&
-      Number.isFinite(lon) &&
-      siteLat !== null &&
-      siteLon !== null &&
-      Number.isFinite(siteLat) &&
-      Number.isFinite(siteLon)
+      Number.isFinite(lon)
     ) {
-      distanceMeters = calculateDistanceMeters(siteLat, siteLon, lat, lon);
-      isInsideZone = distanceMeters <= allowedRadius;
+      for (const site of allowedSites) {
+        const siteLat = Number(site.latitude);
+        const siteLon = Number(site.longitude);
+        if (!Number.isFinite(siteLat) || !Number.isFinite(siteLon)) continue;
+
+        const distance = calculateDistanceMeters(siteLat, siteLon, lat, lon);
+        if (distanceMeters === null || distance < distanceMeters) {
+          distanceMeters = distance;
+          detectedSite = site;
+          allowedRadius = Number(site.rayon_autorise_metre || gpsSettings.allowed_radius_meters || 100);
+          isInsideZone = distance <= allowedRadius;
+        }
+      }
     }
 
-    if (gpsRequired && !allowRemoteAttendance && !isInsideZone) {
+    if (employeeMobile) {
+      gpsStatus = "mobile";
+      isInsideZone = isInsideZone === null ? true : isInsideZone;
+    } else if (isInsideZone) {
+      gpsStatus = "accepté";
+    } else if (gpsRequired && (allowRemoteAttendance || allowOutOfZoneForUser)) {
+      gpsStatus = "hors_zone_autorisé";
+    } else if (gpsRequired) {
+      gpsStatus = "refusé";
+    }
+
+    if (gpsRequired && !employeeMobile && !allowRemoteAttendance && !allowOutOfZoneForUser && !isInsideZone) {
       return res.status(403).json({
         error: "Pointage refusé : vous êtes hors de la zone autorisée.",
         distance_meters: distanceMeters,
-        allowed_radius_meters: allowedRadius
+        allowed_radius_meters: allowedRadius,
+        site_name: detectedSite?.nom_du_site || ""
       });
     }
 
@@ -7966,8 +8325,11 @@ app.post("/attendance/scan", async (req, res) => {
            accuracy=$3,
            distance_meters=$4,
            is_inside_zone=$5,
+           attendance_site_id=$6,
+           attendance_site_name=$7,
+           gps_status=$8,
            updated_at=CURRENT_TIMESTAMP
-       WHERE id=$6
+       WHERE id=$9
        RETURNING *`,
       [
         lat,
@@ -7975,6 +8337,9 @@ app.post("/attendance/scan", async (req, res) => {
         gpsAccuracy,
         distanceMeters,
         isInsideZone,
+        detectedSite?.id || null,
+        detectedSite?.nom_du_site || (employeeMobile ? "Pointage mobile" : ""),
+        gpsStatus,
         result.rows[0].id
       ]
     );
@@ -7982,8 +8347,9 @@ app.post("/attendance/scan", async (req, res) => {
     await pool.query(
       `INSERT INTO attendance_history
        (user_id, action_type, device_info, location_info,
-        latitude, longitude, accuracy, distance_meters, is_inside_zone)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        latitude, longitude, accuracy, distance_meters, is_inside_zone,
+        attendance_site_id, attendance_site_name, gps_status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
       [
         user.id,
         action_type,
@@ -7993,7 +8359,10 @@ app.post("/attendance/scan", async (req, res) => {
         lon,
         gpsAccuracy,
         distanceMeters,
-        isInsideZone
+        isInsideZone,
+        detectedSite?.id || null,
+        detectedSite?.nom_du_site || (employeeMobile ? "Pointage mobile" : ""),
+        gpsStatus
       ]
     );
 
@@ -8004,11 +8373,14 @@ app.post("/attendance/scan", async (req, res) => {
       action,
       gps: {
         gps_required: gpsRequired,
-        site_name: gpsSettings.site_name || "",
+        site_name: detectedSite?.nom_du_site || (employeeMobile ? "Pointage mobile" : gpsSettings.site_name || ""),
+        site_id: detectedSite?.id || null,
         distance_meters: distanceMeters,
         allowed_radius_meters: allowedRadius,
         is_inside_zone: isInsideZone,
-        allow_remote_attendance: allowRemoteAttendance
+        allow_remote_attendance: allowRemoteAttendance || allowOutOfZoneForUser,
+        employee_mobile: employeeMobile,
+        gps_status: gpsStatus
       }
     });
   } catch (error) {
