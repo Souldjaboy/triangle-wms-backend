@@ -2211,7 +2211,8 @@ app.put(
         receipt_format,
         printer_name,
         allowed_payment_methods,
-        max_discount_rate
+        max_discount_rate,
+        decimal_count
       } = req.body;
       const taxRate =
         default_tax_rate === "" || default_tax_rate === null || default_tax_rate === undefined
@@ -2221,8 +2222,8 @@ app.put(
       const result = await pool.query(
         `INSERT INTO pos_settings
          (company_id, pos_enabled, default_tax_rate, currency, receipt_format,
-          printer_name, allowed_payment_methods, max_discount_rate)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+          printer_name, allowed_payment_methods, max_discount_rate, decimal_count)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
          ON CONFLICT (company_id)
          DO UPDATE SET
            pos_enabled=EXCLUDED.pos_enabled,
@@ -2232,6 +2233,7 @@ app.put(
            printer_name=EXCLUDED.printer_name,
            allowed_payment_methods=EXCLUDED.allowed_payment_methods,
            max_discount_rate=EXCLUDED.max_discount_rate,
+           decimal_count=EXCLUDED.decimal_count,
            updated_at=CURRENT_TIMESTAMP
          RETURNING *`,
         [
@@ -2242,7 +2244,8 @@ app.put(
           receipt_format || "80mm",
           printer_name || "",
           allowed_payment_methods || "",
-          Number(max_discount_rate || 0)
+          Number(max_discount_rate || 0),
+          Number(decimal_count || 0)
         ]
       );
 
