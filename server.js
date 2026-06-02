@@ -112,6 +112,20 @@ function isAdminUser(user) {
   );
 }
 
+function canAccessAdminSettings(user) {
+  const role = normalizeRole(user?.role);
+  return user?.is_super_admin === true || role === "super_admin" || role === "admin";
+}
+
+function canAccessDirectionModule(user) {
+  const role = normalizeRole(user?.role);
+  return (
+    canAccessAdminSettings(user) ||
+    role === "directeur" ||
+    role === "direction"
+  );
+}
+
 function canValidateStockMovement(user) {
   const role = normalizeRole(user?.role);
   return (
@@ -267,7 +281,7 @@ function calculateDistanceMeters(lat1, lon1, lat2, lon2) {
 
 function canManageAttendanceSites(user) {
   const role = normalizeRole(user?.role);
-  return user?.is_super_admin === true || role === "super_admin" || role === "admin" || role === "admin_entreprise";
+  return user?.is_super_admin === true || role === "super_admin" || role === "admin";
 }
 
 function normalizeAttendanceGpsStatus(value) {
@@ -556,23 +570,29 @@ app.get("/", (req, res) => {
 });
 
 /* UPLOAD LOGO */
-app.post("/upload-logo", upload.single("logo"), async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ error: "Aucun fichier reçu" });
+app.post(
+  "/upload-logo",
+  authenticateToken,
+  authorizeRoles("admin", "super_admin"),
+  upload.single("logo"),
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: "Aucun fichier reçu" });
+      }
+
+      const logoUrl = publicUploadUrl(req, req.file.filename);
+
+      res.json({
+        message: "Logo uploadé avec succès",
+        logo_url: logoUrl
+      });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Erreur upload logo" });
     }
-
-    const logoUrl = publicUploadUrl(req, req.file.filename);
-
-    res.json({
-      message: "Logo uploadé avec succès",
-      logo_url: logoUrl
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Erreur upload logo" });
   }
-});
+);
 
 /* UPLOAD PHOTO UTILISATEUR */
 app.post("/upload-user-photo", upload.single("photo"), async (req, res) => {
@@ -1038,6 +1058,116 @@ app.get("/users", authenticateToken, async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Erreur lecture utilisateurs" });
+  }
+});
+
+app.get("/modules", authenticateToken, async (req, res) => {
+  try {
+    if (!canAccessAdminSettings(req.user)) {
+      return res.status(403).json({ error: "Accès refusé : réservé à l’administrateur" });
+    }
+
+    const result = await pool.query(
+      `SELECT module_key, module_name, description, is_active
+       FROM modules
+       WHERE is_active=true
+       ORDER BY module_name ASC`
+    );
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR MODULES :", error);
+    res.status(500).json({ error: "Erreur lecture modules" });
+  }
+});
+
+app.get("/users/:id/permissions", authenticateToken, async (req, res) => {
+  try {
+    if (!canAccessAdminSettings(req.user)) {
+      return res.status(403).json({ error: "Accès refusé : réservé à l’administrateur" });
+    }
+
+    const userResult = await pool.query("SELECT id, company_id FROM users WHERE id=$1", [req.params.id]);
+    const targetUser = userResult.rows[0];
+
+    if (!targetUser) {
+      return res.status(404).json({ error: "Utilisateur introuvable" });
+    }
+
+    if (req.user.is_super_admin !== true && Number(targetUser.company_id) !== Number(req.user.company_id)) {
+      return res.status(403).json({ error: "Accès refusé : utilisateur hors entreprise" });
+    }
+
+    const result = await pool.query(
+      `SELECT up.*, m.module_name, m.description
+       FROM user_permissions up
+       LEFT JOIN modules m ON m.module_key=up.module_key
+       WHERE up.user_id=$1
+       ORDER BY up.module_key ASC`,
+      [req.params.id]
+    );
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR USER PERMISSIONS :", error);
+    res.status(500).json({ error: "Erreur lecture permissions utilisateur" });
+  }
+});
+
+app.put("/users/:id/permissions", authenticateToken, async (req, res) => {
+  try {
+    if (!canAccessAdminSettings(req.user)) {
+      return res.status(403).json({ error: "Accès refusé : réservé à l’administrateur" });
+    }
+
+    const { permissions = [] } = req.body;
+    const userResult = await pool.query("SELECT id, company_id FROM users WHERE id=$1", [req.params.id]);
+    const targetUser = userResult.rows[0];
+
+    if (!targetUser) {
+      return res.status(404).json({ error: "Utilisateur introuvable" });
+    }
+
+    if (req.user.is_super_admin !== true && Number(targetUser.company_id) !== Number(req.user.company_id)) {
+      return res.status(403).json({ error: "Accès refusé : utilisateur hors entreprise" });
+    }
+
+    const saved = [];
+
+    for (const permission of permissions) {
+      const result = await pool.query(
+        `INSERT INTO user_permissions
+         (user_id, module_key, can_view, can_create, can_edit, can_delete, can_validate, updated_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+         ON CONFLICT (user_id, module_key)
+         DO UPDATE SET
+           can_view=EXCLUDED.can_view,
+           can_create=EXCLUDED.can_create,
+           can_edit=EXCLUDED.can_edit,
+           can_delete=EXCLUDED.can_delete,
+           can_validate=EXCLUDED.can_validate,
+           updated_by=EXCLUDED.updated_by,
+           updated_at=CURRENT_TIMESTAMP
+         RETURNING *`,
+        [
+          req.params.id,
+          permission.module_key,
+          permission.can_view === true,
+          permission.can_create === true,
+          permission.can_edit === true,
+          permission.can_delete === true,
+          permission.can_validate === true,
+          req.user.id || null
+        ]
+      );
+
+      saved.push(result.rows[0]);
+    }
+
+    res.json(saved);
+  } catch (error) {
+    console.error("ERREUR UPDATE USER PERMISSIONS :", error);
+    res.status(500).json({ error: "Erreur sauvegarde permissions utilisateur" });
   }
 });
 
@@ -3380,6 +3510,10 @@ app.get("/pos/receipts/:id", authenticateToken, async (req, res) => {
 
 app.get("/pos/reports/daily", authenticateToken, async (req, res) => {
   try {
+    if (!canAccessDirectionModule(req.user)) {
+      return res.status(403).json({ error: "Accès refusé : module réservé à la direction" });
+    }
+
     const companyId = req.user.company_id;
     const isSuperAdmin = req.user.is_super_admin === true;
     const date = req.query.date || new Date().toISOString().slice(0, 10);
@@ -3825,6 +3959,10 @@ app.post("/payments/webhook/wave", async (req, res) => {
 
 app.get("/pos/reports/products", authenticateToken, async (req, res) => {
   try {
+    if (!canAccessDirectionModule(req.user)) {
+      return res.status(403).json({ error: "Accès refusé : module réservé à la direction" });
+    }
+
     const companyId = req.user.company_id;
     const isSuperAdmin = req.user.is_super_admin === true;
 
@@ -3849,6 +3987,10 @@ app.get("/pos/reports/products", authenticateToken, async (req, res) => {
 
 app.get("/pos/reports/payments", authenticateToken, async (req, res) => {
   try {
+    if (!canAccessDirectionModule(req.user)) {
+      return res.status(403).json({ error: "Accès refusé : module réservé à la direction" });
+    }
+
     const companyId = req.user.company_id;
     const isSuperAdmin = req.user.is_super_admin === true;
 
@@ -3952,6 +4094,10 @@ app.put("/super-admin/modules/company/:companyId", authenticateToken, async (req
 /* DOCUMENTS SAAS */
 app.get("/documents", authenticateToken, async (req, res) => {
   try {
+    if (!canAccessDirectionModule(req.user)) {
+      return res.status(403).json({ error: "Accès refusé : module réservé à la direction" });
+    }
+
     const companyId = req.user.company_id;
     const isSuperAdmin = req.user.is_super_admin === true;
 
@@ -3979,12 +4125,24 @@ app.get("/documents", authenticateToken, async (req, res) => {
   }
 });
 
-app.get("/documents/:id", async (req, res) => {
+app.get("/documents/:id", authenticateToken, async (req, res) => {
   try {
+    if (!canAccessDirectionModule(req.user)) {
+      return res.status(403).json({ error: "Accès refusé : module réservé à la direction" });
+    }
+
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
+
     const documentResult = await pool.query(
-      "SELECT * FROM documents WHERE id=$1",
-      [req.params.id]
+      `SELECT * FROM documents
+       WHERE id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}`,
+      isSuperAdmin ? [req.params.id] : [req.params.id, companyId]
     );
+
+    if (!documentResult.rows[0]) {
+      return res.status(404).json({ error: "Document introuvable" });
+    }
 
     const itemsResult = await pool.query(
       "SELECT * FROM document_items WHERE document_id=$1 ORDER BY id ASC",
@@ -4003,6 +4161,10 @@ app.get("/documents/:id", async (req, res) => {
 
 app.post("/documents", authenticateToken, async (req, res) => {
   try {
+    if (!canAccessDirectionModule(req.user)) {
+      return res.status(403).json({ error: "Accès refusé : module réservé à la direction" });
+    }
+
     const {
       document_type,
       client_name,
@@ -4099,9 +4261,20 @@ app.post("/documents", authenticateToken, async (req, res) => {
   }
 });
 
-app.delete("/documents/:id", async (req, res) => {
+app.delete("/documents/:id", authenticateToken, async (req, res) => {
   try {
-    await pool.query("DELETE FROM documents WHERE id=$1", [req.params.id]);
+    if (!canAccessAdminSettings(req.user)) {
+      return res.status(403).json({ error: "Accès refusé : réservé à l’administrateur" });
+    }
+
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
+
+    await pool.query(
+      `DELETE FROM documents
+       WHERE id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}`,
+      isSuperAdmin ? [req.params.id] : [req.params.id, companyId]
+    );
 
     await logActivity(
       "Administrateur",
@@ -4121,6 +4294,10 @@ app.delete("/documents/:id", async (req, res) => {
 /* GÉNÉRER DOCUMENT DEPUIS MOUVEMENT STOCK */
 app.post("/documents/from-movement/:id", authenticateToken, async (req, res) => {
   try {
+    if (!canAccessDirectionModule(req.user)) {
+      return res.status(403).json({ error: "Accès refusé : module réservé à la direction" });
+    }
+
     const { id } = req.params;
 
     const {
@@ -4889,104 +5066,241 @@ app.get("/alerts", authenticateToken, async (req, res) => {
   }
 });
 
-/* RECHERCHE GLOBALE INTELLIGENTE */
-app.get("/search", async (req, res) => {
+function normalizeSearchText(value) {
+  return String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/\s+/g, "");
+}
+
+function searchableColumn(column) {
+  return `(
+    COALESCE(${column}::text,'') ILIKE $1
+    OR regexp_replace(
+      translate(lower(COALESCE(${column}::text,'')),
+        'àáâãäåèéêëìíîïòóôõöùúûüçñ',
+        'aaaaaaeeeeiiiiooooouuuucn'
+      ),
+      '\\s+', '', 'g'
+    ) LIKE $2
+  )`;
+}
+
+async function handleGlobalSearch(req, res) {
   try {
     const q = req.query.q;
 
     if (!q || String(q).trim() === "") {
       return res.json({
         products: [],
+        stockMovements: [],
         movements: [],
         inventories: [],
         documents: [],
-        locations: []
+        sales: [],
+        receipts: [],
+        users: [],
+        locations: [],
+        totals: {
+          products: 0,
+          stockMovements: 0,
+          movements: 0,
+          inventories: 0,
+          documents: 0,
+          sales: 0,
+          receipts: 0,
+          users: 0,
+          locations: 0
+        }
       });
     }
 
     const search = `%${String(q).trim()}%`;
+    const compactSearch = `%${normalizeSearchText(q)}%`;
+    const companyId = req.user?.company_id || null;
+    const isSuperAdmin = req.user?.is_super_admin === true || normalizeRole(req.user?.role) === "super_admin";
+    const values = [search, compactSearch];
+    const companyValues = isSuperAdmin ? values : [...values, companyId];
+    const productCompanyClause = isSuperAdmin ? "" : "AND (products.company_id=$3 OR products.company_id IS NULL)";
+    const movementCompanyClause = isSuperAdmin ? "" : "AND (company_id=$3 OR company_id IS NULL)";
+    const inventoryCompanyClause = isSuperAdmin ? "" : "AND (company_id=$3 OR company_id IS NULL)";
+    const documentCompanyClause = isSuperAdmin ? "" : "AND (company_id=$3 OR company_id IS NULL)";
+    const locationCompanyClause = isSuperAdmin ? "" : "AND (locations.company_id=$3 OR locations.company_id IS NULL)";
+    const salesCompanyClause = isSuperAdmin ? "" : "AND (s.company_id=$3 OR s.company_id IS NULL)";
+    const receiptsCompanyClause = isSuperAdmin ? "" : "AND (r.company_id=$3 OR r.company_id IS NULL)";
 
     const products = await pool.query(
       `SELECT products.*, locations.emplacement_code
        FROM products
        LEFT JOIN locations ON products.location_id = locations.id
-       WHERE products.reference ILIKE $1
-          OR products.name ILIKE $1
-          OR products.category ILIKE $1
-          OR products.warehouse ILIKE $1
-          OR products.location_code ILIKE $1
-          OR locations.emplacement_code ILIKE $1
+       WHERE (
+          ${searchableColumn("products.reference")}
+          OR ${searchableColumn("products.name")}
+          OR ${searchableColumn("products.category")}
+          OR ${searchableColumn("products.warehouse")}
+          OR ${searchableColumn("products.location_code")}
+          OR ${searchableColumn("products.barcode")}
+          OR ${searchableColumn("products.sku")}
+          OR ${searchableColumn("products.qr_code")}
+          OR ${searchableColumn("locations.emplacement_code")}
+       )
+       ${productCompanyClause}
        ORDER BY products.id DESC`,
-      [search]
+      companyValues
     );
 
-    const movements = await pool.query(
+    const stockMovements = await pool.query(
       `SELECT *
        FROM stock_movements
-       WHERE product_reference ILIKE $1
-          OR product_name ILIKE $1
-          OR type ILIKE $1
-          OR source_warehouse ILIKE $1
-          OR destination_warehouse ILIKE $1
-          OR reason ILIKE $1
-          OR status ILIKE $1
+       WHERE (
+          ${searchableColumn("product_reference")}
+          OR ${searchableColumn("product_name")}
+          OR ${searchableColumn("type")}
+          OR ${searchableColumn("source_warehouse")}
+          OR ${searchableColumn("destination_warehouse")}
+          OR ${searchableColumn("reason")}
+          OR ${searchableColumn("status")}
+          OR ${searchableColumn("created_by_name")}
+          OR ${searchableColumn("location_code")}
+       )
+       ${movementCompanyClause}
        ORDER BY id DESC`,
-      [search]
+      companyValues
     );
 
     const inventories = await pool.query(
       `SELECT *
        FROM inventory_history
-       WHERE product_reference ILIKE $1
-          OR product_name ILIKE $1
-          OR warehouse ILIKE $1
-          OR location_code ILIKE $1
-          OR user_name ILIKE $1
-          OR status ILIKE $1
-          OR observation ILIKE $1
+       WHERE (
+          ${searchableColumn("product_reference")}
+          OR ${searchableColumn("product_name")}
+          OR ${searchableColumn("warehouse")}
+          OR ${searchableColumn("location_code")}
+          OR ${searchableColumn("user_name")}
+          OR ${searchableColumn("status")}
+          OR ${searchableColumn("observation")}
+       )
+       ${inventoryCompanyClause}
        ORDER BY id DESC`,
-      [search]
+      companyValues
     );
 
-    const documents = await pool.query(
-      `SELECT *
-       FROM documents
-       WHERE document_type ILIKE $1
-          OR document_number ILIKE $1
-          OR client_name ILIKE $1
-          OR client_phone ILIKE $1
-          OR client_address ILIKE $1
-          OR observation ILIKE $1
-          OR created_by ILIKE $1
-       ORDER BY id DESC`,
-      [search]
-    );
+    const documents = canAccessDirectionModule(req.user)
+      ? await pool.query(
+          `SELECT *
+           FROM documents
+           WHERE (
+              ${searchableColumn("document_type")}
+              OR ${searchableColumn("document_number")}
+              OR ${searchableColumn("client_name")}
+              OR ${searchableColumn("client_phone")}
+              OR ${searchableColumn("client_address")}
+              OR ${searchableColumn("observation")}
+              OR ${searchableColumn("created_by")}
+           )
+           ${documentCompanyClause}
+           ORDER BY id DESC`,
+          companyValues
+        )
+      : { rows: [] };
 
     const locations = await pool.query(
       `SELECT locations.*, warehouses.name AS warehouse_name
        FROM locations
        LEFT JOIN warehouses ON locations.warehouse_id = warehouses.id
-       WHERE locations.emplacement_code ILIKE $1
-          OR locations.warehouse_code ILIKE $1
-          OR locations.zone ILIKE $1
-          OR locations.rayon ILIKE $1
-          OR locations.etagere ILIKE $1
-          OR warehouses.name ILIKE $1
+       WHERE (
+          ${searchableColumn("locations.emplacement_code")}
+          OR ${searchableColumn("locations.warehouse_code")}
+          OR ${searchableColumn("locations.zone")}
+          OR ${searchableColumn("locations.rayon")}
+          OR ${searchableColumn("locations.etagere")}
+          OR ${searchableColumn("locations.rayon_code")}
+          OR ${searchableColumn("locations.case_code")}
+          OR ${searchableColumn("locations.level_code")}
+          OR ${searchableColumn("locations.bin_code")}
+          OR ${searchableColumn("locations.product_reference")}
+          OR ${searchableColumn("locations.product_name")}
+          OR ${searchableColumn("warehouses.name")}
+       )
+       ${locationCompanyClause}
        ORDER BY locations.id DESC`,
-      [search]
+      companyValues
     );
+
+    const sales = await pool.query(
+      `SELECT s.*
+       FROM sales s
+       LEFT JOIN sale_items si ON si.sale_id=s.id
+       WHERE (
+          ${searchableColumn("s.sale_number")}
+          OR ${searchableColumn("s.customer_name")}
+          OR ${searchableColumn("s.customer_phone")}
+          OR ${searchableColumn("s.payment_method")}
+          OR ${searchableColumn("s.payment_status")}
+          OR ${searchableColumn("s.status")}
+          OR ${searchableColumn("s.created_by_name")}
+          OR ${searchableColumn("si.product_reference")}
+          OR ${searchableColumn("si.product_name")}
+          OR ${searchableColumn("si.barcode")}
+          OR ${searchableColumn("si.lot_number")}
+       )
+       ${salesCompanyClause}
+       GROUP BY s.id
+       ORDER BY s.id DESC`,
+      companyValues
+    );
+
+    const receipts = await pool.query(
+      `SELECT r.*
+       FROM receipts r
+       WHERE (
+          ${searchableColumn("r.receipt_number")}
+          OR ${searchableColumn("r.payment_method")}
+          OR ${searchableColumn("r.payment_status")}
+          OR ${searchableColumn("r.status")}
+          OR ${searchableColumn("r.receipt_data")}
+       )
+       ${receiptsCompanyClause}
+       ORDER BY r.id DESC`,
+      companyValues
+    );
+
+    const users = canAccessAdminSettings(req.user)
+      ? await pool.query(
+          `SELECT id, fullname, email, role, company_id, warehouse_id, is_active, created_at
+           FROM users
+           WHERE (
+              ${searchableColumn("fullname")}
+              OR ${searchableColumn("email")}
+              OR ${searchableColumn("role")}
+              OR ${searchableColumn("badge_code")}
+           )
+           ${isSuperAdmin ? "" : "AND (company_id=$3 OR company_id IS NULL)"}
+           ORDER BY id DESC`,
+          companyValues
+        )
+      : { rows: [] };
 
     res.json({
       products: products.rows,
-      movements: movements.rows,
+      stockMovements: stockMovements.rows,
+      movements: stockMovements.rows,
       inventories: inventories.rows,
       documents: documents.rows,
+      sales: sales.rows,
+      receipts: receipts.rows,
+      users: users.rows,
       locations: locations.rows,
       totals: {
         products: products.rows.length,
-        movements: movements.rows.length,
+        stockMovements: stockMovements.rows.length,
+        movements: stockMovements.rows.length,
         inventories: inventories.rows.length,
         documents: documents.rows.length,
+        sales: sales.rows.length,
+        receipts: receipts.rows.length,
+        users: users.rows.length,
         locations: locations.rows.length
       }
     });
@@ -4996,7 +5310,11 @@ app.get("/search", async (req, res) => {
       error: "Erreur recherche globale"
     });
   }
-});
+}
+
+/* RECHERCHE GLOBALE INTELLIGENTE */
+app.get("/global-search", authenticateToken, handleGlobalSearch);
+app.get("/search", authenticateToken, handleGlobalSearch);
 
 /* CHAT INTERNE & NOTIFICATIONS */
 
@@ -5731,7 +6049,11 @@ app.post("/attendance/check", authenticateToken, async (req, res) => {
 });
 
 /* PARAMÈTRES POINTAGE */
-app.get("/attendance/settings/schedule-groups", async (req, res) => {
+app.get(
+  "/attendance/settings/schedule-groups",
+  authenticateToken,
+  authorizeRoles("admin", "super_admin"),
+  async (req, res) => {
   try {
     const result = await pool.query(
       "SELECT * FROM schedule_groups ORDER BY id ASC"
@@ -5744,7 +6066,11 @@ app.get("/attendance/settings/schedule-groups", async (req, res) => {
   }
 });
 
-app.post("/attendance/settings/schedule-groups", async (req, res) => {
+app.post(
+  "/attendance/settings/schedule-groups",
+  authenticateToken,
+  authorizeRoles("admin", "super_admin"),
+  async (req, res) => {
   try {
     const { name, start_time, end_time, break_start, break_end } = req.body;
 
@@ -5763,7 +6089,11 @@ app.post("/attendance/settings/schedule-groups", async (req, res) => {
   }
 });
 
-app.put("/attendance/settings/schedule-groups/:id", async (req, res) => {
+app.put(
+  "/attendance/settings/schedule-groups/:id",
+  authenticateToken,
+  authorizeRoles("admin", "super_admin"),
+  async (req, res) => {
   try {
     const { id } = req.params;
     const { name, start_time, end_time, break_start, break_end } = req.body;
@@ -5917,7 +6247,7 @@ app.get("/attendance/settings/gps", authenticateToken, async (req, res) => {
 app.put(
   "/attendance/settings/gps",
   authenticateToken,
-  authorizeRoles("admin", "admin_entreprise", "super_admin"),
+  authorizeRoles("admin", "super_admin"),
   async (req, res) => {
     try {
       const {
