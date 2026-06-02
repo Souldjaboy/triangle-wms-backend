@@ -3478,25 +3478,41 @@ async function updateSandboxPayment(req, res, nextStatus) {
 
   try {
     const { transaction_id, provider_reference } = req.body;
+    const safeReference = String(provider_reference || "").trim();
     await client.query("BEGIN");
 
     const transactionResult = await client.query(
       `SELECT *
        FROM payment_transactions
-       WHERE ($1::int IS NOT NULL AND id=$1)
-          OR ($2::text <> '' AND provider_reference=$2)
+       WHERE ($1::int IS NOT NULL AND id=$1::int)
+          OR ($2::text <> '' AND LOWER(TRIM(provider_reference))=LOWER(TRIM($2)))
+          OR ($2::text <> '' AND LOWER(TRIM(external_reference))=LOWER(TRIM($2)))
        ORDER BY id DESC
        LIMIT 1
        FOR UPDATE`,
-      [transaction_id || null, provider_reference || ""]
+      [transaction_id || null, safeReference]
     );
 
     if (transactionResult.rows.length === 0) {
       await client.query("ROLLBACK");
-      return res.status(404).json({ error: "Transaction introuvable" });
+      return res.status(404).json({
+        error: "Transaction sandbox introuvable.",
+        reference: safeReference || transaction_id || ""
+      });
     }
 
     const transaction = transactionResult.rows[0];
+    const currentStatus = String(transaction.status || "").toLowerCase();
+
+    if (!["pending", "en attente"].includes(currentStatus)) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        error: "Ce paiement a déjà été traité",
+        status: transaction.status,
+        transaction_id: transaction.id,
+        provider_reference: transaction.provider_reference
+      });
+    }
 
     await client.query(
       `UPDATE payment_transactions
@@ -3562,6 +3578,7 @@ async function updateSandboxPayment(req, res, nextStatus) {
           `UPDATE sales
            SET payment_status=$1,
                status='en attente',
+               amount_due=total_amount - COALESCE(amount_paid, 0),
                updated_at=CURRENT_TIMESTAMP
            WHERE id=$2
            RETURNING *`,
