@@ -2833,6 +2833,7 @@ async function finalizePaidPosSale(client, saleId, user = {}) {
          status='validée',
          amount_paid=total_amount,
          amount_due=0,
+         remaining_amount=0,
          updated_at=CURRENT_TIMESTAMP
      WHERE id=$1
      RETURNING *`,
@@ -3184,7 +3185,7 @@ app.get("/pos/caisses/report", authenticateToken, async (req, res) => {
               COALESCE(SUM(CASE WHEN lower(COALESCE(s.status,'')) <> 'annulée' AND s.payment_method='Espèces' THEN s.amount_paid ELSE 0 END),0)::numeric AS ventes_especes,
               COALESCE(SUM(CASE WHEN lower(COALESCE(s.status,'')) <> 'annulée' AND s.payment_method IN ('Orange Money','Moov Money','Wave') THEN s.amount_paid ELSE 0 END),0)::numeric AS ventes_mobile_money,
               COALESCE(SUM(CASE WHEN lower(COALESCE(s.status,'')) <> 'annulée' AND s.payment_method='Carte bancaire' THEN s.amount_paid ELSE 0 END),0)::numeric AS ventes_carte,
-              COALESCE(SUM(CASE WHEN lower(COALESCE(s.status,'')) <> 'annulée' THEN s.amount_due ELSE 0 END),0)::numeric AS credits,
+              COALESCE(SUM(CASE WHEN lower(COALESCE(s.status,'')) <> 'annulée' THEN COALESCE(NULLIF(s.remaining_amount,0), s.amount_due, 0) ELSE 0 END),0)::numeric AS credits,
               COALESCE(SUM(CASE WHEN lower(COALESCE(s.status,''))='annulée' THEN s.total_amount ELSE 0 END),0)::numeric AS annulations,
               (c.solde_initial + COALESCE(SUM(CASE WHEN lower(COALESCE(s.status,'')) <> 'annulée' THEN s.amount_paid ELSE 0 END),0))::numeric AS solde_final
        FROM caisses c
@@ -3214,6 +3215,7 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
     const {
       customer_name,
       customer_phone,
+      client_id = null,
       items = [],
       discount_amount = 0,
       tax_enabled = false,
@@ -3245,6 +3247,7 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
     const caisse = await resolveSaleCaisse(client, req.user, caisse_id || cash_register_id);
     let subtotal = 0;
     let taxAmount = 0;
+    let totalProfit = 0;
     const saleYear = new Date().getFullYear();
     const saleCountResult = await client.query(
       `SELECT COUNT(*)::int AS count
@@ -3282,10 +3285,10 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
     const saleResult = await client.query(
       `INSERT INTO sales
        (company_id, warehouse_id, cash_register_id, caisse_id, nom_caisse,
-        sale_number, customer_name, customer_phone,
+        sale_number, customer_name, customer_phone, client_id,
         subtotal, discount_amount, tax_amount, total_amount, payment_method,
         payment_status, status, created_by, created_by_name, created_by_role)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,0,$9,0,0,$10,$11,$12,$13,$14,$15)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,$10,0,0,$11,$12,$13,$14,$15,$16)
        RETURNING *`,
       [
         companyId,
@@ -3296,6 +3299,7 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
         saleNumber,
         customer_name || "",
         customer_phone || "",
+        client_id || null,
         Number(discount_amount || 0),
         payment_method,
         requestedPaymentStatus,
@@ -3384,8 +3388,11 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
       const taxRate = Number(product.tax_rate || posSettings.default_tax_rate || 18);
       const lineTax = tax_enabled ? (unitPrice * quantity * taxRate) / 100 : 0;
       const lineTotal = unitPrice * quantity - itemDiscount + lineTax;
+      const purchasePrice = Number(product.purchase_price || 0);
+      const lineProfit = (unitPrice - purchasePrice) * quantity - itemDiscount;
       subtotal += unitPrice * quantity - itemDiscount;
       taxAmount += lineTax;
+      totalProfit += lineProfit;
 
       if (shouldFinalizeImmediately) {
         await client.query(
@@ -3401,8 +3408,9 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
         `INSERT INTO sale_items
          (sale_id, company_id, product_id, product_reference, product_name,
           barcode, lot_number, batch_id, quantity, unit_price, discount_amount,
-          tax_rate, total_price, warehouse_id, location_id)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+          tax_rate, total_price, warehouse_id, location_id, purchase_price,
+          sale_price, profit)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
          RETURNING *`,
         [
           sale.id,
@@ -3419,7 +3427,10 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
           taxRate,
           lineTotal,
           warehouse_id || product.warehouse_id || null,
-          product.location_id || null
+          product.location_id || null,
+          purchasePrice,
+          unitPrice,
+          lineProfit
         ]
       );
 
@@ -3473,12 +3484,14 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
            total_amount=$3,
            amount_paid=$4,
            amount_due=$5,
+           remaining_amount=$5,
            change_due=$6,
-           provider=$7,
-           payment_status=$8,
-           status=$9,
+           total_profit=$7,
+           provider=$8,
+           payment_status=$9,
+           status=$10,
            updated_at=CURRENT_TIMESTAMP
-       WHERE id=$10
+       WHERE id=$11
        RETURNING *`,
       [
         subtotal,
@@ -3487,6 +3500,7 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
         confirmedPaidAmount,
         dueAmount,
         Number(change_due || 0),
+        totalProfit,
         providerKey,
         requestedPaymentStatus,
         requestedPaymentStatus === "payé" ? "validée" : "en attente",
@@ -3815,8 +3829,9 @@ app.get("/pos/sales-summary", authenticateToken, async (req, res) => {
          COUNT(*) FILTER (WHERE lower(COALESCE(status,'')) <> 'annulée')::int AS nombre_ventes,
          COALESCE(SUM(CASE WHEN lower(COALESCE(status,'')) <> 'annulée' THEN total_amount ELSE 0 END),0)::numeric AS total_vendu,
          COALESCE(SUM(CASE WHEN lower(COALESCE(status,'')) <> 'annulée' THEN amount_paid ELSE 0 END),0)::numeric AS total_encaisse,
-         COALESCE(SUM(CASE WHEN lower(COALESCE(status,'')) <> 'annulée' THEN amount_due ELSE 0 END),0)::numeric AS total_credit,
+         COALESCE(SUM(CASE WHEN lower(COALESCE(status,'')) <> 'annulée' THEN COALESCE(NULLIF(remaining_amount,0), amount_due, 0) ELSE 0 END),0)::numeric AS total_credit,
          COALESCE(SUM(CASE WHEN lower(COALESCE(status,'')) = 'annulée' THEN total_amount ELSE 0 END),0)::numeric AS total_annule,
+         COALESCE(SUM(CASE WHEN lower(COALESCE(status,'')) <> 'annulée' THEN total_profit ELSE 0 END),0)::numeric AS total_profit,
          CASE
            WHEN COUNT(*) FILTER (WHERE lower(COALESCE(status,'')) <> 'annulée') > 0
            THEN COALESCE(SUM(CASE WHEN lower(COALESCE(status,'')) <> 'annulée' THEN total_amount ELSE 0 END),0)
@@ -4273,6 +4288,7 @@ async function updateSandboxPayment(req, res, nextStatus) {
                  status='en attente',
                  amount_paid=$1,
                  amount_due=GREATEST(total_amount - $1, 0),
+                 remaining_amount=GREATEST(total_amount - $1, 0),
                  updated_at=CURRENT_TIMESTAMP
              WHERE id=$2
              RETURNING *`,
@@ -4287,6 +4303,7 @@ async function updateSandboxPayment(req, res, nextStatus) {
            SET payment_status=$1,
                status='annulée',
                amount_due=total_amount - COALESCE(amount_paid, 0),
+               remaining_amount=total_amount - COALESCE(amount_paid, 0),
                updated_at=CURRENT_TIMESTAMP
            WHERE id=$2
            RETURNING *`,
