@@ -2433,6 +2433,217 @@ app.post("/products/:id/batches", authenticateToken, async (req, res) => {
   }
 });
 
+async function finalizePaidPosSale(client, saleId, user = {}) {
+  const saleResult = await client.query("SELECT * FROM sales WHERE id=$1 FOR UPDATE", [saleId]);
+  const sale = saleResult.rows[0];
+
+  if (!sale) {
+    throw new Error("Vente introuvable.");
+  }
+
+  const existingFinalReceipt = await client.query(
+    "SELECT * FROM receipts WHERE sale_id=$1 ORDER BY id DESC LIMIT 1",
+    [sale.id]
+  );
+
+  if (sale.status === "validée" && sale.payment_status === "paid" && existingFinalReceipt.rows[0]) {
+    return { sale, items: [], receipt: existingFinalReceipt.rows[0], already_finalized: true };
+  }
+
+  const itemsResult = await client.query(
+    "SELECT * FROM sale_items WHERE sale_id=$1 ORDER BY id ASC",
+    [sale.id]
+  );
+  const saleItems = [];
+
+  for (const item of itemsResult.rows) {
+    const productResult = await client.query(
+      `SELECT *
+       FROM products
+       WHERE id=$1 AND company_id=$2
+       FOR UPDATE`,
+      [item.product_id, sale.company_id]
+    );
+    const product = productResult.rows[0];
+
+    if (!product) {
+      throw new Error(`Produit introuvable pour la vente ${sale.sale_number}.`);
+    }
+
+    const quantity = Number(item.quantity || 0);
+
+    if (Number(product.stock || 0) < quantity) {
+      throw new Error(`Stock insuffisant pour ${product.reference}.`);
+    }
+
+    let batch = null;
+    if (product.batch_tracking_enabled || product.expiration_tracking_enabled) {
+      const batchResult = await client.query(
+        `SELECT *
+         FROM product_batches
+         WHERE product_id=$1
+           AND company_id=$2
+           AND quantity_remaining >= $3
+           AND status='active'
+           AND (expiration_date IS NULL OR expiration_date >= CURRENT_DATE)
+         ORDER BY expiration_date ASC NULLS LAST, received_at ASC NULLS LAST, id ASC
+         LIMIT 1
+         FOR UPDATE`,
+        [product.id, sale.company_id, quantity]
+      );
+      batch = batchResult.rows[0] || null;
+
+      if (!batch && product.batch_tracking_enabled) {
+        throw new Error(`Aucun lot disponible pour ${product.reference}.`);
+      }
+
+      if (batch) {
+        await client.query(
+          `UPDATE product_batches
+           SET quantity_remaining = quantity_remaining - $1,
+               updated_at=CURRENT_TIMESTAMP
+           WHERE id=$2`,
+          [quantity, batch.id]
+        );
+
+        await client.query(
+          `UPDATE sale_items
+           SET batch_id=$1, lot_number=$2
+           WHERE id=$3`,
+          [batch.id, batch.lot_number || "", item.id]
+        );
+      }
+    }
+
+    await client.query(
+      `UPDATE products
+       SET stock = stock - $1,
+           updated_at=CURRENT_TIMESTAMP
+       WHERE id=$2`,
+      [quantity, product.id]
+    );
+
+    await client.query(
+      `INSERT INTO stock_movements
+       (type, product_reference, product_name, quantity, source_warehouse,
+        destination_warehouse, reason, status, company_id, created_by,
+        created_by_name, created_by_role, location_code, warehouse_id,
+        approval_status, original_quantity, final_quantity, product_id, location_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'Validé',$8,$9,$10,$11,$12,$13,'Validé',$4,$4,$14,$15)`,
+      [
+        "Sortie",
+        product.reference,
+        product.name,
+        quantity,
+        product.warehouse || "",
+        "",
+        `Vente POS ${sale.sale_number}`,
+        sale.company_id,
+        user.id || sale.created_by || null,
+        user.email || sale.created_by_name || "Caissier",
+        user.role || sale.created_by_role || "caissier",
+        product.location_code || "",
+        sale.warehouse_id || product.warehouse_id || null,
+        product.id,
+        product.location_id || null
+      ]
+    );
+
+    saleItems.push({ ...item, batch_id: batch?.id || item.batch_id, lot_number: batch?.lot_number || item.lot_number });
+  }
+
+  const receiptNumber = `REC-${new Date().getFullYear()}-${String(sale.id).padStart(6, "0")}`;
+  const companySettingsResult = await client.query(
+    "SELECT * FROM company_settings ORDER BY id ASC LIMIT 1"
+  );
+
+  const updatedSaleResult = await client.query(
+    `UPDATE sales
+     SET payment_status='paid',
+         status='validée',
+         amount_paid=total_amount,
+         amount_due=0,
+         updated_at=CURRENT_TIMESTAMP
+     WHERE id=$1
+     RETURNING *`,
+    [sale.id]
+  );
+  const updatedSale = updatedSaleResult.rows[0];
+
+  const existingReceipt = await client.query(
+    "SELECT * FROM receipts WHERE sale_id=$1 ORDER BY id DESC LIMIT 1",
+    [sale.id]
+  );
+
+  let receipt = existingReceipt.rows[0] || null;
+  if (!receipt) {
+    const receiptResult = await client.query(
+      `INSERT INTO receipts
+       (company_id, sale_id, receipt_number, receipt_data, total_amount,
+        payment_method, payment_status, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,'paid',$7)
+       RETURNING *`,
+      [
+        sale.company_id,
+        sale.id,
+        receiptNumber,
+        JSON.stringify({
+          sale: updatedSale,
+          items: saleItems,
+          company_settings: companySettingsResult.rows[0] || null
+        }),
+        Number(sale.total_amount || 0),
+        sale.payment_method,
+        user.id || sale.created_by || null
+      ]
+    );
+    receipt = receiptResult.rows[0];
+
+    await client.query(
+      `INSERT INTO documents
+       (document_type, document_number, client_name, total_amount,
+        observation, created_by, company_id, related_entity_type,
+        related_entity_id, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      [
+        "Reçu POS",
+        receiptNumber,
+        sale.customer_name || "",
+        Number(sale.total_amount || 0),
+        `Reçu généré depuis vente POS ${sale.sale_number}`,
+        user.email || sale.created_by_name || "Caissier",
+        sale.company_id,
+        "sale",
+        sale.id,
+        "Validé"
+      ]
+    );
+  }
+
+  await client.query(
+    `INSERT INTO payments
+     (company_id, amount, currency, payment_method, payment_reference,
+      status, notes, paid_at, sale_id, receipt_id, payment_status)
+     VALUES ($1,$2,'FCFA',$3,$4,'paid',$5,CURRENT_TIMESTAMP,$6,$7,'paid')`,
+    [
+      sale.company_id,
+      Number(sale.total_amount || 0),
+      sale.payment_method,
+      sale.payment_reference || sale.sale_number,
+      `Paiement POS ${sale.sale_number}`,
+      sale.id,
+      receipt?.id || null
+    ]
+  );
+
+  return {
+    sale: updatedSale,
+    items: saleItems,
+    receipt,
+    company_settings: companySettingsResult.rows[0] || null
+  };
+}
+
 app.post("/pos/sales", authenticateToken, async (req, res) => {
   const client = await pool.connect();
 
@@ -2453,7 +2664,8 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
       warehouse_id = null,
       amount_received = 0,
       change_due = 0,
-      remaining_amount = 0
+      remaining_amount = 0,
+      mixed_payments = []
     } = req.body;
 
     if (!Array.isArray(items) || items.length === 0) {
@@ -2481,10 +2693,30 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
     );
     const saleNumber = `VENTE-${saleYear}-${String(Number(saleCountResult.rows[0]?.count || 0) + 1).padStart(6, "0")}`;
 
+    const isPendingPosPaymentMethod = (method) =>
+      isExternalPaymentMethod(method) || method === "Virement";
+    const isMixedPayment = payment_method === "Paiement mixte";
+    const mixedPaymentRows = Array.isArray(mixed_payments)
+      ? mixed_payments
+          .map((row) => ({
+            method: row.method || "Espèces",
+            amount: Number(row.amount || 0),
+            reference: row.reference || "",
+          }))
+          .filter((row) => row.amount > 0)
+      : [];
+    const mixedHasPendingPayment = mixedPaymentRows.some((row) =>
+      isPendingPosPaymentMethod(row.method)
+    );
     const providerKey = providerKeyFromMethod(payment_method);
-    const requestedPaymentStatus = isExternalPaymentMethod(payment_method)
+    const requestedPaymentStatus = isMixedPayment
+      ? mixedHasPendingPayment
+        ? "en attente"
+        : payment_status
+      : isExternalPaymentMethod(payment_method)
       ? "en attente"
       : payment_status;
+    const shouldFinalizeImmediately = requestedPaymentStatus === "payé";
 
     const saleResult = await client.query(
       `INSERT INTO sales
@@ -2552,7 +2784,7 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
 
       let batch = null;
 
-      if (product.batch_tracking_enabled || product.expiration_tracking_enabled) {
+      if (shouldFinalizeImmediately && (product.batch_tracking_enabled || product.expiration_tracking_enabled)) {
         const batchResult = await client.query(
           `SELECT *
            FROM product_batches
@@ -2590,13 +2822,15 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
       subtotal += unitPrice * quantity - itemDiscount;
       taxAmount += lineTax;
 
-      await client.query(
-        `UPDATE products
-         SET stock = stock - $1,
-             updated_at=CURRENT_TIMESTAMP
-         WHERE id=$2`,
-        [quantity, product.id]
-      );
+      if (shouldFinalizeImmediately) {
+        await client.query(
+          `UPDATE products
+           SET stock = stock - $1,
+               updated_at=CURRENT_TIMESTAMP
+           WHERE id=$2`,
+          [quantity, product.id]
+        );
+      }
 
       const itemResult = await client.query(
         `INSERT INTO sale_items
@@ -2626,39 +2860,46 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
 
       saleItems.push(itemResult.rows[0]);
 
-      await client.query(
-        `INSERT INTO stock_movements
-         (type, product_reference, product_name, quantity, source_warehouse,
-          destination_warehouse, reason, status, company_id, created_by,
-          created_by_name, created_by_role, location_code, warehouse_id,
-          approval_status, original_quantity, final_quantity, product_id, location_id)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,'Validé',$8,$9,$10,$11,$12,$13,'Validé',$4,$4,$14,$15)`,
-        [
-          "Sortie",
-          product.reference,
-          product.name,
-          quantity,
-          product.warehouse || "",
-          "",
-          `Vente POS ${saleNumber}`,
-          companyId,
-          req.user.id,
-          req.user.email || "Caissier",
-          req.user.role || "caissier",
-          product.location_code || "",
-          warehouse_id || product.warehouse_id || null,
-          product.id,
-          product.location_id || null
-        ]
-      );
+      if (shouldFinalizeImmediately) {
+        await client.query(
+          `INSERT INTO stock_movements
+           (type, product_reference, product_name, quantity, source_warehouse,
+            destination_warehouse, reason, status, company_id, created_by,
+            created_by_name, created_by_role, location_code, warehouse_id,
+            approval_status, original_quantity, final_quantity, product_id, location_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,'Validé',$8,$9,$10,$11,$12,$13,'Validé',$4,$4,$14,$15)`,
+          [
+            "Sortie",
+            product.reference,
+            product.name,
+            quantity,
+            product.warehouse || "",
+            "",
+            `Vente POS ${saleNumber}`,
+            companyId,
+            req.user.id,
+            req.user.email || "Caissier",
+            req.user.role || "caissier",
+            product.location_code || "",
+            warehouse_id || product.warehouse_id || null,
+            product.id,
+            product.location_id || null
+          ]
+        );
+      }
     }
 
     const totalAmount = Math.max(subtotal - Number(discount_amount || 0) + taxAmount, 0);
-    const paidAmount = Number(amount_received || 0);
-    const dueAmount = Math.max(
-      remaining_amount || totalAmount - paidAmount,
-      0
-    );
+    const confirmedPaidAmount = isMixedPayment
+      ? mixedPaymentRows
+          .filter((row) => !isPendingPosPaymentMethod(row.method))
+          .reduce((sum, row) => sum + Number(row.amount || 0), 0)
+      : shouldFinalizeImmediately
+        ? Math.min(Number(amount_received || totalAmount), totalAmount)
+        : 0;
+    const dueAmount = shouldFinalizeImmediately
+      ? 0
+      : Math.max(remaining_amount || totalAmount - confirmedPaidAmount, 0);
 
     const updatedSale = await client.query(
       `UPDATE sales
@@ -2678,7 +2919,7 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
         subtotal,
         taxAmount,
         totalAmount,
-        paidAmount,
+        confirmedPaidAmount,
         dueAmount,
         Number(change_due || 0),
         providerKey,
@@ -2688,129 +2929,157 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
       ]
     );
 
-    const transactionReference = `${providerKey.toUpperCase()}-${saleNumber}`;
-    const transactionResult = await client.query(
-      `INSERT INTO payment_transactions
-       (company_id, sale_id, provider_key, payment_method, amount, currency,
-        status, provider_reference, external_reference, phone_number,
-        request_payload, response_payload, provider_response, created_by)
-       VALUES ($1,$2,$3,$4,$5,'FCFA',$6,$7,$8,$9,$10,$11,$11,$12)
-       RETURNING *`,
-      [
-        companyId,
-        sale.id,
-        providerKey,
-        payment_method,
-        totalAmount,
-        requestedPaymentStatus,
-        transactionReference,
-        saleNumber,
-        customer_phone || "",
-        JSON.stringify({ sale_id: sale.id, payment_method, amount: totalAmount }),
-        JSON.stringify({
-          message: isExternalPaymentMethod(payment_method)
-            ? "Transaction créée. Connecter le fournisseur marchand pour finaliser le paiement réel."
-            : "Paiement manuel enregistré."
-        }),
-        req.user.id
-      ]
-    );
+    let paymentTransaction = null;
+    let paymentReference = "";
+    const rowsToCreate = isMixedPayment && mixedPaymentRows.length > 0
+      ? mixedPaymentRows
+      : [{ method: payment_method, amount: totalAmount, reference: "" }];
+
+    for (let index = 0; index < rowsToCreate.length; index += 1) {
+      const row = rowsToCreate[index];
+      const rowProviderKey = providerKeyFromMethod(row.method);
+      const rowStatus = isPendingPosPaymentMethod(row.method)
+        ? "en attente"
+        : requestedPaymentStatus === "payé"
+          ? "paid"
+          : requestedPaymentStatus;
+      const transactionReference = row.reference || `${rowProviderKey.toUpperCase()}-${saleNumber}-${index + 1}`;
+
+      const transactionResult = await client.query(
+        `INSERT INTO payment_transactions
+         (company_id, sale_id, provider_key, payment_method, amount, currency,
+          status, provider_reference, external_reference, phone_number,
+          request_payload, response_payload, provider_response, created_by)
+         VALUES ($1,$2,$3,$4,$5,'FCFA',$6,$7,$8,$9,$10,$11,$11,$12)
+         RETURNING *`,
+        [
+          companyId,
+          sale.id,
+          rowProviderKey,
+          row.method,
+          Number(row.amount || 0),
+          rowStatus,
+          transactionReference,
+          saleNumber,
+          customer_phone || "",
+          JSON.stringify({ sale_id: sale.id, payment_method: row.method, amount: row.amount }),
+          JSON.stringify({
+            sandbox: isPendingPosPaymentMethod(row.method),
+            message: isPendingPosPaymentMethod(row.method)
+              ? "Transaction sandbox créée. Simulez le résultat dans Paiements POS."
+              : "Paiement manuel enregistré."
+          }),
+          req.user.id
+        ]
+      );
+
+      const createdTransaction = transactionResult.rows[0];
+      if (!paymentTransaction || createdTransaction.status === "en attente") {
+        paymentTransaction = createdTransaction;
+        paymentReference = transactionReference;
+      }
+
+      await client.query(
+        `INSERT INTO sale_payments
+         (company_id, sale_id, transaction_id, payment_method, amount, currency,
+          status, created_by)
+         VALUES ($1,$2,$3,$4,$5,'FCFA',$6,$7)`,
+        [
+          companyId,
+          sale.id,
+          createdTransaction.id,
+          row.method,
+          Number(row.amount || 0),
+          rowStatus,
+          req.user.id
+        ]
+      );
+    }
 
     await client.query(
       `UPDATE sales
        SET transaction_id=$1, payment_reference=$2
        WHERE id=$3`,
-      [transactionResult.rows[0].id, transactionReference, sale.id]
+      [paymentTransaction?.id || null, paymentReference || saleNumber, sale.id]
     );
 
-    await client.query(
-      `INSERT INTO sale_payments
-       (company_id, sale_id, transaction_id, payment_method, amount, currency,
-        status, created_by)
-       VALUES ($1,$2,$3,$4,$5,'FCFA',$6,$7)`,
-      [
-        companyId,
-        sale.id,
-        transactionResult.rows[0].id,
-        payment_method,
-        paidAmount || totalAmount,
-        requestedPaymentStatus,
-        req.user.id
-      ]
-    );
-
-    const receiptNumber = `REC-${saleYear}-${String(sale.id).padStart(6, "0")}`;
     const companySettingsResult = await client.query(
       "SELECT * FROM company_settings ORDER BY id ASC LIMIT 1"
     );
-    const receiptResult = await client.query(
-      `INSERT INTO receipts
-       (company_id, sale_id, receipt_number, receipt_data, total_amount,
-        payment_method, payment_status, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-       RETURNING *`,
-      [
-        companyId,
-        sale.id,
-        receiptNumber,
-        JSON.stringify({
-          sale: updatedSale.rows[0],
-          items: saleItems,
-          company_settings: companySettingsResult.rows[0] || null
-        }),
-        totalAmount,
-        payment_method,
-        payment_status,
-        req.user.id
-      ]
-    );
+    let receipt = null;
 
-    await client.query(
-      `INSERT INTO documents
-       (document_type, document_number, client_name, total_amount,
-        observation, created_by, company_id, related_entity_type,
-        related_entity_id, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-      [
-        "Reçu POS",
-        receiptNumber,
-        customer_name || "",
-        totalAmount,
-        `Reçu généré depuis vente POS ${saleNumber}`,
-        req.user.email || "Caissier",
-        companyId,
-        "sale",
-        sale.id,
-        "Validé"
-      ]
-    );
+    if (shouldFinalizeImmediately) {
+      const receiptNumber = `REC-${saleYear}-${String(sale.id).padStart(6, "0")}`;
+      const receiptResult = await client.query(
+        `INSERT INTO receipts
+         (company_id, sale_id, receipt_number, receipt_data, total_amount,
+          payment_method, payment_status, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+         RETURNING *`,
+        [
+          companyId,
+          sale.id,
+          receiptNumber,
+          JSON.stringify({
+            sale: updatedSale.rows[0],
+            items: saleItems,
+            company_settings: companySettingsResult.rows[0] || null
+          }),
+          totalAmount,
+          payment_method,
+          requestedPaymentStatus,
+          req.user.id
+        ]
+      );
+      receipt = receiptResult.rows[0];
 
-    await client.query(
-      `INSERT INTO payments
-       (company_id, amount, currency, payment_method, payment_reference,
-        status, notes, paid_at, sale_id, receipt_id, payment_status)
-       VALUES ($1,$2,'FCFA',$3,$4,$5,$6,CURRENT_TIMESTAMP,$7,$8,$5)`,
-      [
-        companyId,
-        totalAmount,
-        payment_method,
-        saleNumber,
-        requestedPaymentStatus,
-        `Paiement POS ${saleNumber}`,
-        sale.id,
-        receiptResult.rows[0].id
-      ]
-    );
+      await client.query(
+        `INSERT INTO documents
+         (document_type, document_number, client_name, total_amount,
+          observation, created_by, company_id, related_entity_type,
+          related_entity_id, status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+        [
+          "Reçu POS",
+          receiptNumber,
+          customer_name || "",
+          totalAmount,
+          `Reçu généré depuis vente POS ${saleNumber}`,
+          req.user.email || "Caissier",
+          companyId,
+          "sale",
+          sale.id,
+          "Validé"
+        ]
+      );
+
+      await client.query(
+        `INSERT INTO payments
+         (company_id, amount, currency, payment_method, payment_reference,
+          status, notes, paid_at, sale_id, receipt_id, payment_status)
+         VALUES ($1,$2,'FCFA',$3,$4,$5,$6,CURRENT_TIMESTAMP,$7,$8,$5)`,
+        [
+          companyId,
+          totalAmount,
+          payment_method,
+          saleNumber,
+          requestedPaymentStatus,
+          `Paiement POS ${saleNumber}`,
+          sale.id,
+          receipt.id
+        ]
+      );
+    }
 
     await client.query("COMMIT");
 
     res.status(201).json({
       sale: updatedSale.rows[0],
       items: saleItems,
-      receipt: receiptResult.rows[0],
+      receipt,
       company_settings: companySettingsResult.rows[0] || null,
-      payment_transaction: transactionResult.rows[0],
-      payment_required: isExternalPaymentMethod(payment_method)
+      payment_transaction: paymentTransaction,
+      payment_required: requestedPaymentStatus !== "payé"
     });
   } catch (error) {
     await client.query("ROLLBACK");
@@ -3195,97 +3464,41 @@ app.post("/payments/initiate", authenticateToken, async (req, res) => {
 });
 
 app.post("/payments/confirm", authenticateToken, async (req, res) => {
-  try {
-    const { transaction_id, provider_reference, status = "payé" } = req.body;
-    const transactionResult = await pool.query(
-      `SELECT *
-       FROM payment_transactions
-       WHERE ($1::int IS NOT NULL AND id=$1)
-          OR ($2::text <> '' AND provider_reference=$2)
-       ORDER BY id DESC
-       LIMIT 1`,
-      [transaction_id || null, provider_reference || ""]
-    );
+  const { status = "payé" } = req.body;
+  const nextStatus =
+    status === "échoué" || status === "failed" || status === "fail"
+      ? "failed"
+      : "paid";
 
-    if (transactionResult.rows.length === 0) {
-      return res.status(404).json({ error: "Transaction introuvable" });
-    }
-
-    const transaction = transactionResult.rows[0];
-    const nextStatus =
-      status === "échoué" || status === "failed" || status === "fail"
-        ? "failed"
-        : "paid";
-
-    await pool.query(
-      `UPDATE payment_transactions
-       SET status=$1,
-           paid_at=CASE WHEN $1='paid' THEN CURRENT_TIMESTAMP ELSE paid_at END,
-           response_payload=$2,
-           provider_response=$2,
-           updated_at=CURRENT_TIMESTAMP
-       WHERE id=$3`,
-      [
-        nextStatus,
-        JSON.stringify({ sandbox: true, confirmed_by: req.user.id, status: nextStatus }),
-        transaction.id
-      ]
-    );
-
-    await pool.query(
-      `UPDATE sale_payments SET status=$1 WHERE transaction_id=$2`,
-      [nextStatus, transaction.id]
-    );
-
-    let sale = null;
-    if (transaction.sale_id) {
-      const saleResult = await pool.query(
-        `UPDATE sales
-         SET payment_status=$1,
-             status=CASE WHEN $1='paid' THEN 'validée' ELSE status END,
-             amount_paid=CASE WHEN $1='paid' THEN total_amount ELSE amount_paid END,
-             amount_due=CASE WHEN $1='paid' THEN 0 ELSE amount_due END,
-             updated_at=CURRENT_TIMESTAMP
-         WHERE id=$2
-         RETURNING *`,
-        [nextStatus, transaction.sale_id]
-      );
-      sale = saleResult.rows[0] || null;
-    }
-
-    res.json({
-      ok: true,
-      status: nextStatus,
-      transaction_id: transaction.id,
-      provider_reference: transaction.provider_reference,
-      sale
-    });
-  } catch (error) {
-    console.error("ERREUR CONFIRMATION PAIEMENT :", error);
-    res.status(500).json({ error: "Erreur confirmation paiement" });
-  }
+  return updateSandboxPayment(req, res, nextStatus);
 });
 
 async function updateSandboxPayment(req, res, nextStatus) {
+  const client = await pool.connect();
+
   try {
     const { transaction_id, provider_reference } = req.body;
-    const transactionResult = await pool.query(
+    await client.query("BEGIN");
+
+    const transactionResult = await client.query(
       `SELECT *
        FROM payment_transactions
        WHERE ($1::int IS NOT NULL AND id=$1)
           OR ($2::text <> '' AND provider_reference=$2)
        ORDER BY id DESC
-       LIMIT 1`,
+       LIMIT 1
+       FOR UPDATE`,
       [transaction_id || null, provider_reference || ""]
     );
 
     if (transactionResult.rows.length === 0) {
+      await client.query("ROLLBACK");
       return res.status(404).json({ error: "Transaction introuvable" });
     }
 
     const transaction = transactionResult.rows[0];
 
-    await pool.query(
+    await client.query(
       `UPDATE payment_transactions
        SET status=$1,
            paid_at=CASE WHEN $1='paid' THEN CURRENT_TIMESTAMP ELSE paid_at END,
@@ -3300,37 +3513,82 @@ async function updateSandboxPayment(req, res, nextStatus) {
       ]
     );
 
-    await pool.query(
+    await client.query(
       `UPDATE sale_payments SET status=$1 WHERE transaction_id=$2`,
       [nextStatus, transaction.id]
     );
 
     let sale = null;
+    let receipt = null;
+    let items = [];
+    let companySettings = null;
+
     if (transaction.sale_id) {
-      const saleResult = await pool.query(
-        `UPDATE sales
-         SET payment_status=$1,
-             status=CASE WHEN $1='paid' THEN 'validée' ELSE status END,
-             amount_paid=CASE WHEN $1='paid' THEN total_amount ELSE amount_paid END,
-             amount_due=CASE WHEN $1='paid' THEN 0 ELSE amount_due END,
-             updated_at=CURRENT_TIMESTAMP
-         WHERE id=$2
-         RETURNING *`,
-        [nextStatus, transaction.sale_id]
-      );
-      sale = saleResult.rows[0] || null;
+      if (nextStatus === "paid") {
+        const paymentTotals = await client.query(
+          `SELECT s.total_amount,
+                  COALESCE(SUM(CASE WHEN sp.status IN ('paid','payé') THEN sp.amount ELSE 0 END), 0)::numeric AS paid_amount
+           FROM sales s
+           LEFT JOIN sale_payments sp ON sp.sale_id=s.id
+           WHERE s.id=$1
+           GROUP BY s.id`,
+          [transaction.sale_id]
+        );
+        const totalAmount = Number(paymentTotals.rows[0]?.total_amount || 0);
+        const paidAmount = Number(paymentTotals.rows[0]?.paid_amount || 0);
+
+        if (paidAmount >= totalAmount) {
+          const finalized = await finalizePaidPosSale(client, transaction.sale_id, req.user);
+          sale = finalized.sale || null;
+          receipt = finalized.receipt || null;
+          items = finalized.items || [];
+          companySettings = finalized.company_settings || null;
+        } else {
+          const saleResult = await client.query(
+            `UPDATE sales
+             SET payment_status='en attente',
+                 status='en attente',
+                 amount_paid=$1,
+                 amount_due=GREATEST(total_amount - $1, 0),
+                 updated_at=CURRENT_TIMESTAMP
+             WHERE id=$2
+             RETURNING *`,
+            [paidAmount, transaction.sale_id]
+          );
+          sale = saleResult.rows[0] || null;
+        }
+      } else {
+        const saleResult = await client.query(
+          `UPDATE sales
+           SET payment_status=$1,
+               status='en attente',
+               updated_at=CURRENT_TIMESTAMP
+           WHERE id=$2
+           RETURNING *`,
+          [nextStatus, transaction.sale_id]
+        );
+        sale = saleResult.rows[0] || null;
+      }
     }
+
+    await client.query("COMMIT");
 
     res.json({
       ok: true,
       status: nextStatus,
       transaction_id: transaction.id,
       provider_reference: transaction.provider_reference,
-      sale
+      sale,
+      receipt,
+      items,
+      company_settings: companySettings
     });
   } catch (error) {
+    await client.query("ROLLBACK");
     console.error("ERREUR SANDBOX PAIEMENT :", error);
     res.status(500).json({ error: "Erreur sandbox paiement" });
+  } finally {
+    client.release();
   }
 }
 
