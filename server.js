@@ -171,6 +171,11 @@ function canUsePos(user) {
   );
 }
 
+function canManageCaisses(user) {
+  const role = normalizeRole(user?.role);
+  return user?.is_super_admin === true || role === "super_admin" || role === "admin";
+}
+
 function canAdjustPosPrice(user) {
   const role = normalizeRole(user?.role);
   return user?.is_super_admin === true || role === "super_admin" || role === "admin";
@@ -1168,6 +1173,52 @@ app.put("/users/:id/permissions", authenticateToken, async (req, res) => {
   } catch (error) {
     console.error("ERREUR UPDATE USER PERMISSIONS :", error);
     res.status(500).json({ error: "Erreur sauvegarde permissions utilisateur" });
+  }
+});
+
+app.put("/users/:id/caisse", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageCaisses(req.user)) {
+      return res.status(403).json({ error: "Accès refusé : réservé à l’administrateur" });
+    }
+
+    const { caisse_id } = req.body;
+    const userResult = await pool.query("SELECT id, company_id FROM users WHERE id=$1", [req.params.id]);
+    const targetUser = userResult.rows[0];
+
+    if (!targetUser) {
+      return res.status(404).json({ error: "Utilisateur introuvable" });
+    }
+
+    if (req.user.is_super_admin !== true && Number(targetUser.company_id) !== Number(req.user.company_id)) {
+      return res.status(403).json({ error: "Accès refusé : utilisateur hors entreprise" });
+    }
+
+    if (caisse_id) {
+      const caisseResult = await pool.query(
+        `SELECT id FROM caisses
+         WHERE id=$1 AND actif=true
+         ${req.user.is_super_admin === true ? "" : "AND company_id=$2"}`,
+        req.user.is_super_admin === true ? [caisse_id] : [caisse_id, req.user.company_id]
+      );
+
+      if (!caisseResult.rows[0]) {
+        return res.status(404).json({ error: "Caisse introuvable" });
+      }
+    }
+
+    const result = await pool.query(
+      `UPDATE users
+       SET caisse_id=$1, updated_at=CURRENT_TIMESTAMP
+       WHERE id=$2
+       RETURNING id, fullname, email, role, caisse_id`,
+      [caisse_id || null, req.params.id]
+    );
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("ERREUR USER CAISSE :", error);
+    res.status(500).json({ error: "Erreur affectation caisse utilisateur" });
   }
 });
 
@@ -2842,8 +2893,8 @@ async function finalizePaidPosSale(client, saleId, user = {}) {
   await client.query(
     `INSERT INTO payments
      (company_id, amount, currency, payment_method, payment_reference,
-      status, notes, paid_at, sale_id, receipt_id, payment_status)
-     VALUES ($1,$2,'FCFA',$3,$4,'paid',$5,CURRENT_TIMESTAMP,$6,$7,'paid')`,
+      status, notes, paid_at, sale_id, receipt_id, payment_status, caisse_id)
+     VALUES ($1,$2,'FCFA',$3,$4,'paid',$5,CURRENT_TIMESTAMP,$6,$7,'paid',$8)`,
     [
       sale.company_id,
       Number(sale.total_amount || 0),
@@ -2851,9 +2902,20 @@ async function finalizePaidPosSale(client, saleId, user = {}) {
       sale.payment_reference || sale.sale_number,
       `Paiement POS ${sale.sale_number}`,
       sale.id,
-      receipt?.id || null
+      receipt?.id || null,
+      sale.caisse_id || sale.cash_register_id || null
     ]
   );
+
+  if (sale.caisse_id || sale.cash_register_id) {
+    await client.query(
+      `UPDATE caisses
+       SET solde_actuel = COALESCE(solde_actuel,0) + $1,
+           updated_at=CURRENT_TIMESTAMP
+       WHERE id=$2`,
+      [Number(sale.total_amount || 0), sale.caisse_id || sale.cash_register_id]
+    );
+  }
 
   return {
     sale: updatedSale,
@@ -2862,6 +2924,283 @@ async function finalizePaidPosSale(client, saleId, user = {}) {
     company_settings: companySettingsResult.rows[0] || null
   };
 }
+
+async function getUserCaisse(clientOrPool, userId) {
+  const result = await clientOrPool.query(
+    `SELECT u.caisse_id, c.*
+     FROM users u
+     LEFT JOIN caisses c ON c.id=u.caisse_id
+     WHERE u.id=$1
+     LIMIT 1`,
+    [userId]
+  );
+
+  return result.rows[0] || null;
+}
+
+async function resolveSaleCaisse(clientOrPool, user, requestedCaisseId) {
+  const companyId = user.company_id || null;
+  const assigned = await getUserCaisse(clientOrPool, user.id);
+  const isManager = canManageCaisses(user);
+  const preferredId = requestedCaisseId || assigned?.caisse_id || null;
+
+  if (preferredId) {
+    const values = [preferredId];
+    let query = "SELECT * FROM caisses WHERE id=$1 AND actif=true";
+
+    if (!user.is_super_admin) {
+      values.push(companyId);
+      query += " AND (company_id=$2 OR company_id IS NULL)";
+    }
+
+    const result = await clientOrPool.query(query, values);
+    const caisse = result.rows[0];
+
+    if (!caisse) throw new Error("Caisse introuvable ou inactive.");
+    if (!isManager && Number(assigned?.caisse_id || 0) !== Number(caisse.id)) {
+      throw new Error("Vous n'êtes pas affecté à cette caisse.");
+    }
+
+    return caisse;
+  }
+
+  if (!isManager) {
+    throw new Error("Aucune caisse n'est affectée à cet utilisateur.");
+  }
+
+  const result = await clientOrPool.query(
+    `SELECT * FROM caisses
+     WHERE actif=true AND ($1::int IS NULL OR company_id=$1)
+     ORDER BY id ASC
+     LIMIT 1`,
+    [companyId]
+  );
+
+  return result.rows[0] || null;
+}
+
+app.get("/pos/caisses", authenticateToken, async (req, res) => {
+  try {
+    if (!canUsePos(req.user) && !canAccessDirectionModule(req.user)) {
+      return res.status(403).json({ error: "Accès POS refusé." });
+    }
+
+    const companyId = req.user.company_id || null;
+    const isManager = canManageCaisses(req.user);
+    const values = [];
+    let query = `
+      SELECT c.*, COUNT(u.id)::int AS assigned_users
+      FROM caisses c
+      LEFT JOIN users u ON u.caisse_id=c.id
+      WHERE c.actif=true
+    `;
+
+    if (!req.user.is_super_admin) {
+      values.push(companyId);
+      query += ` AND (c.company_id=$${values.length} OR c.company_id IS NULL)`;
+    }
+
+    if (!isManager && !canAccessDirectionModule(req.user)) {
+      values.push(req.user.id);
+      query += ` AND EXISTS (SELECT 1 FROM users cu WHERE cu.id=$${values.length} AND cu.caisse_id=c.id)`;
+    }
+
+    query += " GROUP BY c.id ORDER BY c.id ASC";
+
+    const result = await pool.query(query, values);
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR POS CAISSES :", error);
+    res.status(500).json({ error: "Erreur lecture caisses" });
+  }
+});
+
+app.post("/pos/caisses", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageCaisses(req.user)) {
+      return res.status(403).json({ error: "Accès refusé : réservé à l’administrateur" });
+    }
+
+    const { nom_caisse, code_caisse, solde_initial = 0 } = req.body;
+    const result = await pool.query(
+      `INSERT INTO caisses
+       (company_id, nom_caisse, code_caisse, statut, solde_initial, solde_actuel)
+       VALUES ($1,$2,$3,'fermée',$4,$4)
+       RETURNING *`,
+      [
+        req.user.company_id || null,
+        nom_caisse || "Caisse principale",
+        code_caisse || `CAISSE-${Date.now()}`,
+        Number(solde_initial || 0)
+      ]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error("ERREUR CREATE CAISSE :", error);
+    res.status(500).json({ error: "Erreur création caisse" });
+  }
+});
+
+app.put("/pos/caisses/:id", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageCaisses(req.user)) {
+      return res.status(403).json({ error: "Accès refusé : réservé à l’administrateur" });
+    }
+
+    const { nom_caisse, code_caisse, solde_initial = 0 } = req.body;
+    const values = [nom_caisse || "Caisse principale", code_caisse || "", Number(solde_initial || 0), req.params.id];
+    let query = `
+      UPDATE caisses
+      SET nom_caisse=$1, code_caisse=$2, solde_initial=$3, updated_at=CURRENT_TIMESTAMP
+      WHERE id=$4
+    `;
+
+    if (!req.user.is_super_admin) {
+      values.push(req.user.company_id || null);
+      query += " AND company_id=$5";
+    }
+
+    query += " RETURNING *";
+
+    const result = await pool.query(query, values);
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("ERREUR UPDATE CAISSE :", error);
+    res.status(500).json({ error: "Erreur modification caisse" });
+  }
+});
+
+app.delete("/pos/caisses/:id", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageCaisses(req.user)) {
+      return res.status(403).json({ error: "Accès refusé : réservé à l’administrateur" });
+    }
+
+    const values = [req.params.id];
+    let query = "UPDATE caisses SET actif=false, updated_at=CURRENT_TIMESTAMP WHERE id=$1";
+
+    if (!req.user.is_super_admin) {
+      values.push(req.user.company_id || null);
+      query += " AND company_id=$2";
+    }
+
+    await pool.query(query, values);
+    res.json({ message: "Caisse désactivée" });
+  } catch (error) {
+    console.error("ERREUR DELETE CAISSE :", error);
+    res.status(500).json({ error: "Erreur suppression caisse" });
+  }
+});
+
+app.post("/pos/caisses/:id/open", authenticateToken, async (req, res) => {
+  try {
+    if (!canUsePos(req.user)) return res.status(403).json({ error: "Accès POS refusé." });
+
+    const caisse = await resolveSaleCaisse(pool, req.user, req.params.id);
+    const soldeInitial = Number(req.body.solde_initial || req.body.montant_depart || 0);
+
+    const result = await pool.query(
+      `UPDATE caisses
+       SET statut='ouverte', solde_initial=$1, solde_actuel=$1,
+           opened_by=$2, opened_at=CURRENT_TIMESTAMP,
+           closed_by=NULL, closed_at=NULL, updated_at=CURRENT_TIMESTAMP
+       WHERE id=$3
+       RETURNING *`,
+      [soldeInitial, req.user.id || null, caisse.id]
+    );
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("ERREUR OPEN CAISSE :", error);
+    res.status(500).json({ error: error.message || "Erreur ouverture caisse" });
+  }
+});
+
+app.post("/pos/caisses/:id/close", authenticateToken, async (req, res) => {
+  try {
+    if (!canUsePos(req.user)) return res.status(403).json({ error: "Accès POS refusé." });
+
+    const caisse = await resolveSaleCaisse(pool, req.user, req.params.id);
+    const totals = await pool.query(
+      `SELECT COALESCE(SUM(CASE WHEN lower(status) <> 'annulée' THEN amount_paid ELSE 0 END),0)::numeric AS total_encaisse
+       FROM sales
+       WHERE caisse_id=$1 AND ($2::timestamp IS NULL OR created_at >= $2)`,
+      [caisse.id, caisse.opened_at || null]
+    );
+    const soldeFinal = Number(caisse.solde_initial || 0) + Number(totals.rows[0]?.total_encaisse || 0);
+
+    const result = await pool.query(
+      `UPDATE caisses
+       SET statut='fermée', solde_actuel=$1, closed_by=$2,
+           closed_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
+       WHERE id=$3
+       RETURNING *`,
+      [soldeFinal, req.user.id || null, caisse.id]
+    );
+
+    res.json({ caisse: result.rows[0], solde_final: soldeFinal });
+  } catch (error) {
+    console.error("ERREUR CLOSE CAISSE :", error);
+    res.status(500).json({ error: error.message || "Erreur fermeture caisse" });
+  }
+});
+
+app.get("/pos/caisses/report", authenticateToken, async (req, res) => {
+  try {
+    if (!canUsePos(req.user) && !canAccessDirectionModule(req.user)) {
+      return res.status(403).json({ error: "Accès POS refusé." });
+    }
+
+    const { date_from, date_to } = req.query;
+    const companyId = req.user.company_id || null;
+    const values = [];
+    let filter = "WHERE c.actif=true";
+
+    if (!req.user.is_super_admin) {
+      values.push(companyId);
+      filter += ` AND (c.company_id=$${values.length} OR c.company_id IS NULL)`;
+    }
+
+    if (!canManageCaisses(req.user) && !canAccessDirectionModule(req.user)) {
+      values.push(req.user.id);
+      filter += ` AND EXISTS (SELECT 1 FROM users cu WHERE cu.id=$${values.length} AND cu.caisse_id=c.id)`;
+    }
+
+    let salesDateFilter = "";
+    if (date_from) {
+      values.push(date_from);
+      salesDateFilter += ` AND DATE(s.created_at) >= $${values.length}`;
+    }
+    if (date_to) {
+      values.push(date_to);
+      salesDateFilter += ` AND DATE(s.created_at) <= $${values.length}`;
+    }
+
+    const result = await pool.query(
+      `SELECT c.id, c.nom_caisse, c.code_caisse, c.statut, c.solde_initial,
+              COALESCE(SUM(CASE WHEN lower(COALESCE(s.status,'')) <> 'annulée' THEN s.total_amount ELSE 0 END),0)::numeric AS total_vendu,
+              COALESCE(SUM(CASE WHEN lower(COALESCE(s.status,'')) <> 'annulée' THEN s.amount_paid ELSE 0 END),0)::numeric AS total_encaisse,
+              COALESCE(SUM(CASE WHEN lower(COALESCE(s.status,'')) <> 'annulée' AND s.payment_method='Espèces' THEN s.amount_paid ELSE 0 END),0)::numeric AS ventes_especes,
+              COALESCE(SUM(CASE WHEN lower(COALESCE(s.status,'')) <> 'annulée' AND s.payment_method IN ('Orange Money','Moov Money','Wave') THEN s.amount_paid ELSE 0 END),0)::numeric AS ventes_mobile_money,
+              COALESCE(SUM(CASE WHEN lower(COALESCE(s.status,'')) <> 'annulée' AND s.payment_method='Carte bancaire' THEN s.amount_paid ELSE 0 END),0)::numeric AS ventes_carte,
+              COALESCE(SUM(CASE WHEN lower(COALESCE(s.status,'')) <> 'annulée' THEN s.amount_due ELSE 0 END),0)::numeric AS credits,
+              COALESCE(SUM(CASE WHEN lower(COALESCE(s.status,''))='annulée' THEN s.total_amount ELSE 0 END),0)::numeric AS annulations,
+              (c.solde_initial + COALESCE(SUM(CASE WHEN lower(COALESCE(s.status,'')) <> 'annulée' THEN s.amount_paid ELSE 0 END),0))::numeric AS solde_final
+       FROM caisses c
+       LEFT JOIN sales s ON s.caisse_id=c.id ${salesDateFilter}
+       ${filter}
+       GROUP BY c.id
+       ORDER BY c.id ASC`,
+      values
+    );
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR RAPPORT CAISSES :", error);
+    res.status(500).json({ error: "Erreur rapport caisses" });
+  }
+});
 
 app.post("/pos/sales", authenticateToken, async (req, res) => {
   const client = await pool.connect();
@@ -2881,6 +3220,8 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
       payment_method = "Espèces",
       payment_status = "payé",
       warehouse_id = null,
+      caisse_id = null,
+      cash_register_id = null,
       amount_received = 0,
       change_due = 0,
       remaining_amount = 0,
@@ -2901,6 +3242,7 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
       [companyId || null]
     );
     const posSettings = settingsResult.rows[0] || {};
+    const caisse = await resolveSaleCaisse(client, req.user, caisse_id || cash_register_id);
     let subtotal = 0;
     let taxAmount = 0;
     const saleYear = new Date().getFullYear();
@@ -2939,14 +3281,18 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
 
     const saleResult = await client.query(
       `INSERT INTO sales
-       (company_id, warehouse_id, sale_number, customer_name, customer_phone,
+       (company_id, warehouse_id, cash_register_id, caisse_id, nom_caisse,
+        sale_number, customer_name, customer_phone,
         subtotal, discount_amount, tax_amount, total_amount, payment_method,
         payment_status, status, created_by, created_by_name, created_by_role)
-       VALUES ($1,$2,$3,$4,$5,0,$6,0,0,$7,$8,$9,$10,$11,$12)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,0,$9,0,0,$10,$11,$12,$13,$14,$15)
        RETURNING *`,
       [
         companyId,
         warehouse_id,
+        caisse?.id || null,
+        caisse?.id || null,
+        caisse?.nom_caisse || "",
         saleNumber,
         customer_name || "",
         customer_phone || "",
@@ -3168,8 +3514,9 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
         `INSERT INTO payment_transactions
          (company_id, sale_id, provider_key, payment_method, amount, currency,
           status, provider_reference, external_reference, phone_number,
-          request_payload, response_payload, provider_response, created_by)
-         VALUES ($1,$2,$3,$4,$5,'FCFA',$6,$7,$8,$9,$10,$11,$11,$12)
+          request_payload, response_payload, provider_response, created_by,
+          caisse_id)
+         VALUES ($1,$2,$3,$4,$5,'FCFA',$6,$7,$8,$9,$10,$11,$11,$12,$13)
          RETURNING *`,
         [
           companyId,
@@ -3188,7 +3535,8 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
               ? "Transaction sandbox créée. Simulez le résultat dans Paiements POS."
               : "Paiement manuel enregistré."
           }),
-          req.user.id
+          req.user.id,
+          caisse?.id || null
         ]
       );
 
@@ -3201,8 +3549,8 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
       await client.query(
         `INSERT INTO sale_payments
          (company_id, sale_id, transaction_id, payment_method, amount, currency,
-          status, created_by)
-         VALUES ($1,$2,$3,$4,$5,'FCFA',$6,$7)`,
+          status, created_by, caisse_id)
+         VALUES ($1,$2,$3,$4,$5,'FCFA',$6,$7,$8)`,
         [
           companyId,
           sale.id,
@@ -3210,7 +3558,8 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
           row.method,
           Number(row.amount || 0),
           rowStatus,
-          req.user.id
+          req.user.id,
+          caisse?.id || null
         ]
       );
     }
@@ -3275,8 +3624,8 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
       await client.query(
         `INSERT INTO payments
          (company_id, amount, currency, payment_method, payment_reference,
-          status, notes, paid_at, sale_id, receipt_id, payment_status)
-         VALUES ($1,$2,'FCFA',$3,$4,$5,$6,CURRENT_TIMESTAMP,$7,$8,$5)`,
+          status, notes, paid_at, sale_id, receipt_id, payment_status, caisse_id)
+         VALUES ($1,$2,'FCFA',$3,$4,$5,$6,CURRENT_TIMESTAMP,$7,$8,$5,$9)`,
         [
           companyId,
           totalAmount,
@@ -3285,9 +3634,20 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
           requestedPaymentStatus,
           `Paiement POS ${saleNumber}`,
           sale.id,
-          receipt.id
+          receipt.id,
+          caisse?.id || null
         ]
       );
+
+      if (caisse?.id) {
+        await client.query(
+          `UPDATE caisses
+           SET solde_actuel = COALESCE(solde_actuel,0) + $1,
+               updated_at=CURRENT_TIMESTAMP
+           WHERE id=$2`,
+          [confirmedPaidAmount || totalAmount, caisse.id]
+        );
+      }
     }
 
     await client.query("COMMIT");
@@ -3325,14 +3685,27 @@ app.get("/pos/sales", authenticateToken, async (req, res) => {
     } = req.query;
     const values = [];
 
-    let query = `SELECT DISTINCT sales.*
+    let query = `SELECT DISTINCT sales.*,
+                        COALESCE(c.nom_caisse, sales.nom_caisse, '') AS nom_caisse
                  FROM sales
                  LEFT JOIN sale_items ON sale_items.sale_id = sales.id
+                 LEFT JOIN caisses c ON c.id = sales.caisse_id
                  WHERE 1=1`;
 
     if (!isSuperAdmin) {
       values.push(companyId);
       query += ` AND sales.company_id=$${values.length}`;
+    }
+
+    if (!canManageCaisses(req.user) && !canAccessDirectionModule(req.user)) {
+      const assigned = await getUserCaisse(pool, req.user.id);
+      if (assigned?.caisse_id) {
+        values.push(assigned.caisse_id);
+        query += ` AND (sales.caisse_id=$${values.length} OR sales.cash_register_id=$${values.length})`;
+      } else {
+        values.push(req.user.id);
+        query += ` AND sales.created_by=$${values.length}`;
+      }
     }
 
     if (q) {
@@ -3358,7 +3731,7 @@ app.get("/pos/sales", authenticateToken, async (req, res) => {
 
     if (cash_register_id) {
       values.push(cash_register_id);
-      query += ` AND sales.cash_register_id=$${values.length}`;
+      query += ` AND (sales.cash_register_id=$${values.length} OR sales.caisse_id=$${values.length})`;
     }
 
     if (date_from) {
@@ -3389,6 +3762,94 @@ app.get("/pos/sales", authenticateToken, async (req, res) => {
   } catch (error) {
     console.error("ERREUR POS SALES :", error);
     res.status(500).json({ error: "Erreur lecture ventes POS" });
+  }
+});
+
+app.get("/pos/sales-summary", authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
+    const { date_from, date_to, payment_method, status, cash_register_id } = req.query;
+    const values = [];
+    let where = "WHERE 1=1";
+
+    if (!isSuperAdmin) {
+      values.push(companyId);
+      where += ` AND sales.company_id=$${values.length}`;
+    }
+
+    if (!canManageCaisses(req.user) && !canAccessDirectionModule(req.user)) {
+      const assigned = await getUserCaisse(pool, req.user.id);
+      if (assigned?.caisse_id) {
+        values.push(assigned.caisse_id);
+        where += ` AND (sales.caisse_id=$${values.length} OR sales.cash_register_id=$${values.length})`;
+      } else {
+        values.push(req.user.id);
+        where += ` AND sales.created_by=$${values.length}`;
+      }
+    }
+
+    if (cash_register_id) {
+      values.push(cash_register_id);
+      where += ` AND (sales.caisse_id=$${values.length} OR sales.cash_register_id=$${values.length})`;
+    }
+    if (date_from) {
+      values.push(date_from);
+      where += ` AND DATE(sales.created_at) >= $${values.length}`;
+    }
+    if (date_to) {
+      values.push(date_to);
+      where += ` AND DATE(sales.created_at) <= $${values.length}`;
+    }
+    if (payment_method) {
+      values.push(payment_method);
+      where += ` AND sales.payment_method=$${values.length}`;
+    }
+    if (status) {
+      values.push(status);
+      where += ` AND LOWER(sales.status)=LOWER($${values.length})`;
+    }
+
+    const summary = await pool.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE lower(COALESCE(status,'')) <> 'annulée')::int AS nombre_ventes,
+         COALESCE(SUM(CASE WHEN lower(COALESCE(status,'')) <> 'annulée' THEN total_amount ELSE 0 END),0)::numeric AS total_vendu,
+         COALESCE(SUM(CASE WHEN lower(COALESCE(status,'')) <> 'annulée' THEN amount_paid ELSE 0 END),0)::numeric AS total_encaisse,
+         COALESCE(SUM(CASE WHEN lower(COALESCE(status,'')) <> 'annulée' THEN amount_due ELSE 0 END),0)::numeric AS total_credit,
+         COALESCE(SUM(CASE WHEN lower(COALESCE(status,'')) = 'annulée' THEN total_amount ELSE 0 END),0)::numeric AS total_annule,
+         CASE
+           WHEN COUNT(*) FILTER (WHERE lower(COALESCE(status,'')) <> 'annulée') > 0
+           THEN COALESCE(SUM(CASE WHEN lower(COALESCE(status,'')) <> 'annulée' THEN total_amount ELSE 0 END),0)
+                / COUNT(*) FILTER (WHERE lower(COALESCE(status,'')) <> 'annulée')
+           ELSE 0
+         END::numeric AS montant_moyen
+       FROM sales
+       ${where}`,
+      values
+    );
+
+    const byCaisse = await pool.query(
+      `SELECT
+         COALESCE(c.id, sales.caisse_id, sales.cash_register_id) AS caisse_id,
+         COALESCE(c.nom_caisse, sales.nom_caisse, 'Sans caisse') AS nom_caisse,
+         COALESCE(SUM(CASE WHEN lower(COALESCE(sales.status,'')) <> 'annulée' THEN sales.total_amount ELSE 0 END),0)::numeric AS total_vendu,
+         COALESCE(SUM(CASE WHEN lower(COALESCE(sales.status,'')) <> 'annulée' THEN sales.amount_paid ELSE 0 END),0)::numeric AS total_encaisse,
+         COUNT(*) FILTER (WHERE lower(COALESCE(sales.status,'')) <> 'annulée')::int AS nombre_ventes
+       FROM sales
+       LEFT JOIN caisses c ON c.id=sales.caisse_id
+       ${where}
+       GROUP BY COALESCE(c.id, sales.caisse_id, sales.cash_register_id), COALESCE(c.nom_caisse, sales.nom_caisse, 'Sans caisse')
+       ORDER BY nom_caisse ASC`,
+      values
+    );
+
+    res.json({
+      totals: summary.rows[0],
+      by_caisse: byCaisse.rows
+    });
+  } catch (error) {
+    console.error("ERREUR POS SALES SUMMARY :", error);
+    res.status(500).json({ error: "Erreur résumé ventes POS" });
   }
 });
 
@@ -3446,8 +3907,10 @@ app.post("/pos/sales/:id/cancel", authenticateToken, async (req, res) => {
     await client.query("BEGIN");
 
     const saleResult = await client.query(
-      "SELECT * FROM sales WHERE id=$1 AND company_id=$2 FOR UPDATE",
-      [req.params.id, companyId]
+      `SELECT * FROM sales
+       WHERE id=$1 ${req.user.is_super_admin === true ? "" : "AND company_id=$2"}
+       FOR UPDATE`,
+      req.user.is_super_admin === true ? [req.params.id] : [req.params.id, companyId]
     );
     const sale = saleResult.rows[0];
 
@@ -3478,6 +3941,16 @@ app.post("/pos/sales/:id/cancel", authenticateToken, async (req, res) => {
        RETURNING *`,
       [req.user.id, reason || "", sale.id]
     );
+
+    if (sale.caisse_id || sale.cash_register_id) {
+      await client.query(
+        `UPDATE caisses
+         SET solde_actuel = GREATEST(COALESCE(solde_actuel,0) - $1, 0),
+             updated_at=CURRENT_TIMESTAMP
+         WHERE id=$2`,
+        [Number(sale.amount_paid || 0), sale.caisse_id || sale.cash_register_id]
+      );
+    }
 
     await client.query("COMMIT");
     res.json(updated.rows[0]);
