@@ -2,6 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
 const jwt = require("jsonwebtoken");
+const bcrypt = require("bcryptjs");
 const QRCode = require("qrcode");
 const multer = require("multer");
 const path = require("path");
@@ -11,8 +12,35 @@ require("dotenv").config();
 
 const app = express();
 
-app.use(cors());
-app.use(express.json());
+const allowedOrigins = [
+  process.env.FRONTEND_URL,
+  process.env.PUBLIC_BASE_URL,
+  "https://trianglewmspro.com",
+  "https://www.trianglewmspro.com",
+  "http://localhost:3000"
+].filter(Boolean);
+
+app.disable("x-powered-by");
+
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader("Permissions-Policy", "camera=(self), microphone=(self), geolocation=(self)");
+  next();
+});
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+      return callback(new Error("Origine CORS non autorisée"));
+    },
+    credentials: true
+  })
+);
+
+app.use(express.json({ limit: "1mb" }));
 
 app.use((req, res, next) => {
   if (req.url.startsWith("/api/")) {
@@ -39,13 +67,64 @@ const storage = multer.diskStorage({
     cb(null, "uploads/");
   },
   filename: function (req, file, cb) {
-    const uniqueName =
-      Date.now() + "-" + file.originalname.replace(/\s+/g, "-");
+    const ext = path.extname(file.originalname || "").toLowerCase();
+    const baseName = path
+      .basename(file.originalname || "upload", ext)
+      .replace(/\s+/g, "-")
+      .replace(/[^a-zA-Z0-9-_]/g, "");
+    const uniqueName = `${Date.now()}-${crypto.randomBytes(6).toString("hex")}-${baseName || "upload"}${ext}`;
     cb(null, uniqueName);
   }
 });
 
-const upload = multer({ storage });
+const allowedUploadMimeTypes = new Set([
+  "image/jpeg",
+  "image/jpg",
+  "image/png",
+  "image/webp",
+  "application/pdf",
+  "audio/mpeg",
+  "audio/mp3",
+  "audio/mp4",
+  "audio/wav",
+  "audio/webm",
+  "audio/ogg"
+]);
+
+const blockedUploadExtensions = new Set([
+  ".php",
+  ".exe",
+  ".js",
+  ".mjs",
+  ".cjs",
+  ".sh",
+  ".bat",
+  ".cmd",
+  ".ps1",
+  ".html",
+  ".htm",
+  ".svg"
+]);
+
+function secureUploadFileFilter(req, file, cb) {
+  const ext = path.extname(file.originalname || "").toLowerCase();
+
+  if (blockedUploadExtensions.has(ext)) {
+    return cb(new Error("Type de fichier interdit pour des raisons de sécurité."));
+  }
+
+  if (!allowedUploadMimeTypes.has(file.mimetype)) {
+    return cb(new Error("Format de fichier non autorisé."));
+  }
+
+  cb(null, true);
+}
+
+const upload = multer({
+  storage,
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: secureUploadFileFilter
+});
 
 const productImageStorage = multer.diskStorage({
   destination: function (req, file, cb) {
@@ -86,7 +165,13 @@ const pool = process.env.DATABASE_URL
       port: 5432
     });
 
-const JWT_SECRET = "triangle_wms_secret_key";
+const JWT_SECRET = process.env.JWT_SECRET || "triangle_wms_secret_key";
+const BCRYPT_ROUNDS = 12;
+
+if (!process.env.JWT_SECRET && process.env.NODE_ENV === "production") {
+  console.warn("AVERTISSEMENT SECURITE: JWT_SECRET absent du fichier .env.");
+}
+
 const SUPER_ADMIN_EMAILS = new Set([
   "diallogcif@gmail.com"
 ]);
@@ -210,6 +295,35 @@ function optionalNumber(value) {
   if (value === "" || value === null || value === undefined) return null;
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
+}
+
+function isBcryptHash(value) {
+  return /^\$2[aby]\$\d{2}\$/.test(String(value || ""));
+}
+
+function validatePasswordStrength(password) {
+  const value = String(password || "");
+  if (value.length < 8) {
+    return "Le mot de passe doit contenir au moins 8 caractères.";
+  }
+
+  if (!/[A-Za-z]/.test(value) || !/[0-9]/.test(value)) {
+    return "Le mot de passe doit contenir au moins une lettre et un chiffre.";
+  }
+
+  return "";
+}
+
+async function hashPassword(password) {
+  return bcrypt.hash(String(password), BCRYPT_ROUNDS);
+}
+
+async function verifyPassword(inputPassword, storedPassword) {
+  if (isBcryptHash(storedPassword)) {
+    return bcrypt.compare(String(inputPassword || ""), storedPassword);
+  }
+
+  return String(inputPassword || "") === String(storedPassword || "");
 }
 
 function paymentCryptoKey() {
@@ -449,6 +563,30 @@ async function logActivity(user_name, user_role, action, module, details) {
   }
 }
 
+async function logAudit(req, action, entityType = "", entityId = null, details = {}) {
+  try {
+    await pool.query(
+      `INSERT INTO audit_logs
+       (user_id, user_email, user_role, company_id, action, entity_type, entity_id, ip_address, user_agent, details)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      [
+        req.user?.id || null,
+        req.user?.email || "",
+        req.user?.role || "",
+        req.user?.company_id || null,
+        action,
+        entityType,
+        entityId,
+        req.ip || req.headers["x-forwarded-for"] || "",
+        typeof req.get === "function" ? req.get("user-agent") || "" : "",
+        JSON.stringify(details || {})
+      ]
+    );
+  } catch (error) {
+    console.error("Erreur audit log :", error.message || error);
+  }
+}
+
 async function createNotification({
   user_id,
   title,
@@ -600,7 +738,7 @@ app.post(
 );
 
 /* UPLOAD PHOTO UTILISATEUR */
-app.post("/upload-user-photo", upload.single("photo"), async (req, res) => {
+app.post("/upload-user-photo", authenticateToken, upload.single("photo"), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: "Aucune photo reçue" });
@@ -744,6 +882,11 @@ app.post("/register-saas", async (req, res) => {
       });
     }
 
+    const passwordError = validatePasswordStrength(password);
+    if (passwordError) {
+      return res.status(400).json({ error: passwordError });
+    }
+
     await ensureDefaultSubscriptionPlans();
 
     let planResult;
@@ -842,6 +985,7 @@ app.post("/register-saas", async (req, res) => {
     );
 
     const company = companyResult.rows[0];
+    const hashedPassword = await hashPassword(password);
 
     const userResult = await pool.query(
       `
@@ -861,7 +1005,7 @@ app.post("/register-saas", async (req, res) => {
       [
         responsible_name,
         email,
-        password,
+        hashedPassword,
         "admin",
         company.id,
         false,
@@ -934,7 +1078,7 @@ app.post("/login", async (req, res) => {
        WHERE u.email = $1
        ORDER BY s.id DESC
        LIMIT 1`,
-      [email]
+      [normalizedEmail]
     );
 
     const user = result.rows[0];
@@ -945,8 +1089,17 @@ app.post("/login", async (req, res) => {
       return res.status(403).json({ error: "Compte désactivé" });
     }
 
-    if (password !== user.password) {
+    const passwordMatches = await verifyPassword(password, user.password);
+
+    if (!passwordMatches) {
       return res.status(401).json({ error: "Mot de passe incorrect" });
+    }
+
+    if (!isBcryptHash(user.password)) {
+      await pool.query("UPDATE users SET password=$1 WHERE id=$2", [
+        await hashPassword(password),
+        user.id
+      ]);
     }
 
     const isSuperAdmin =
@@ -981,7 +1134,8 @@ app.post("/login", async (req, res) => {
         email: user.email,
         role: user.role,
         company_id: user.company_id,
-        is_super_admin: isSuperAdmin
+        is_super_admin: isSuperAdmin,
+        subscription_status: user.subscription_status || ""
       },
       JWT_SECRET,
       { expiresIn: "1d" }
@@ -993,6 +1147,13 @@ app.post("/login", async (req, res) => {
       "Connexion utilisateur",
       "Authentification",
       `${user.fullname} s'est connecté`
+    );
+    await logAudit(
+      { ...req, user: { id: user.id, email: user.email, role: user.role, company_id: user.company_id } },
+      "login",
+      "user",
+      user.id,
+      { email: user.email }
     );
 
     res.json({
@@ -1230,6 +1391,13 @@ app.post(
   async (req, res) => {
     try {
       const { fullname, email, password, role, phone, company_id } = req.body;
+      const rawPassword = password || crypto.randomBytes(8).toString("base64");
+      const passwordError = validatePasswordStrength(rawPassword);
+
+      if (passwordError) {
+        return res.status(400).json({ error: passwordError });
+      }
+
       const assignedCompanyId =
         req.user.is_super_admin === true
           ? company_id || req.user.company_id || null
@@ -1253,7 +1421,7 @@ app.post(
         [
           fullname,
           email,
-          password || "123456",
+          await hashPassword(rawPassword),
           role || "magasinier",
           phone || "",
           assignedCompanyId,
@@ -1333,7 +1501,12 @@ app.put(
       `;
 
       if (password && String(password).trim() !== "") {
-        values.push(password);
+        const passwordError = validatePasswordStrength(password);
+        if (passwordError) {
+          return res.status(400).json({ error: passwordError });
+        }
+
+        values.push(await hashPassword(password));
         query += `, password=$${values.length}`;
       }
 
@@ -7554,7 +7727,7 @@ app.post("/assistant/query", authenticateToken, async (req, res) => {
 });
 
 /* ASSISTANT IA OPENROUTER */
-app.post("/ai/chat", async (req, res) => {
+app.post("/ai/chat", authenticateToken, async (req, res) => {
   try {
     const { message, user } = req.body;
 
@@ -7642,7 +7815,7 @@ app.post("/ai/chat", async (req, res) => {
 });
 
 /* PAIEMENT MANUEL SAAS */
-app.post("/payments/manual", async (req, res) => {
+app.post("/payments/manual", authenticateToken, async (req, res) => {
   try {
     const {
       company_id,
@@ -7688,7 +7861,7 @@ app.post("/payments/manual", async (req, res) => {
 });
 
 /* RENOUVELLEMENT ABONNEMENT */
-app.post("/subscriptions/renew", async (req, res) => {
+app.post("/subscriptions/renew", authenticateToken, async (req, res) => {
   try {
     const { subscription_id, months } = req.body;
 
@@ -7747,6 +7920,8 @@ app.post("/chat/upload-audio", authenticateToken, upload.single("audio"), async 
     });
   }
 });
+
+app.use("/super-admin", authenticateToken, authorizeRoles("super_admin"));
 
 /* SUPER ADMIN SAAS */
 app.get("/super-admin/overview", async (req, res) => {
@@ -8255,13 +8430,18 @@ app.put("/super-admin/users/:id", async (req, res) => {
 app.put("/super-admin/users/:id/password", async (req, res) => {
   try {
     const { password } = req.body;
+    const passwordError = validatePasswordStrength(password);
+
+    if (passwordError) {
+      return res.status(400).json({ error: passwordError });
+    }
 
     const result = await pool.query(
       `UPDATE users
        SET password=$1
        WHERE id=$2
        RETURNING id, fullname, email`,
-      [password, req.params.id]
+      [await hashPassword(password), req.params.id]
     );
 
     res.json({
@@ -8275,31 +8455,42 @@ app.put("/super-admin/users/:id/password", async (req, res) => {
 });
 
 /* DASHBOARD STATS */
-app.get("/dashboard-stats", async (req, res) => {
+app.get("/dashboard-stats", authenticateToken, async (req, res) => {
   try {
-    const totalProduits = await pool.query("SELECT COUNT(*) FROM products");
+    const isSuperAdmin = req.user?.is_super_admin === true;
+    const companyId = req.user?.company_id || null;
+    const companyFilter = isSuperAdmin ? "" : " WHERE company_id=$1";
+    const values = isSuperAdmin ? [] : [companyId];
+
+    const totalProduits = await pool.query(`SELECT COUNT(*) FROM products${companyFilter}`, values);
     const totalStock = await pool.query(
-      "SELECT COALESCE(SUM(stock), 0) AS total FROM products"
+      `SELECT COALESCE(SUM(stock), 0) AS total FROM products${companyFilter}`,
+      values
     );
-    const totalEntrepots = await pool.query("SELECT COUNT(*) FROM warehouses");
+    const totalEntrepots = await pool.query(`SELECT COUNT(*) FROM warehouses${companyFilter}`, values);
     const totalEmplacements = await pool.query(
-      "SELECT COUNT(*) FROM locations"
+      `SELECT COUNT(*) FROM locations${companyFilter}`,
+      values
     );
-    const totalUsers = await pool.query("SELECT COUNT(*) FROM users");
+    const totalUsers = await pool.query(`SELECT COUNT(*) FROM users${companyFilter}`, values);
     const totalInventaires = await pool.query(
-      "SELECT COUNT(*) FROM inventory_history"
+      `SELECT COUNT(*) FROM inventory_history${companyFilter}`,
+      values
     );
 
     const mouvementsAttente = await pool.query(
-      "SELECT COUNT(*) FROM stock_movements WHERE status='En attente'"
+      `SELECT COUNT(*) FROM stock_movements WHERE status='En attente'${isSuperAdmin ? "" : " AND company_id=$1"}`,
+      values
     );
 
     const stockFaible = await pool.query(
-      "SELECT COUNT(*) FROM products WHERE stock > 0 AND stock <= minimum_stock"
+      `SELECT COUNT(*) FROM products WHERE stock > 0 AND stock <= minimum_stock${isSuperAdmin ? "" : " AND company_id=$1"}`,
+      values
     );
 
     const ruptureStock = await pool.query(
-      "SELECT COUNT(*) FROM products WHERE stock <= 0"
+      `SELECT COUNT(*) FROM products WHERE stock <= 0${isSuperAdmin ? "" : " AND company_id=$1"}`,
+      values
     );
 
     const activitesRecentes = await pool.query(
@@ -8307,7 +8498,8 @@ app.get("/dashboard-stats", async (req, res) => {
     );
 
     const derniersMouvements = await pool.query(
-      "SELECT * FROM stock_movements ORDER BY id DESC LIMIT 5"
+      `SELECT * FROM stock_movements${companyFilter} ORDER BY id DESC LIMIT 5`,
+      values
     );
 
     res.json({
@@ -8332,7 +8524,7 @@ app.get("/dashboard-stats", async (req, res) => {
 });
 
 /* ATTENDANCE TODAY - AFFICHAGE CORRIGÉ */
-app.get("/attendance/today", async (req, res) => {
+app.get("/attendance/today", authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT
@@ -8822,7 +9014,7 @@ app.put("/super-admin/subscriptions/:companyId/renew", async (req, res) => {
 
 const axios = require("axios");
 
-app.post("/payments/create", async (req, res) => {
+app.post("/payments/create", authenticateToken, async (req, res) => {
   try {
     const {
       company_id,
