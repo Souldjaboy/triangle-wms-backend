@@ -2472,6 +2472,11 @@ async function finalizePaidPosSale(client, saleId, user = {}) {
     [sale.id]
   );
   const saleItems = [];
+  const existingMovementResult = await client.query(
+    "SELECT COUNT(*)::int AS count FROM stock_movements WHERE reason=$1 AND company_id=$2",
+    [`Vente POS ${sale.sale_number}`, sale.company_id]
+  );
+  const inventoryAlreadyFinalized = Number(existingMovementResult.rows[0]?.count || 0) > 0;
 
   for (const item of itemsResult.rows) {
     const productResult = await client.query(
@@ -2484,17 +2489,31 @@ async function finalizePaidPosSale(client, saleId, user = {}) {
     const product = productResult.rows[0];
 
     if (!product) {
-      throw new Error(`Produit introuvable pour la vente ${sale.sale_number}.`);
+      console.log("Produit introuvable pendant finalisation POS:", {
+        sale_id: sale.id,
+        sale_number: sale.sale_number,
+        product_id: item.product_id
+      });
+      saleItems.push(item);
+      continue;
     }
 
     const quantity = Number(item.quantity || 0);
 
-    if (Number(product.stock || 0) < quantity) {
-      throw new Error(`Stock insuffisant pour ${product.reference}.`);
+    if (!inventoryAlreadyFinalized && Number(product.stock || 0) < quantity) {
+      console.log("Stock insuffisant pendant finalisation POS, reçu conservé:", {
+        sale_id: sale.id,
+        sale_number: sale.sale_number,
+        product_reference: product.reference,
+        stock: product.stock,
+        quantity
+      });
+      saleItems.push(item);
+      continue;
     }
 
     let batch = null;
-    if (product.batch_tracking_enabled || product.expiration_tracking_enabled) {
+    if (!inventoryAlreadyFinalized && (product.batch_tracking_enabled || product.expiration_tracking_enabled)) {
       const batchResult = await client.query(
         `SELECT *
          FROM product_batches
@@ -2511,7 +2530,12 @@ async function finalizePaidPosSale(client, saleId, user = {}) {
       batch = batchResult.rows[0] || null;
 
       if (!batch && product.batch_tracking_enabled) {
-        throw new Error(`Aucun lot disponible pour ${product.reference}.`);
+        console.log("Aucun lot disponible pendant finalisation POS, reçu conservé:", {
+          sale_id: sale.id,
+          product_reference: product.reference
+        });
+        saleItems.push(item);
+        continue;
       }
 
       if (batch) {
@@ -2532,39 +2556,41 @@ async function finalizePaidPosSale(client, saleId, user = {}) {
       }
     }
 
-    await client.query(
-      `UPDATE products
-       SET stock = stock - $1,
-           updated_at=CURRENT_TIMESTAMP
-       WHERE id=$2`,
-      [quantity, product.id]
-    );
+    if (!inventoryAlreadyFinalized) {
+      await client.query(
+        `UPDATE products
+         SET stock = stock - $1,
+             updated_at=CURRENT_TIMESTAMP
+         WHERE id=$2`,
+        [quantity, product.id]
+      );
 
-    await client.query(
-      `INSERT INTO stock_movements
-       (type, product_reference, product_name, quantity, source_warehouse,
-        destination_warehouse, reason, status, company_id, created_by,
-        created_by_name, created_by_role, location_code, warehouse_id,
-        approval_status, original_quantity, final_quantity, product_id, location_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,'Validé',$8,$9,$10,$11,$12,$13,'Validé',$4,$4,$14,$15)`,
-      [
-        "Sortie",
-        product.reference,
-        product.name,
-        quantity,
-        product.warehouse || "",
-        "",
-        `Vente POS ${sale.sale_number}`,
-        sale.company_id,
-        user.id || sale.created_by || null,
-        user.email || sale.created_by_name || "Caissier",
-        user.role || sale.created_by_role || "caissier",
-        product.location_code || "",
-        sale.warehouse_id || product.warehouse_id || null,
-        product.id,
-        product.location_id || null
-      ]
-    );
+      await client.query(
+        `INSERT INTO stock_movements
+         (type, product_reference, product_name, quantity, source_warehouse,
+          destination_warehouse, reason, status, company_id, created_by,
+          created_by_name, created_by_role, location_code, warehouse_id,
+          approval_status, original_quantity, final_quantity, product_id, location_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'Validé',$8,$9,$10,$11,$12,$13,'Validé',$4,$4,$14,$15)`,
+        [
+          "Sortie",
+          product.reference,
+          product.name,
+          quantity,
+          product.warehouse || "",
+          "",
+          `Vente POS ${sale.sale_number}`,
+          sale.company_id,
+          user.id || sale.created_by || null,
+          user.email || sale.created_by_name || "Caissier",
+          user.role || sale.created_by_role || "caissier",
+          product.location_code || "",
+          sale.warehouse_id || product.warehouse_id || null,
+          product.id,
+          product.location_id || null
+        ]
+      );
+    }
 
     saleItems.push({ ...item, batch_id: batch?.id || item.batch_id, lot_number: batch?.lot_number || item.lot_number });
   }
@@ -3130,7 +3156,7 @@ app.get("/pos/sales", authenticateToken, async (req, res) => {
 
     if (!isSuperAdmin) {
       values.push(companyId);
-      query += ` AND company_id=$${values.length}`;
+      query += ` AND sales.company_id=$${values.length}`;
     }
 
     if (q) {
@@ -3585,6 +3611,8 @@ async function updateSandboxPayment(req, res, nextStatus) {
           receipt = finalized.receipt || null;
           items = finalized.items || [];
           companySettings = finalized.company_settings || null;
+          console.log("sale liée", sale);
+          console.log("receipt créé", receipt);
         } else {
           const saleResult = await client.query(
             `UPDATE sales
@@ -3598,12 +3626,13 @@ async function updateSandboxPayment(req, res, nextStatus) {
             [paidAmount, transaction.sale_id]
           );
           sale = saleResult.rows[0] || null;
+          console.log("sale liée", sale);
         }
       } else {
         const saleResult = await client.query(
           `UPDATE sales
            SET payment_status=$1,
-               status='en attente',
+               status='annulée',
                amount_due=total_amount - COALESCE(amount_paid, 0),
                updated_at=CURRENT_TIMESTAMP
            WHERE id=$2
@@ -3611,6 +3640,7 @@ async function updateSandboxPayment(req, res, nextStatus) {
           [nextStatus, transaction.sale_id]
         );
         sale = saleResult.rows[0] || null;
+        console.log("sale liée", sale);
       }
     }
 
