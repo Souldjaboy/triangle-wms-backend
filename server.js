@@ -2446,8 +2446,25 @@ async function finalizePaidPosSale(client, saleId, user = {}) {
     [sale.id]
   );
 
-  if (sale.status === "validée" && sale.payment_status === "paid" && existingFinalReceipt.rows[0]) {
-    return { sale, items: [], receipt: existingFinalReceipt.rows[0], already_finalized: true };
+  if (existingFinalReceipt.rows[0]) {
+    const updatedExistingSale = await client.query(
+      `UPDATE sales
+       SET payment_status='paid',
+           status='validée',
+           amount_paid=total_amount,
+           amount_due=0,
+           updated_at=CURRENT_TIMESTAMP
+       WHERE id=$1
+       RETURNING *`,
+      [sale.id]
+    );
+
+    return {
+      sale: updatedExistingSale.rows[0] || sale,
+      items: [],
+      receipt: existingFinalReceipt.rows[0],
+      already_finalized: true
+    };
   }
 
   const itemsResult = await client.query(
@@ -3479,6 +3496,8 @@ async function updateSandboxPayment(req, res, nextStatus) {
   try {
     const { transaction_id, provider_reference } = req.body;
     const safeReference = String(provider_reference || "").trim();
+    console.log("Sandbox simulation request:", req.body);
+    console.log("Reference received:", safeReference || transaction_id || "");
     await client.query("BEGIN");
 
     const transactionResult = await client.query(
@@ -3502,6 +3521,13 @@ async function updateSandboxPayment(req, res, nextStatus) {
     }
 
     const transaction = transactionResult.rows[0];
+    console.log("Payment found:", {
+      id: transaction.id,
+      sale_id: transaction.sale_id,
+      provider_reference: transaction.provider_reference,
+      external_reference: transaction.external_reference,
+      status: transaction.status
+    });
     const currentStatus = String(transaction.status || "").toLowerCase();
 
     if (!["pending", "en attente"].includes(currentStatus)) {
@@ -3603,7 +3629,10 @@ async function updateSandboxPayment(req, res, nextStatus) {
   } catch (error) {
     await client.query("ROLLBACK");
     console.error("ERREUR SANDBOX PAIEMENT :", error);
-    res.status(500).json({ error: "Erreur sandbox paiement" });
+    res.status(500).json({
+      error: "Erreur sandbox paiement",
+      details: error.message || String(error)
+    });
   } finally {
     client.release();
   }
