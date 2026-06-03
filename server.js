@@ -177,12 +177,18 @@ const SUPER_ADMIN_EMAILS = new Set([
 ]);
 
 function getCompanyFilter(req) {
-  const companyId = req.headers["x-company-id"];
-  const isSuperAdmin = req.headers["x-super-admin"] === "true";
+  const userIsSuperAdmin =
+    req.user?.is_super_admin === true ||
+    normalizeRole(req.user?.role) === "super_admin";
+  const requestedCompanyId = req.headers["x-company-id"];
+  const companyId =
+    userIsSuperAdmin && requestedCompanyId
+      ? requestedCompanyId
+      : req.user?.company_id || null;
 
   return {
     companyId,
-    isSuperAdmin
+    isSuperAdmin: userIsSuperAdmin
   };
 }
 
@@ -1208,6 +1214,9 @@ app.post("/login", async (req, res) => {
     }
 
     const usersHasPhone = await columnExists("users", "phone");
+    const looksLikeEmail = loginIdentifier.includes("@");
+    const normalizedPhone = loginIdentifier.replace(/[^0-9+]/g, "");
+    const canSearchPhone = usersHasPhone && !looksLikeEmail && normalizedPhone.length >= 6;
 
     const result = await pool.query(
       `SELECT 
@@ -1222,10 +1231,10 @@ app.post("/login", async (req, res) => {
        LEFT JOIN subscriptions s ON c.id = s.company_id
        LEFT JOIN subscription_plans sp ON s.plan_id = sp.id
        WHERE LOWER(u.email) = LOWER($1)
-          ${usersHasPhone ? "OR regexp_replace(COALESCE(u.phone,''), '[^0-9+]', '', 'g') = regexp_replace($1, '[^0-9+]', '', 'g')" : ""}
+          ${canSearchPhone ? "OR regexp_replace(COALESCE(u.phone,''), '[^0-9+]', '', 'g') = $2" : ""}
        ORDER BY s.id DESC
        LIMIT 1`,
-      [loginIdentifier]
+      canSearchPhone ? [loginIdentifier, normalizedPhone] : [loginIdentifier]
     );
 
     const user = result.rows[0];
@@ -1321,12 +1330,55 @@ app.post("/login", async (req, res) => {
         subscription_end_date: user.subscription_end_date || "",
         plan_name: user.plan_name || "",
         profile_image_url: user.profile_image_url || "",
+        force_password_change: user.force_password_change === true,
         modules: companyModules
       }
     });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Erreur login SaaS" });
+  }
+});
+
+app.put("/me/password", authenticateToken, async (req, res) => {
+  try {
+    const { current_password, new_password } = req.body;
+
+    const passwordError = validatePasswordStrength(new_password);
+    if (passwordError) {
+      return res.status(400).json({ error: passwordError });
+    }
+
+    const userResult = await pool.query(
+      "SELECT id, password FROM users WHERE id=$1 LIMIT 1",
+      [req.user.id]
+    );
+    const user = userResult.rows[0];
+
+    if (!user) {
+      return res.status(404).json({ error: "Utilisateur introuvable" });
+    }
+
+    const passwordMatches = await verifyPassword(current_password, user.password);
+    if (!passwordMatches) {
+      return res.status(401).json({ error: "Mot de passe actuel incorrect" });
+    }
+
+    await pool.query(
+      `UPDATE users
+       SET password=$1,
+           force_password_change=false,
+           updated_at=CURRENT_TIMESTAMP
+       WHERE id=$2`,
+      [await hashPassword(new_password), req.user.id]
+    );
+
+    await logAudit(req, "change_password", "user", req.user.id, {});
+
+    res.json({ message: "Mot de passe modifié" });
+  } catch (error) {
+    console.error("ERREUR ME PASSWORD :", error);
+    res.status(500).json({ error: "Erreur changement mot de passe" });
   }
 });
 
@@ -1541,6 +1593,14 @@ app.post(
   async (req, res) => {
     try {
       const { fullname, email, password, role, phone, company_id } = req.body;
+      const requestedRole = normalizeRole(role || "magasinier");
+
+      if (requestedRole === "super_admin" && req.user.is_super_admin !== true) {
+        return res.status(403).json({
+          error: "Action interdite : rôle Super Admin réservé"
+        });
+      }
+
       const rawPassword = password || crypto.randomBytes(8).toString("base64");
       const passwordError = validatePasswordStrength(rawPassword);
 
@@ -1572,10 +1632,10 @@ app.post(
           fullname,
           email,
           await hashPassword(rawPassword),
-          role || "magasinier",
+          requestedRole || "magasinier",
           phone || "",
           assignedCompanyId,
-          false
+          req.user.is_super_admin === true && requestedRole === "super_admin"
         ]
       );
 
@@ -1632,11 +1692,18 @@ app.put(
       const isSuperAdmin = req.user.is_super_admin === true;
       const { id } = req.params;
       const { fullname, email, password, role, phone, is_active } = req.body;
+      const requestedRole = normalizeRole(role || "magasinier");
+
+      if (requestedRole === "super_admin" && !isSuperAdmin) {
+        return res.status(403).json({
+          error: "Action interdite : rôle Super Admin réservé"
+        });
+      }
 
       const values = [
         fullname,
         email,
-        role || "magasinier",
+        requestedRole || "magasinier",
         phone || "",
         is_active !== false,
       ];
@@ -1647,8 +1714,13 @@ app.put(
             email=$2,
             role=$3,
             phone=$4,
-            is_active=$5
+            is_active=$5,
+            is_super_admin=${isSuperAdmin ? "$6" : "is_super_admin"}
       `;
+
+      if (isSuperAdmin) {
+        values.push(requestedRole === "super_admin");
+      }
 
       if (password && String(password).trim() !== "") {
         const passwordError = validatePasswordStrength(password);
@@ -1682,6 +1754,53 @@ app.put(
       res.status(500).json({
         error: error.message || "Erreur modification utilisateur"
       });
+    }
+  }
+);
+
+app.post(
+  "/users/:id/reset-password",
+  authenticateToken,
+  authorizeRoles("super_admin"),
+  async (req, res) => {
+    try {
+      if (req.user.is_super_admin !== true && normalizeRole(req.user.role) !== "super_admin") {
+        return res.status(403).json({ error: "Accès Super Admin requis." });
+      }
+
+      const tempPassword = `Triangle-${crypto.randomBytes(4).toString("hex")}-2026`;
+      const hashedPassword = await hashPassword(tempPassword);
+
+      const result = await pool.query(
+        `UPDATE users
+         SET password=$1,
+             force_password_change=true,
+             updated_at=CURRENT_TIMESTAMP
+         WHERE id=$2
+         RETURNING id, fullname, email, role, company_id`,
+        [hashedPassword, req.params.id]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({ error: "Utilisateur introuvable" });
+      }
+
+      await logAudit(
+        req,
+        "reset_password",
+        "user",
+        req.params.id,
+        { target_email: result.rows[0].email }
+      );
+
+      res.json({
+        message: "Mot de passe temporaire généré.",
+        user: result.rows[0],
+        temporary_password: tempPassword
+      });
+    } catch (error) {
+      console.error("ERREUR RESET PASSWORD :", error);
+      res.status(500).json({ error: "Erreur réinitialisation mot de passe" });
     }
   }
 );
@@ -4876,6 +4995,13 @@ app.get("/pos/reports/payments", authenticateToken, async (req, res) => {
   }
 });
 
+app.use("/super-admin", authenticateToken, (req, res, next) => {
+  if (req.user?.is_super_admin !== true && normalizeRole(req.user?.role) !== "super_admin") {
+    return res.status(403).json({ error: "Accès super admin requis." });
+  }
+  next();
+});
+
 app.get("/super-admin/modules", authenticateToken, async (req, res) => {
   try {
     if (req.user.is_super_admin !== true && normalizeRole(req.user.role) !== "super_admin") {
@@ -5988,14 +6114,14 @@ async function handleGlobalSearch(req, res) {
     const isSuperAdmin = req.user?.is_super_admin === true || normalizeRole(req.user?.role) === "super_admin";
     const values = [search, compactSearch];
     const companyValues = isSuperAdmin ? values : [...values, companyId];
-    const productCompanyClause = isSuperAdmin ? "" : "AND (products.company_id=$3 OR products.company_id IS NULL)";
-    const movementCompanyClause = isSuperAdmin ? "" : "AND (company_id=$3 OR company_id IS NULL)";
-    const inventoryCompanyClause = isSuperAdmin ? "" : "AND (company_id=$3 OR company_id IS NULL)";
-    const documentCompanyClause = isSuperAdmin ? "" : "AND (company_id=$3 OR company_id IS NULL)";
-    const locationCompanyClause = isSuperAdmin ? "" : "AND (locations.company_id=$3 OR locations.company_id IS NULL)";
-    const salesCompanyClause = isSuperAdmin ? "" : "AND (s.company_id=$3 OR s.company_id IS NULL)";
-    const receiptsCompanyClause = isSuperAdmin ? "" : "AND (r.company_id=$3 OR r.company_id IS NULL)";
-    const partnersCompanyClause = isSuperAdmin ? "" : "AND (company_id=$3 OR company_id IS NULL)";
+    const productCompanyClause = isSuperAdmin ? "" : "AND products.company_id=$3";
+    const movementCompanyClause = isSuperAdmin ? "" : "AND company_id=$3";
+    const inventoryCompanyClause = isSuperAdmin ? "" : "AND company_id=$3";
+    const documentCompanyClause = isSuperAdmin ? "" : "AND company_id=$3";
+    const locationCompanyClause = isSuperAdmin ? "" : "AND locations.company_id=$3";
+    const salesCompanyClause = isSuperAdmin ? "" : "AND s.company_id=$3";
+    const receiptsCompanyClause = isSuperAdmin ? "" : "AND r.company_id=$3";
+    const partnersCompanyClause = isSuperAdmin ? "" : "AND company_id=$3";
 
     const products = await pool.query(
       `SELECT products.*, locations.emplacement_code
@@ -6162,7 +6288,7 @@ async function handleGlobalSearch(req, res) {
               OR ${searchableColumn("role")}
               OR ${searchableColumn("badge_code")}
            )
-           ${isSuperAdmin ? "" : "AND (company_id=$3 OR company_id IS NULL)"}
+           ${isSuperAdmin ? "" : "AND company_id=$3"}
            ORDER BY id DESC`,
           companyValues
         )
@@ -6602,10 +6728,15 @@ app.get("/meetings", authenticateToken, async (req, res) => {
   }
 });
 /* POINTAGE INTELLIGENT */
-app.get("/attendance/schedule-groups", async (req, res) => {
+app.get("/attendance/schedule-groups", authenticateToken, async (req, res) => {
   try {
+    const isSuperAdmin = req.user.is_super_admin === true;
     const result = await pool.query(
-      "SELECT * FROM schedule_groups ORDER BY id ASC"
+      `SELECT *
+       FROM schedule_groups
+       ${isSuperAdmin ? "" : "WHERE company_id=$1"}
+       ORDER BY id ASC`,
+      isSuperAdmin ? [] : [req.user.company_id]
     );
 
     res.json(result.rows);
@@ -6618,6 +6749,7 @@ app.get("/attendance/schedule-groups", async (req, res) => {
 /* ATTENDANCE TODAY - AFFICHAGE POINTAGE */
 app.get("/attendance/today", authenticateToken, async (req, res) => {
   try {
+    const isSuperAdmin = req.user.is_super_admin === true;
     const result = await pool.query(`
       SELECT
         u.id AS user_id,
@@ -6645,8 +6777,9 @@ app.get("/attendance/today", authenticateToken, async (req, res) => {
       LEFT JOIN attendance_records ar
         ON ar.user_id = u.id
         AND ar.work_date = CURRENT_DATE
+      ${isSuperAdmin ? "" : "WHERE u.company_id=$1"}
       ORDER BY u.fullname ASC
-    `);
+    `, isSuperAdmin ? [] : [req.user.company_id]);
 
     const records = result.rows.map((r) => {
       let status = "Absent";
@@ -6741,10 +6874,23 @@ app.get("/attendance/history/:userId", authenticateToken, async (req, res) => {
   try {
     const requestedUserId = Number(req.params.userId);
     const role = normalizeRole(req.user.role);
+    const isSuperAdmin = req.user.is_super_admin === true;
+
+    const targetUserResult = await pool.query(
+      `SELECT id, company_id
+       FROM users
+       WHERE id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}
+       LIMIT 1`,
+      isSuperAdmin ? [requestedUserId] : [requestedUserId, req.user.company_id]
+    );
+
+    if (!targetUserResult.rows[0]) {
+      return res.status(404).json({ error: "Utilisateur introuvable" });
+    }
 
     if (
       requestedUserId !== Number(req.user.id) &&
-      !canViewAllSalaries(req.user) &&
+      !isSuperAdmin &&
       role !== "admin" &&
       role !== "responsable_entrepot" &&
       role !== "chef_entrepot"
@@ -6780,6 +6926,19 @@ app.post("/attendance/check", authenticateToken, async (req, res) => {
 
     if (Number(user_id) !== Number(req.user.id) && !canViewAllSalaries(req.user)) {
       return res.status(403).json({ error: "Accès refusé." });
+    }
+
+    const isSuperAdmin = req.user.is_super_admin === true;
+    const targetUserResult = await pool.query(
+      `SELECT id, company_id
+       FROM users
+       WHERE id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}
+       LIMIT 1`,
+      isSuperAdmin ? [user_id] : [user_id, req.user.company_id]
+    );
+
+    if (!targetUserResult.rows[0]) {
+      return res.status(404).json({ error: "Utilisateur introuvable" });
     }
 
     const existingResult = await pool.query(
@@ -6943,8 +7102,13 @@ app.get(
   authorizeRoles("admin", "super_admin"),
   async (req, res) => {
   try {
+    const isSuperAdmin = req.user.is_super_admin === true;
     const result = await pool.query(
-      "SELECT * FROM schedule_groups ORDER BY id ASC"
+      `SELECT *
+       FROM schedule_groups
+       ${isSuperAdmin ? "" : "WHERE company_id=$1"}
+       ORDER BY id ASC`,
+      isSuperAdmin ? [] : [req.user.company_id]
     );
 
     res.json(result.rows);
@@ -6961,13 +7125,16 @@ app.post(
   async (req, res) => {
   try {
     const { name, start_time, end_time, break_start, break_end } = req.body;
+    const companyId = req.user.is_super_admin === true
+      ? req.body.company_id || req.user.company_id || null
+      : req.user.company_id;
 
     const result = await pool.query(
       `INSERT INTO schedule_groups
-      (name, start_time, end_time, break_start, break_end)
-      VALUES ($1,$2,$3,$4,$5)
+      (name, start_time, end_time, break_start, break_end, company_id)
+      VALUES ($1,$2,$3,$4,$5,$6)
       RETURNING *`,
-      [name, start_time, end_time, break_start || null, break_end || null]
+      [name, start_time, end_time, break_start || null, break_end || null, companyId]
     );
 
     res.status(201).json(result.rows[0]);
@@ -6985,6 +7152,7 @@ app.put(
   try {
     const { id } = req.params;
     const { name, start_time, end_time, break_start, break_end } = req.body;
+    const isSuperAdmin = req.user.is_super_admin === true;
 
     const result = await pool.query(
       `UPDATE schedule_groups
@@ -6993,9 +7161,11 @@ app.put(
            end_time=$3,
            break_start=$4,
            break_end=$5
-       WHERE id=$6
+       WHERE id=$6 ${isSuperAdmin ? "" : "AND company_id=$7"}
        RETURNING *`,
-      [name, start_time, end_time, break_start || null, break_end || null, id]
+      isSuperAdmin
+        ? [name, start_time, end_time, break_start || null, break_end || null, id]
+        : [name, start_time, end_time, break_start || null, break_end || null, id, req.user.company_id]
     );
 
     res.json(result.rows[0]);
@@ -7021,12 +7191,37 @@ app.put(
       monthly_salary
     } = req.body;
 
+    const isSuperAdmin = req.user.is_super_admin === true;
+
+    const targetUserResult = await pool.query(
+      `SELECT id, company_id
+       FROM users
+       WHERE id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}
+       LIMIT 1`,
+      isSuperAdmin ? [id] : [id, req.user.company_id]
+    );
+
+    if (!targetUserResult.rows[0]) {
+      return res.status(404).json({ error: "Utilisateur introuvable" });
+    }
+
+    const targetCompanyId = targetUserResult.rows[0].company_id;
+
     const groupResult = await pool.query(
-      "SELECT * FROM schedule_groups WHERE id=$1 LIMIT 1",
-      [schedule_group_id || null]
+      `SELECT *
+       FROM schedule_groups
+       WHERE id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}
+       LIMIT 1`,
+      isSuperAdmin
+        ? [schedule_group_id || null]
+        : [schedule_group_id || null, targetCompanyId]
     );
 
     const group = groupResult.rows[0] || null;
+
+    if (schedule_group_id && !group) {
+      return res.status(404).json({ error: "Groupe horaire introuvable pour cette entreprise" });
+    }
 
     const canEditSalary = canViewAllSalaries(req.user);
 
@@ -7115,14 +7310,20 @@ app.put(
 
 app.get("/attendance/settings/gps", authenticateToken, async (req, res) => {
   try {
+    const companyId =
+      req.user.is_super_admin === true && req.headers["x-company-id"]
+        ? Number(req.headers["x-company-id"])
+        : req.user.company_id || null;
     const result = await pool.query(
       `INSERT INTO attendance_gps_settings
-       (id, gps_required, site_name, allowed_radius_meters,
+       (company_id, gps_required, site_name, allowed_radius_meters,
         allow_remote_attendance, kiosk_mode, employee_scanner_access,
         allow_out_of_zone_global)
-       VALUES (1, false, '', 100, false, true, false, false)
-       ON CONFLICT (id) DO UPDATE SET id=EXCLUDED.id
-       RETURNING *`
+       VALUES ($1, false, '', 100, false, true, false, false)
+       ON CONFLICT (company_id)
+       DO UPDATE SET company_id=EXCLUDED.company_id
+       RETURNING *`,
+      [companyId]
     );
 
     res.json(result.rows[0]);
@@ -7138,6 +7339,10 @@ app.put(
   authorizeRoles("admin", "super_admin"),
   async (req, res) => {
     try {
+      const companyId =
+        req.user.is_super_admin === true && req.headers["x-company-id"]
+          ? Number(req.headers["x-company-id"])
+          : req.user.company_id || null;
       const {
         gps_required,
         site_name,
@@ -7152,11 +7357,11 @@ app.put(
 
       const result = await pool.query(
         `INSERT INTO attendance_gps_settings
-         (id, gps_required, site_name, site_latitude, site_longitude,
+         (company_id, gps_required, site_name, site_latitude, site_longitude,
           allowed_radius_meters, allow_remote_attendance, allow_out_of_zone_global,
           kiosk_mode, employee_scanner_access, updated_by)
-         VALUES (1,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-         ON CONFLICT (id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+         ON CONFLICT (company_id)
          DO UPDATE SET
            gps_required=EXCLUDED.gps_required,
            site_name=EXCLUDED.site_name,
@@ -7171,6 +7376,7 @@ app.put(
            updated_at=CURRENT_TIMESTAMP
          RETURNING *`,
         [
+          companyId,
           gps_required === true,
           site_name || "",
           site_latitude === "" || site_latitude === null || site_latitude === undefined
@@ -7473,12 +7679,15 @@ app.put("/employees/:id/attendance-sites", authenticateToken, async (req, res) =
 });
 
 /* LISTE GROUPES HORAIRES */
-app.get("/attendance/groups", async (req, res) => {
+app.get("/attendance/groups", authenticateToken, authorizeRoles("admin", "super_admin"), async (req, res) => {
   try {
+    const isSuperAdmin = req.user.is_super_admin === true;
     const result = await pool.query(
       `SELECT *
        FROM schedule_groups
-       ORDER BY id ASC`
+       ${isSuperAdmin ? "" : "WHERE company_id=$1"}
+       ORDER BY id ASC`,
+      isSuperAdmin ? [] : [req.user.company_id]
     );
 
     res.json(result.rows);
@@ -7491,9 +7700,12 @@ app.get("/attendance/groups", async (req, res) => {
 });
 
 /* AJOUT GROUPE HORAIRE */
-app.post("/attendance/groups", async (req, res) => {
+app.post("/attendance/groups", authenticateToken, authorizeRoles("admin", "super_admin"), async (req, res) => {
   try {
     const { name, start_time, end_time, break_start, break_end } = req.body;
+    const companyId = req.user.is_super_admin === true
+      ? req.body.company_id || req.user.company_id || null
+      : req.user.company_id;
 
     const result = await pool.query(
       `INSERT INTO schedule_groups
@@ -7502,11 +7714,12 @@ app.post("/attendance/groups", async (req, res) => {
         start_time,
         end_time,
         break_start,
-        break_end
+        break_end,
+        company_id
       )
-      VALUES ($1,$2,$3,$4,$5)
+      VALUES ($1,$2,$3,$4,$5,$6)
       RETURNING *`,
-      [name, start_time, end_time, break_start, break_end]
+      [name, start_time, end_time, break_start, break_end, companyId]
     );
 
     await logActivity(
@@ -7528,11 +7741,12 @@ app.post("/attendance/groups", async (req, res) => {
 });
 
 /* MODIFICATION GROUPE */
-app.put("/attendance/groups/:id", async (req, res) => {
+app.put("/attendance/groups/:id", authenticateToken, authorizeRoles("admin", "super_admin"), async (req, res) => {
   try {
     const { id } = req.params;
 
     const { name, start_time, end_time, break_start, break_end } = req.body;
+    const isSuperAdmin = req.user.is_super_admin === true;
 
     const result = await pool.query(
       `UPDATE schedule_groups
@@ -7542,9 +7756,11 @@ app.put("/attendance/groups/:id", async (req, res) => {
          end_time=$3,
          break_start=$4,
          break_end=$5
-       WHERE id=$6
+       WHERE id=$6 ${isSuperAdmin ? "" : "AND company_id=$7"}
        RETURNING *`,
-      [name, start_time, end_time, break_start, break_end, id]
+      isSuperAdmin
+        ? [name, start_time, end_time, break_start, break_end, id]
+        : [name, start_time, end_time, break_start, break_end, id, req.user.company_id]
     );
 
     await logActivity(
@@ -7566,12 +7782,13 @@ app.put("/attendance/groups/:id", async (req, res) => {
 });
 
 /* SUPPRESSION GROUPE */
-app.delete("/attendance/groups/:id", async (req, res) => {
+app.delete("/attendance/groups/:id", authenticateToken, authorizeRoles("admin", "super_admin"), async (req, res) => {
   try {
+    const isSuperAdmin = req.user.is_super_admin === true;
     await pool.query(
       `DELETE FROM schedule_groups
-       WHERE id=$1`,
-      [req.params.id]
+       WHERE id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}`,
+      isSuperAdmin ? [req.params.id] : [req.params.id, req.user.company_id]
     );
 
     await logActivity(
@@ -8778,7 +8995,7 @@ app.put("/super-admin/plans/:id", async (req, res) => {
 });
 
 /* SUPER ADMIN - GESTION UTILISATEURS */
-app.get("/super-admin/users", async (req, res) => {
+app.get("/super-admin/users", authenticateToken, authorizeRoles("super_admin"), async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT 
@@ -8804,7 +9021,7 @@ app.get("/super-admin/users", async (req, res) => {
   }
 });
 
-app.put("/super-admin/users/:id", async (req, res) => {
+app.put("/super-admin/users/:id", authenticateToken, authorizeRoles("super_admin"), async (req, res) => {
   try {
     const { fullname, email, phone, role, is_active, is_super_admin } =
       req.body;
@@ -8837,7 +9054,7 @@ app.put("/super-admin/users/:id", async (req, res) => {
   }
 });
 
-app.put("/super-admin/users/:id/password", async (req, res) => {
+app.put("/super-admin/users/:id/password", authenticateToken, authorizeRoles("super_admin"), async (req, res) => {
   try {
     const { password } = req.body;
     const passwordError = validatePasswordStrength(password);
@@ -9107,7 +9324,7 @@ app.delete("/super-admin/companies/:id", async (req, res) => {
 });
 
 /* DELETE USER */
-app.delete("/super-admin/users/:id", async (req, res) => {
+app.delete("/super-admin/users/:id", authenticateToken, authorizeRoles("super_admin"), async (req, res) => {
   try {
     const userId = req.params.id;
 
@@ -9141,7 +9358,7 @@ app.delete("/super-admin/users/:id", async (req, res) => {
 });
 
 /* DELETE PLAN */
-app.delete("/super-admin/plans/:id", async (req, res) => {
+app.delete("/super-admin/plans/:id", authenticateToken, authorizeRoles("super_admin"), async (req, res) => {
   try {
     await pool.query(
       `
@@ -9165,7 +9382,7 @@ app.delete("/super-admin/plans/:id", async (req, res) => {
 });
 
 /* SUPER ADMIN - GET COMPANIES */
-app.get("/super-admin/companies", async (req, res) => {
+app.get("/super-admin/companies", authenticateToken, authorizeRoles("super_admin"), async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT *
@@ -9184,7 +9401,7 @@ app.get("/super-admin/companies", async (req, res) => {
 });
 
 /* SUPER ADMIN - GET USERS */
-app.get("/super-admin/users", async (req, res) => {
+app.get("/super-admin/users", authenticateToken, authorizeRoles("super_admin"), async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT *
@@ -9203,7 +9420,7 @@ app.get("/super-admin/users", async (req, res) => {
 });
 
 /* SUPER ADMIN - GET PLANS */
-app.get("/super-admin/plans", async (req, res) => {
+app.get("/super-admin/plans", authenticateToken, authorizeRoles("super_admin"), async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT *
