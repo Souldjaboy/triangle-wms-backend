@@ -5089,6 +5089,66 @@ async function createAccountingEntry(client, {
   );
 }
 
+async function createJournalEntry(client, {
+  companyId,
+  label,
+  moduleSource,
+  sourceId,
+  lines,
+  createdBy = null
+}) {
+  const normalizedLines = (lines || []).map((line) => ({
+    ...line,
+    debit: Number(line.debit || 0),
+    credit: Number(line.credit || 0)
+  }));
+  const totalDebit = normalizedLines.reduce((sum, line) => sum + line.debit, 0);
+  const totalCredit = normalizedLines.reduce((sum, line) => sum + line.credit, 0);
+
+  if (Math.round(totalDebit) !== Math.round(totalCredit)) {
+    const error = new Error("Écriture comptable déséquilibrée.");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const entryNumber = await nextAccountingNumber(
+    client,
+    "journal_entries",
+    "entry_number",
+    "JRN",
+    companyId
+  );
+  const entryResult = await client.query(
+    `INSERT INTO journal_entries
+     (company_id, entry_number, label, module_source, source_id, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6)
+     RETURNING *`,
+    [companyId, entryNumber, label, moduleSource, sourceId, createdBy]
+  );
+
+  for (const line of normalizedLines) {
+    await client.query(
+      `INSERT INTO journal_entry_lines
+       (entry_id, company_id, account_code, account_name, debit, credit,
+        partner_id, bank_id, caisse_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [
+        entryResult.rows[0].id,
+        companyId,
+        line.account_code,
+        line.account_name,
+        line.debit,
+        line.credit,
+        line.partner_id || null,
+        line.bank_id || null,
+        line.caisse_id || null
+      ]
+    );
+  }
+
+  return entryResult.rows[0];
+}
+
 app.get("/accounting/dashboard", authenticateToken, async (req, res) => {
   try {
     if (!canViewAccounting(req.user)) {
@@ -5109,6 +5169,11 @@ app.get("/accounting/dashboard", authenticateToken, async (req, res) => {
     const banks = await pool.query(
       `SELECT COALESCE(SUM(current_balance),0)::numeric AS total
        FROM accounting_banks ${filter}`,
+      values
+    );
+    const caisses = await pool.query(
+      `SELECT COALESCE(SUM(solde_actuel),0)::numeric AS total
+       FROM caisses ${filter}`,
       values
     );
     const dailyIn = await pool.query(
@@ -5148,10 +5213,19 @@ app.get("/accounting/dashboard", authenticateToken, async (req, res) => {
     res.json({
       treasury_balance: Number(treasury.rows[0]?.total || 0),
       bank_balance: Number(banks.rows[0]?.total || 0),
+      cash_register_balance: Number(caisses.rows[0]?.total || 0),
+      total_treasury: Number(treasury.rows[0]?.total || 0) + Number(banks.rows[0]?.total || 0) + Number(caisses.rows[0]?.total || 0),
       encaissements_jour: Number(dailyIn.rows[0]?.total || 0),
+      cash_in_today: Number(dailyIn.rows[0]?.total || 0),
       decaissements_jour: Number(dailyOut.rows[0]?.total || 0),
+      cash_out_today: Number(dailyOut.rows[0]?.total || 0),
       depenses_mois: Number(monthExpenses.rows[0]?.total || 0),
+      expenses_month: Number(monthExpenses.rows[0]?.total || 0),
       salaires_a_payer: Number(payroll.rows[0]?.total || 0),
+      payroll_pending: Number(payroll.rows[0]?.total || 0),
+      expense_requests_pending: Number(requests.rows.find((row) => row.status === "soumis")?.count || 0),
+      expense_requests_approved: Number(requests.rows.find((row) => row.status === "validé")?.count || 0),
+      expense_requests_rejected: Number(requests.rows.find((row) => row.status === "refusé")?.count || 0),
       demandes: requests.rows.reduce((acc, row) => {
         acc[row.status] = Number(row.count || 0);
         return acc;
@@ -5160,6 +5234,101 @@ app.get("/accounting/dashboard", authenticateToken, async (req, res) => {
   } catch (error) {
     console.error("ERREUR ACCOUNTING DASHBOARD :", error);
     res.status(500).json({ error: "Erreur dashboard comptable" });
+  }
+});
+
+app.get("/accounting/chart-accounts", authenticateToken, async (req, res) => {
+  try {
+    if (!canViewAccounting(req.user)) {
+      return res.status(403).json({ error: "Accès comptabilité refusé." });
+    }
+    const isSuperAdmin = req.user.is_super_admin === true;
+    const result = await pool.query(
+      `SELECT *
+       FROM accounting_chart_accounts
+       ${isSuperAdmin ? "" : "WHERE company_id=$1"}
+       ORDER BY account_code ASC`,
+      isSuperAdmin ? [] : [req.user.company_id]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR CHART ACCOUNTS :", error);
+    res.status(500).json({ error: "Erreur plan comptable" });
+  }
+});
+
+app.post("/accounting/chart-accounts", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageAccounting(req.user)) {
+      return res.status(403).json({ error: "Accès gestion comptable refusé." });
+    }
+    const { account_code, account_name, account_class = "", account_type = "" } = req.body;
+    if (!account_code || !account_name) {
+      return res.status(400).json({ error: "Code et nom de compte obligatoires." });
+    }
+    const result = await pool.query(
+      `INSERT INTO accounting_chart_accounts
+       (company_id, account_code, account_name, account_class, account_type, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       ON CONFLICT (company_id, account_code)
+       DO UPDATE SET
+         account_name=EXCLUDED.account_name,
+         account_class=EXCLUDED.account_class,
+         account_type=EXCLUDED.account_type,
+         updated_at=CURRENT_TIMESTAMP
+       RETURNING *`,
+      [req.user.company_id, account_code, account_name, account_class, account_type, req.user.id]
+    );
+    await logAudit(req, "upsert_chart_account", "accounting_chart_account", result.rows[0].id, { account_code });
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error("ERREUR UPSERT CHART ACCOUNT :", error);
+    res.status(500).json({ error: "Erreur enregistrement compte" });
+  }
+});
+
+app.get("/accounting/caisses", authenticateToken, async (req, res) => {
+  try {
+    if (!canViewAccounting(req.user)) {
+      return res.status(403).json({ error: "Accès comptabilité refusé." });
+    }
+    const isSuperAdmin = req.user.is_super_admin === true;
+    const result = await pool.query(
+      `SELECT c.*, u.fullname AS responsable_name, u.email AS responsable_email
+       FROM caisses c
+       LEFT JOIN users u ON u.caisse_id=c.id
+       ${isSuperAdmin ? "" : "WHERE c.company_id=$1"}
+       ORDER BY c.id DESC`,
+      isSuperAdmin ? [] : [req.user.company_id]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR ACCOUNTING CAISSES :", error);
+    res.status(500).json({ error: "Erreur lecture caisses comptables" });
+  }
+});
+
+app.get("/accounting/journal-entries", authenticateToken, async (req, res) => {
+  try {
+    if (!canViewAccounting(req.user)) {
+      return res.status(403).json({ error: "Accès comptabilité refusé." });
+    }
+    const isSuperAdmin = req.user.is_super_admin === true;
+    const result = await pool.query(
+      `SELECT e.*,
+        COALESCE(json_agg(l ORDER BY l.id) FILTER (WHERE l.id IS NOT NULL), '[]') AS lines
+       FROM journal_entries e
+       LEFT JOIN journal_entry_lines l ON l.entry_id=e.id
+       ${isSuperAdmin ? "" : "WHERE e.company_id=$1"}
+       GROUP BY e.id
+       ORDER BY e.id DESC
+       LIMIT 300`,
+      isSuperAdmin ? [] : [req.user.company_id]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR JOURNAL ENTRIES :", error);
+    res.status(500).json({ error: "Erreur lecture journal" });
   }
 });
 
@@ -5267,9 +5436,10 @@ app.get("/accounting/transactions", authenticateToken, async (req, res) => {
     }
     const isSuperAdmin = req.user.is_super_admin === true;
     const result = await pool.query(
-      `SELECT t.*, b.bank_name
+      `SELECT t.*, b.bank_name, c.nom_caisse
        FROM accounting_transactions t
        LEFT JOIN accounting_banks b ON b.id=t.bank_id
+       LEFT JOIN caisses c ON c.id=t.caisse_id
        ${isSuperAdmin ? "" : "WHERE t.company_id=$1"}
        ORDER BY t.id DESC
        LIMIT 300`,
@@ -5291,13 +5461,16 @@ app.post("/accounting/transactions", authenticateToken, async (req, res) => {
     const {
       transaction_type,
       bank_id = null,
+      caisse_id = null,
       amount,
       direction,
       category = "",
       partner_id = null,
       partner_name = "",
       description = "",
-      attachment_url = ""
+      attachment_url = "",
+      source_label = "",
+      destination_label = ""
     } = req.body;
 
     const amountValue = Number(amount || 0);
@@ -5336,6 +5509,27 @@ app.post("/accounting/transactions", authenticateToken, async (req, res) => {
       );
     }
 
+    if (caisse_id) {
+      const caisseResult = await client.query(
+        `SELECT * FROM caisses
+         WHERE id=$1 AND company_id=$2
+         FOR UPDATE`,
+        [caisse_id, req.user.company_id]
+      );
+      if (!caisseResult.rows[0]) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "Caisse introuvable." });
+      }
+      const caisseDelta = direction === "entrée" ? amountValue : -amountValue;
+      await client.query(
+        `UPDATE caisses
+         SET solde_actuel=COALESCE(solde_actuel,0)+$1,
+             updated_at=CURRENT_TIMESTAMP
+         WHERE id=$2`,
+        [caisseDelta, caisse_id]
+      );
+    }
+
     const treasuryDelta =
       transaction_type === "retrait_banque" || transaction_type === "encaissement_especes"
         ? amountValue
@@ -5356,16 +5550,17 @@ app.post("/accounting/transactions", authenticateToken, async (req, res) => {
 
     const result = await client.query(
       `INSERT INTO accounting_transactions
-       (company_id, transaction_number, transaction_type, bank_id, amount,
+       (company_id, transaction_number, transaction_type, bank_id, caisse_id, amount,
         direction, category, partner_id, partner_name, description,
-        attachment_url, created_by, validated_by, validated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12,CURRENT_TIMESTAMP)
+        attachment_url, source_label, destination_label, created_by, validated_by, validated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$15,CURRENT_TIMESTAMP)
        RETURNING *`,
       [
         req.user.company_id,
         transactionNumber,
         transaction_type,
         bank_id || null,
+        caisse_id || null,
         amountValue,
         direction,
         category,
@@ -5373,6 +5568,8 @@ app.post("/accounting/transactions", authenticateToken, async (req, res) => {
         partner_name || "",
         description,
         attachment_url,
+        source_label,
+        destination_label,
         req.user.id
       ]
     );
@@ -5385,6 +5582,60 @@ app.post("/accounting/transactions", authenticateToken, async (req, res) => {
       debit: direction === "entrée" ? amountValue : 0,
       credit: direction === "sortie" ? amountValue : 0,
       description,
+      createdBy: req.user.id
+    });
+
+    const debitLine =
+      direction === "entrée"
+        ? {
+            account_code: bank_id ? "52" : caisse_id ? "57" : "57",
+            account_name: bank_id ? "Banque" : "Caisse",
+            debit: amountValue,
+            credit: 0,
+            bank_id: bank_id || null,
+            caisse_id: caisse_id || null
+          }
+        : {
+            account_code:
+              transaction_type === "salaire"
+                ? "64"
+                : transaction_type === "paiement_fournisseur"
+                  ? "40"
+                  : "65",
+            account_name:
+              transaction_type === "salaire"
+                ? "Charges de personnel"
+                : transaction_type === "paiement_fournisseur"
+                  ? "Fournisseurs"
+                  : "Autres charges",
+            debit: amountValue,
+            credit: 0,
+            partner_id: partner_id || null
+          };
+    const creditLine =
+      direction === "entrée"
+        ? {
+            account_code: transaction_type === "encaissement_bancaire" ? "70" : "75",
+            account_name: transaction_type === "encaissement_bancaire" ? "Ventes" : "Autres produits",
+            debit: 0,
+            credit: amountValue,
+            partner_id: partner_id || null
+          }
+        : {
+            account_code: bank_id ? "52" : "57",
+            account_name: bank_id ? "Banque" : "Caisse",
+            debit: 0,
+            credit: amountValue,
+            bank_id: bank_id || null,
+            caisse_id: caisse_id || null
+          };
+
+    await createJournalEntry(client, {
+      companyId: req.user.company_id,
+      label: description || transaction_type,
+      moduleSource: "accounting_transaction",
+      sourceId: result.rows[0].id,
+      lines: [debitLine, creditLine],
       createdBy: req.user.id
     });
 
@@ -5721,10 +5972,12 @@ app.get("/accounting/statements", authenticateToken, async (req, res) => {
     const andFilter = isSuperAdmin ? "" : "AND company_id=$1";
 
     const entries = await pool.query(
-      `SELECT *
-       FROM accounting_entries
-       ${filter}
-       ORDER BY id DESC
+      `SELECT e.*, COALESCE(json_agg(l ORDER BY l.id) FILTER (WHERE l.id IS NOT NULL), '[]') AS lines
+       FROM journal_entries e
+       LEFT JOIN journal_entry_lines l ON l.entry_id=e.id
+       ${filter ? "WHERE e.company_id=$1" : ""}
+       GROUP BY e.id
+       ORDER BY e.id DESC
        LIMIT 500`,
       values
     );
@@ -5732,7 +5985,7 @@ app.get("/accounting/statements", authenticateToken, async (req, res) => {
       `SELECT
          COALESCE(SUM(debit),0)::numeric AS debit,
          COALESCE(SUM(credit),0)::numeric AS credit
-       FROM accounting_entries
+       FROM journal_entry_lines
        ${filter}`,
       values
     );
@@ -5746,15 +5999,20 @@ app.get("/accounting/statements", authenticateToken, async (req, res) => {
     const assets = await pool.query(
       `SELECT
          (SELECT COALESCE(SUM(current_balance),0) FROM accounting_banks ${filter}) AS banks,
-         (SELECT COALESCE(SUM(current_balance),0) FROM treasury_accounts ${filter}) AS treasury`,
+         (SELECT COALESCE(SUM(current_balance),0) FROM treasury_accounts ${filter}) AS treasury,
+         (SELECT COALESCE(SUM(solde_actuel),0) FROM caisses ${filter}) AS caisses`,
       values
     );
 
     res.json({
       bilan: {
-        actif: Number(assets.rows[0]?.banks || 0) + Number(assets.rows[0]?.treasury || 0),
+        actif:
+          Number(assets.rows[0]?.banks || 0) +
+          Number(assets.rows[0]?.treasury || 0) +
+          Number(assets.rows[0]?.caisses || 0),
         passif: 0,
         banques: Number(assets.rows[0]?.banks || 0),
+        caisses: Number(assets.rows[0]?.caisses || 0),
         tresorerie: Number(assets.rows[0]?.treasury || 0)
       },
       compte_resultat: {
