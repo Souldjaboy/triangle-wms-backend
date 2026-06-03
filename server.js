@@ -626,6 +626,48 @@ async function createNotification({
   );
 }
 
+async function getCompanyModules(companyId) {
+  const moduleKeys = [
+    "pos",
+    "ventes",
+    "achats",
+    "pointage",
+    "inventaire",
+    "ia",
+    "reunions",
+    "documents",
+    "rapports",
+    "transport",
+    "crm"
+  ];
+
+  if (!companyId) {
+    return moduleKeys.reduce((acc, key) => {
+      acc[key] = true;
+      return acc;
+    }, {});
+  }
+
+  let result = { rows: [] };
+
+  try {
+    result = await pool.query(
+      `SELECT module_key, is_enabled
+       FROM company_modules
+       WHERE company_id=$1`,
+      [companyId]
+    );
+  } catch (error) {
+    console.error("Erreur lecture modules entreprise :", error.message || error);
+  }
+
+  return moduleKeys.reduce((acc, key) => {
+    const configured = result.rows.find((item) => item.module_key === key);
+    acc[key] = configured ? configured.is_enabled === true : true;
+    return acc;
+  }, {});
+}
+
 async function ensureDefaultSubscriptionPlans() {
   const defaultPlans = [
     {
@@ -1156,6 +1198,8 @@ app.post("/login", async (req, res) => {
       { email: user.email }
     );
 
+    const companyModules = isSuperAdmin ? await getCompanyModules(null) : await getCompanyModules(user.company_id);
+
     res.json({
       message: "Connexion réussie",
       token,
@@ -1171,7 +1215,8 @@ app.post("/login", async (req, res) => {
         subscription_status: user.subscription_status || "",
         subscription_end_date: user.subscription_end_date || "",
         plan_name: user.plan_name || "",
-        profile_image_url: user.profile_image_url || ""
+        profile_image_url: user.profile_image_url || "",
+        modules: companyModules
       }
     });
   } catch (error) {
@@ -5769,6 +5814,7 @@ async function handleGlobalSearch(req, res) {
         documents: [],
         sales: [],
         receipts: [],
+        partners: [],
         users: [],
         locations: [],
         totals: {
@@ -5779,6 +5825,7 @@ async function handleGlobalSearch(req, res) {
           documents: 0,
           sales: 0,
           receipts: 0,
+          partners: 0,
           users: 0,
           locations: 0
         }
@@ -5798,6 +5845,7 @@ async function handleGlobalSearch(req, res) {
     const locationCompanyClause = isSuperAdmin ? "" : "AND (locations.company_id=$3 OR locations.company_id IS NULL)";
     const salesCompanyClause = isSuperAdmin ? "" : "AND (s.company_id=$3 OR s.company_id IS NULL)";
     const receiptsCompanyClause = isSuperAdmin ? "" : "AND (r.company_id=$3 OR r.company_id IS NULL)";
+    const partnersCompanyClause = isSuperAdmin ? "" : "AND (company_id=$3 OR company_id IS NULL)";
 
     const products = await pool.query(
       `SELECT products.*, locations.emplacement_code
@@ -5935,6 +5983,25 @@ async function handleGlobalSearch(req, res) {
       companyValues
     );
 
+    const partners = await pool.query(
+      `SELECT *
+       FROM partners
+       WHERE (
+          ${searchableColumn("type")}
+          OR ${searchableColumn("name")}
+          OR ${searchableColumn("phone")}
+          OR ${searchableColumn("email")}
+          OR ${searchableColumn("address")}
+          OR ${searchableColumn("city")}
+          OR ${searchableColumn("contact_person")}
+          OR ${searchableColumn("nif")}
+          OR ${searchableColumn("rccm")}
+       )
+       ${partnersCompanyClause}
+       ORDER BY id DESC`,
+      companyValues
+    );
+
     const users = canAccessAdminSettings(req.user)
       ? await pool.query(
           `SELECT id, fullname, email, role, company_id, warehouse_id, is_active, created_at
@@ -5959,6 +6026,7 @@ async function handleGlobalSearch(req, res) {
       documents: documents.rows,
       sales: sales.rows,
       receipts: receipts.rows,
+      partners: partners.rows,
       users: users.rows,
       locations: locations.rows,
       totals: {
@@ -5969,6 +6037,7 @@ async function handleGlobalSearch(req, res) {
         documents: documents.rows.length,
         sales: sales.rows.length,
         receipts: receipts.rows.length,
+        partners: partners.rows.length,
         users: users.rows.length,
         locations: locations.rows.length
       }
@@ -8134,6 +8203,110 @@ app.post("/partners", authenticateToken, async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Erreur ajout partenaire" });
+  }
+});
+
+app.get("/partners/:id/details", authenticateToken, async (req, res) => {
+  try {
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
+    const partnerId = req.params.id;
+
+    const partnerResult = await pool.query(
+      `SELECT *
+       FROM partners
+       WHERE id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}
+       LIMIT 1`,
+      isSuperAdmin ? [partnerId] : [partnerId, companyId]
+    );
+
+    const partner = partnerResult.rows[0];
+
+    if (!partner) {
+      return res.status(404).json({ error: "Partenaire introuvable" });
+    }
+
+    const salesResult = await pool.query(
+      `SELECT id, sale_number, customer_name, customer_phone, total_amount,
+              amount_paid, amount_due, remaining_amount, payment_method,
+              payment_status, status, created_at
+       FROM sales
+       WHERE client_id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}
+       ORDER BY id DESC
+       LIMIT 100`,
+      isSuperAdmin ? [partnerId] : [partnerId, companyId]
+    );
+
+    const paymentsResult = await pool.query(
+      `SELECT id, amount, currency, payment_method, status, notes,
+              paid_at, created_at, sale_id
+       FROM payments
+       WHERE partner_id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}
+       ORDER BY id DESC
+       LIMIT 100`,
+      isSuperAdmin ? [partnerId] : [partnerId, companyId]
+    );
+
+    const receiptsResult = await pool.query(
+      `SELECT r.id, r.receipt_number, r.total_amount, r.payment_method,
+              r.payment_status, r.status, r.created_at, r.sale_id
+       FROM receipts r
+       LEFT JOIN sales s ON s.id=r.sale_id
+       WHERE (r.partner_id=$1 OR s.client_id=$1)
+       ${isSuperAdmin ? "" : "AND (r.company_id=$2 OR s.company_id=$2)"}
+       ORDER BY r.id DESC
+       LIMIT 100`,
+      isSuperAdmin ? [partnerId] : [partnerId, companyId]
+    );
+
+    const documentsResult = await pool.query(
+      `SELECT id, document_type, document_number, client_name, total_amount,
+              status, created_by, created_at
+       FROM documents
+       WHERE partner_id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}
+       ORDER BY id DESC
+       LIMIT 100`,
+      isSuperAdmin ? [partnerId] : [partnerId, companyId]
+    );
+
+    const purchasesTable = await pool.query("SELECT to_regclass('public.purchases') AS table_name");
+    let purchases = [];
+
+    if (purchasesTable.rows[0]?.table_name) {
+      const purchasesResult = await pool.query(
+        `SELECT *
+         FROM purchases
+         WHERE supplier_id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}
+         ORDER BY id DESC
+         LIMIT 100`,
+        isSuperAdmin ? [partnerId] : [partnerId, companyId]
+      );
+      purchases = purchasesResult.rows;
+    }
+
+    const salesTotal = salesResult.rows.reduce((sum, sale) => sum + Number(sale.total_amount || 0), 0);
+    const salesPaid = salesResult.rows.reduce((sum, sale) => sum + Number(sale.amount_paid || 0), 0);
+    const supplierDebt = purchases.reduce((sum, purchase) => {
+      const total = Number(purchase.total_amount || purchase.amount || 0);
+      const paid = Number(purchase.amount_paid || 0);
+      return sum + Math.max(total - paid, 0);
+    }, 0);
+
+    res.json({
+      partner,
+      sales: salesResult.rows,
+      purchases,
+      payments: paymentsResult.rows,
+      receipts: receiptsResult.rows,
+      documents: documentsResult.rows,
+      balance: {
+        client_credit: Math.max(salesTotal - salesPaid, 0),
+        supplier_debt: supplierDebt
+      }
+    });
+  } catch (error) {
+    console.error("ERREUR PARTNER DETAILS :", error);
+    res.status(500).json({ error: "Erreur fiche partenaire" });
   }
 });
 
