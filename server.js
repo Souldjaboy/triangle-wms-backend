@@ -5149,6 +5149,44 @@ async function createJournalEntry(client, {
   return entryResult.rows[0];
 }
 
+function normalizeOptionalId(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : null;
+}
+
+async function loadAccountingBankForUpdate(client, user, bankId) {
+  if (!bankId) return null;
+  const isSuperAdmin = user?.is_super_admin === true || normalizeRole(user?.role) === "super_admin";
+  const result = await client.query(
+    `SELECT * FROM accounting_banks
+     WHERE id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}
+     FOR UPDATE`,
+    isSuperAdmin ? [bankId] : [bankId, user.company_id]
+  );
+  return result.rows[0] || null;
+}
+
+async function loadAccountingCaisseForUpdate(client, user, caisseId) {
+  if (!caisseId) return null;
+  const isSuperAdmin = user?.is_super_admin === true || normalizeRole(user?.role) === "super_admin";
+  const result = await client.query(
+    `SELECT * FROM caisses
+     WHERE id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}
+     FOR UPDATE`,
+    isSuperAdmin ? [caisseId] : [caisseId, user.company_id]
+  );
+  return result.rows[0] || null;
+}
+
+function ensureSufficientBalance(balance, amount, message) {
+  if (Number(balance || 0) < Number(amount || 0)) {
+    const error = new Error(message);
+    error.statusCode = 400;
+    throw error;
+  }
+}
+
 app.get("/accounting/dashboard", authenticateToken, async (req, res) => {
   try {
     if (!canViewAccounting(req.user)) {
@@ -5477,74 +5515,87 @@ app.post("/accounting/transactions", authenticateToken, async (req, res) => {
     if (!transaction_type || amountValue <= 0 || !["entrée", "sortie"].includes(direction)) {
       return res.status(400).json({ error: "Type, sens et montant valides obligatoires." });
     }
+    const bankId = normalizeOptionalId(bank_id);
+    const caisseId = normalizeOptionalId(caisse_id);
 
     await client.query("BEGIN");
-    await ensureTreasuryAccount(client, req.user.company_id);
+    const bank = await loadAccountingBankForUpdate(client, req.user, bankId);
+    if (bankId && !bank) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Banque introuvable ou non autorisée pour cette entreprise." });
+    }
+    const caisse = await loadAccountingCaisseForUpdate(client, req.user, caisseId);
+    if (caisseId && !caisse) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Caisse introuvable ou non autorisée pour cette entreprise." });
+    }
+
+    const companyId = bank?.company_id || caisse?.company_id || req.user.company_id;
+    await ensureTreasuryAccount(client, companyId);
     const transactionNumber = await nextAccountingNumber(
       client,
       "accounting_transactions",
       "transaction_number",
       direction === "entrée" ? "ENC" : "DEC",
-      req.user.company_id
+      companyId
     );
 
-    if (bank_id) {
-      const bankResult = await client.query(
-        `SELECT * FROM accounting_banks
-         WHERE id=$1 AND company_id=$2
-         FOR UPDATE`,
-        [bank_id, req.user.company_id]
-      );
-      if (!bankResult.rows[0]) {
-        await client.query("ROLLBACK");
-        return res.status(404).json({ error: "Banque introuvable." });
+    if (bank) {
+      const bankDelta =
+        transaction_type === "depot_caisse_banque" || direction === "entrée"
+          ? amountValue
+          : -amountValue;
+      if (bankDelta < 0) {
+        ensureSufficientBalance(bank.current_balance, amountValue, "Solde insuffisant dans cette banque.");
       }
-      const bankDelta = direction === "entrée" ? amountValue : -amountValue;
       await client.query(
         `UPDATE accounting_banks
          SET current_balance=COALESCE(current_balance,0)+$1,
              updated_at=CURRENT_TIMESTAMP
          WHERE id=$2`,
-        [bankDelta, bank_id]
+        [bankDelta, bankId]
       );
     }
 
-    if (caisse_id) {
-      const caisseResult = await client.query(
-        `SELECT * FROM caisses
-         WHERE id=$1 AND company_id=$2
-         FOR UPDATE`,
-        [caisse_id, req.user.company_id]
-      );
-      if (!caisseResult.rows[0]) {
-        await client.query("ROLLBACK");
-        return res.status(404).json({ error: "Caisse introuvable." });
+    if (caisse) {
+      const caisseDelta =
+        transaction_type === "retrait_banque" || direction === "entrée"
+          ? amountValue
+          : -amountValue;
+      if (caisseDelta < 0) {
+        ensureSufficientBalance(caisse.solde_actuel, amountValue, "Solde insuffisant dans cette caisse.");
       }
-      const caisseDelta = direction === "entrée" ? amountValue : -amountValue;
       await client.query(
         `UPDATE caisses
          SET solde_actuel=COALESCE(solde_actuel,0)+$1,
              updated_at=CURRENT_TIMESTAMP
          WHERE id=$2`,
-        [caisseDelta, caisse_id]
+        [caisseDelta, caisseId]
       );
     }
 
     const treasuryDelta =
-      transaction_type === "retrait_banque" || transaction_type === "encaissement_especes"
+      !bank && !caisse && (transaction_type === "encaissement_especes" || direction === "entrée")
         ? amountValue
-        : direction === "sortie"
+        : !bank && !caisse && direction === "sortie"
           ? -amountValue
           : 0;
 
     if (treasuryDelta !== 0) {
+      if (treasuryDelta < 0) {
+        const treasuryResult = await client.query(
+          `SELECT * FROM treasury_accounts WHERE company_id=$1 FOR UPDATE`,
+          [companyId]
+        );
+        ensureSufficientBalance(treasuryResult.rows[0]?.current_balance, amountValue, "Solde insuffisant dans la trésorerie.");
+      }
       await client.query(
         `UPDATE treasury_accounts
          SET current_balance=COALESCE(current_balance,0)+$1,
              updated_by=$2,
              updated_at=CURRENT_TIMESTAMP
          WHERE company_id=$3`,
-        [treasuryDelta, req.user.id, req.user.company_id]
+        [treasuryDelta, req.user.id, companyId]
       );
     }
 
@@ -5556,11 +5607,11 @@ app.post("/accounting/transactions", authenticateToken, async (req, res) => {
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$15,CURRENT_TIMESTAMP)
        RETURNING *`,
       [
-        req.user.company_id,
+        companyId,
         transactionNumber,
         transaction_type,
-        bank_id || null,
-        caisse_id || null,
+        bankId,
+        caisseId,
         amountValue,
         direction,
         category,
@@ -5575,7 +5626,7 @@ app.post("/accounting/transactions", authenticateToken, async (req, res) => {
     );
 
     await createAccountingEntry(client, {
-      companyId: req.user.company_id,
+      companyId,
       sourceType: "accounting_transaction",
       sourceId: result.rows[0].id,
       accountLabel: direction === "entrée" ? "Banque / Trésorerie" : "Charge / Décaissement",
@@ -5585,15 +5636,33 @@ app.post("/accounting/transactions", authenticateToken, async (req, res) => {
       createdBy: req.user.id
     });
 
+    const isBankCashTransfer = transaction_type === "retrait_banque" && bankId && caisseId;
+    const isCashBankDeposit = transaction_type === "depot_caisse_banque" && bankId && caisseId;
     const debitLine =
-      direction === "entrée"
+      isBankCashTransfer
         ? {
-            account_code: bank_id ? "52" : caisse_id ? "57" : "57",
-            account_name: bank_id ? "Banque" : "Caisse",
+            account_code: "57",
+            account_name: "Caisse",
             debit: amountValue,
             credit: 0,
-            bank_id: bank_id || null,
-            caisse_id: caisse_id || null
+            caisse_id: caisseId
+          }
+        : isCashBankDeposit
+          ? {
+              account_code: "52",
+              account_name: "Banque",
+              debit: amountValue,
+              credit: 0,
+              bank_id: bankId
+            }
+          : direction === "entrée"
+        ? {
+            account_code: bankId ? "52" : caisseId ? "57" : "57",
+            account_name: bankId ? "Banque" : "Caisse",
+            debit: amountValue,
+            credit: 0,
+            bank_id: bankId,
+            caisse_id: caisseId
           }
         : {
             account_code:
@@ -5613,7 +5682,23 @@ app.post("/accounting/transactions", authenticateToken, async (req, res) => {
             partner_id: partner_id || null
           };
     const creditLine =
-      direction === "entrée"
+      isBankCashTransfer
+        ? {
+            account_code: "52",
+            account_name: "Banque",
+            debit: 0,
+            credit: amountValue,
+            bank_id: bankId
+          }
+        : isCashBankDeposit
+          ? {
+              account_code: "57",
+              account_name: "Caisse",
+              debit: 0,
+              credit: amountValue,
+              caisse_id: caisseId
+            }
+          : direction === "entrée"
         ? {
             account_code: transaction_type === "encaissement_bancaire" ? "70" : "75",
             account_name: transaction_type === "encaissement_bancaire" ? "Ventes" : "Autres produits",
@@ -5622,16 +5707,16 @@ app.post("/accounting/transactions", authenticateToken, async (req, res) => {
             partner_id: partner_id || null
           }
         : {
-            account_code: bank_id ? "52" : "57",
-            account_name: bank_id ? "Banque" : "Caisse",
+            account_code: bankId ? "52" : "57",
+            account_name: bankId ? "Banque" : "Caisse",
             debit: 0,
             credit: amountValue,
-            bank_id: bank_id || null,
-            caisse_id: caisse_id || null
+            bank_id: bankId,
+            caisse_id: caisseId
           };
 
     await createJournalEntry(client, {
-      companyId: req.user.company_id,
+      companyId,
       label: description || transaction_type,
       moduleSource: "accounting_transaction",
       sourceId: result.rows[0].id,
@@ -5645,7 +5730,7 @@ app.post("/accounting/transactions", authenticateToken, async (req, res) => {
   } catch (error) {
     await client.query("ROLLBACK");
     console.error("ERREUR CREATE ACCOUNTING TRANSACTION :", error);
-    res.status(500).json({ error: "Erreur mouvement comptable" });
+    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Erreur mouvement comptable" });
   } finally {
     client.release();
   }
@@ -5658,9 +5743,10 @@ app.get("/accounting/vouchers", authenticateToken, async (req, res) => {
     }
     const isSuperAdmin = req.user.is_super_admin === true;
     const result = await pool.query(
-      `SELECT v.*, b.bank_name
+      `SELECT v.*, b.bank_name, c.nom_caisse
        FROM cash_vouchers v
        LEFT JOIN accounting_banks b ON b.id=v.bank_id
+       LEFT JOIN caisses c ON c.id=v.caisse_id
        ${isSuperAdmin ? "" : "WHERE v.company_id=$1"}
        ORDER BY v.id DESC
        LIMIT 300`,
@@ -5684,6 +5770,7 @@ app.post("/accounting/vouchers", authenticateToken, async (req, res) => {
       origin = "",
       beneficiary = "",
       bank_id = null,
+      caisse_id = null,
       partner_id = null,
       partner_name = "",
       reason = "",
@@ -5691,6 +5778,8 @@ app.post("/accounting/vouchers", authenticateToken, async (req, res) => {
       attachment_url = ""
     } = req.body;
     const amountValue = Number(amount || 0);
+    const bankId = normalizeOptionalId(bank_id);
+    const caisseId = normalizeOptionalId(caisse_id);
     if (!["encaissement", "decaissement"].includes(voucher_type) || amountValue <= 0) {
       return res.status(400).json({ error: "Type de bon et montant valides obligatoires." });
     }
@@ -5704,9 +5793,9 @@ app.post("/accounting/vouchers", authenticateToken, async (req, res) => {
     const result = await pool.query(
       `INSERT INTO cash_vouchers
        (company_id, voucher_number, voucher_type, amount, origin, beneficiary,
-        bank_id, partner_id, partner_name, reason, expense_category,
+        bank_id, caisse_id, partner_id, partner_name, reason, expense_category,
         attachment_url, status, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'soumis',$13)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'soumis',$14)
        RETURNING *`,
       [
         req.user.company_id,
@@ -5715,7 +5804,8 @@ app.post("/accounting/vouchers", authenticateToken, async (req, res) => {
         amountValue,
         origin,
         beneficiary,
-        bank_id || null,
+        bankId,
+        caisseId,
         partner_id || null,
         partner_name || "",
         reason,
@@ -5757,17 +5847,58 @@ app.put("/accounting/vouchers/:id/validate", authenticateToken, async (req, res)
     }
 
     await ensureTreasuryAccount(client, voucher.company_id);
-    const treasuryDelta = voucher.voucher_type === "encaissement"
-      ? Number(voucher.amount || 0)
-      : -Number(voucher.amount || 0);
-    await client.query(
-      `UPDATE treasury_accounts
-       SET current_balance=COALESCE(current_balance,0)+$1,
-           updated_by=$2,
-           updated_at=CURRENT_TIMESTAMP
-       WHERE company_id=$3`,
-      [treasuryDelta, req.user.id, voucher.company_id]
-    );
+    const amountValue = Number(voucher.amount || 0);
+    const direction = voucher.voucher_type === "encaissement" ? "entrée" : "sortie";
+    const bank = await loadAccountingBankForUpdate(client, req.user, normalizeOptionalId(voucher.bank_id));
+    const caisse = await loadAccountingCaisseForUpdate(client, req.user, normalizeOptionalId(voucher.caisse_id));
+
+    if (voucher.bank_id && !bank) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Banque introuvable ou non autorisée pour ce bon." });
+    }
+    if (voucher.caisse_id && !caisse) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Caisse introuvable ou non autorisée pour ce bon." });
+    }
+
+    if (bank) {
+      const delta = direction === "entrée" ? amountValue : -amountValue;
+      if (delta < 0) ensureSufficientBalance(bank.current_balance, amountValue, "Solde insuffisant dans cette banque.");
+      await client.query(
+        `UPDATE accounting_banks
+         SET current_balance=COALESCE(current_balance,0)+$1,
+             updated_at=CURRENT_TIMESTAMP
+         WHERE id=$2`,
+        [delta, bank.id]
+      );
+    } else if (caisse) {
+      const delta = direction === "entrée" ? amountValue : -amountValue;
+      if (delta < 0) ensureSufficientBalance(caisse.solde_actuel, amountValue, "Solde insuffisant dans cette caisse.");
+      await client.query(
+        `UPDATE caisses
+         SET solde_actuel=COALESCE(solde_actuel,0)+$1,
+             updated_at=CURRENT_TIMESTAMP
+         WHERE id=$2`,
+        [delta, caisse.id]
+      );
+    } else {
+      const treasuryDelta = direction === "entrée" ? amountValue : -amountValue;
+      if (treasuryDelta < 0) {
+        const treasuryResult = await client.query(
+          `SELECT * FROM treasury_accounts WHERE company_id=$1 FOR UPDATE`,
+          [voucher.company_id]
+        );
+        ensureSufficientBalance(treasuryResult.rows[0]?.current_balance, amountValue, "Solde insuffisant dans la trésorerie.");
+      }
+      await client.query(
+        `UPDATE treasury_accounts
+         SET current_balance=COALESCE(current_balance,0)+$1,
+             updated_by=$2,
+             updated_at=CURRENT_TIMESTAMP
+         WHERE company_id=$3`,
+        [treasuryDelta, req.user.id, voucher.company_id]
+      );
+    }
 
     const transactionNumber = await nextAccountingNumber(
       client,
@@ -5779,17 +5910,18 @@ app.put("/accounting/vouchers/:id/validate", authenticateToken, async (req, res)
     await client.query(
       `INSERT INTO accounting_transactions
        (company_id, transaction_number, transaction_type, source_type, source_id,
-        bank_id, amount, direction, category, partner_id, partner_name,
+        bank_id, caisse_id, amount, direction, category, partner_id, partner_name,
         description, attachment_url, created_by, validated_by, validated_at)
-       VALUES ($1,$2,$3,'cash_voucher',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13,CURRENT_TIMESTAMP)`,
+       VALUES ($1,$2,$3,'cash_voucher',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$14,CURRENT_TIMESTAMP)`,
       [
         voucher.company_id,
         transactionNumber,
         voucher.voucher_type,
         voucher.id,
         voucher.bank_id,
-        Number(voucher.amount || 0),
-        voucher.voucher_type === "encaissement" ? "entrée" : "sortie",
+        voucher.caisse_id,
+        amountValue,
+        direction,
         voucher.expense_category || "",
         voucher.partner_id,
         voucher.partner_name || "",
@@ -5798,6 +5930,49 @@ app.put("/accounting/vouchers/:id/validate", authenticateToken, async (req, res)
         req.user.id
       ]
     );
+
+    await createJournalEntry(client, {
+      companyId: voucher.company_id,
+      label: voucher.reason || voucher.voucher_number,
+      moduleSource: "cash_voucher",
+      sourceId: voucher.id,
+      lines: direction === "entrée"
+        ? [
+            {
+              account_code: bank ? "52" : "57",
+              account_name: bank ? "Banque" : "Caisse",
+              debit: amountValue,
+              credit: 0,
+              bank_id: bank?.id || null,
+              caisse_id: caisse?.id || null
+            },
+            {
+              account_code: "75",
+              account_name: "Autres produits",
+              debit: 0,
+              credit: amountValue,
+              partner_id: voucher.partner_id || null
+            }
+          ]
+        : [
+            {
+              account_code: voucher.expense_category === "achat" ? "60" : "65",
+              account_name: voucher.expense_category === "achat" ? "Achats" : "Autres charges",
+              debit: amountValue,
+              credit: 0,
+              partner_id: voucher.partner_id || null
+            },
+            {
+              account_code: bank ? "52" : "57",
+              account_name: bank ? "Banque" : "Caisse",
+              debit: 0,
+              credit: amountValue,
+              bank_id: bank?.id || null,
+              caisse_id: caisse?.id || null
+            }
+          ],
+      createdBy: req.user.id
+    });
 
     const updated = await client.query(
       `UPDATE cash_vouchers
@@ -5815,7 +5990,7 @@ app.put("/accounting/vouchers/:id/validate", authenticateToken, async (req, res)
   } catch (error) {
     await client.query("ROLLBACK");
     console.error("ERREUR VALIDATE VOUCHER :", error);
-    res.status(500).json({ error: "Erreur validation bon" });
+    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Erreur validation bon" });
   } finally {
     client.release();
   }
@@ -5890,15 +6065,16 @@ app.post("/accounting/expense-requests", authenticateToken, async (req, res) => 
 app.put("/accounting/expense-requests/:id/status", authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
-    const { status, rejection_reason = "", proof_url = "" } = req.body;
-    const allowed = ["validé", "refusé", "payé", "clôturé"];
+    let { status, rejection_reason = "", proof_url = "" } = req.body;
+    if (status === "payé") status = "paiement_effectué";
+    const allowed = ["validé", "refusé", "paiement_effectué", "justificatif_reçu", "clôturé"];
     if (!allowed.includes(status)) {
       return res.status(400).json({ error: "Statut invalide." });
     }
     if ((status === "validé" || status === "refusé") && !canApproveAccounting(req.user)) {
       return res.status(403).json({ error: "Validation réservée à la direction/admin." });
     }
-    if ((status === "payé" || status === "clôturé") && !canManageAccounting(req.user)) {
+    if ((status === "paiement_effectué" || status === "justificatif_reçu" || status === "clôturé") && !canManageAccounting(req.user)) {
       return res.status(403).json({ error: "Paiement/clôture réservé au comptable/admin." });
     }
 
@@ -5920,8 +6096,13 @@ app.put("/accounting/expense-requests/:id/status", authenticateToken, async (req
       return res.status(400).json({ error: "Justificatif obligatoire pour clôturer." });
     }
 
-    if (status === "payé" && request.status !== "payé") {
+    if (status === "paiement_effectué" && request.status !== "paiement_effectué") {
       await ensureTreasuryAccount(client, request.company_id);
+      const treasuryResult = await client.query(
+        `SELECT * FROM treasury_accounts WHERE company_id=$1 FOR UPDATE`,
+        [request.company_id]
+      );
+      ensureSufficientBalance(treasuryResult.rows[0]?.current_balance, Number(request.requested_amount || 0), "Solde insuffisant dans la trésorerie.");
       await client.query(
         `UPDATE treasury_accounts
          SET current_balance=COALESCE(current_balance,0)-$1,
@@ -5939,8 +6120,8 @@ app.put("/accounting/expense-requests/:id/status", authenticateToken, async (req
            proof_url=COALESCE(NULLIF($3,''), proof_url),
            approved_by=CASE WHEN $1 IN ('validé','refusé') THEN $4 ELSE approved_by END,
            approved_at=CASE WHEN $1 IN ('validé','refusé') THEN CURRENT_TIMESTAMP ELSE approved_at END,
-           paid_by=CASE WHEN $1='payé' THEN $4 ELSE paid_by END,
-           paid_at=CASE WHEN $1='payé' THEN CURRENT_TIMESTAMP ELSE paid_at END,
+           paid_by=CASE WHEN $1='paiement_effectué' THEN $4 ELSE paid_by END,
+           paid_at=CASE WHEN $1='paiement_effectué' THEN CURRENT_TIMESTAMP ELSE paid_at END,
            closed_by=CASE WHEN $1='clôturé' THEN $4 ELSE closed_by END,
            closed_at=CASE WHEN $1='clôturé' THEN CURRENT_TIMESTAMP ELSE closed_at END,
            updated_at=CURRENT_TIMESTAMP
@@ -5954,7 +6135,7 @@ app.put("/accounting/expense-requests/:id/status", authenticateToken, async (req
   } catch (error) {
     await client.query("ROLLBACK");
     console.error("ERREUR UPDATE EXPENSE STATUS :", error);
-    res.status(500).json({ error: "Erreur changement statut demande" });
+    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Erreur changement statut demande" });
   } finally {
     client.release();
   }
