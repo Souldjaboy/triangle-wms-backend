@@ -626,20 +626,32 @@ async function createNotification({
   );
 }
 
+const COMPANY_MODULE_KEYS = [
+  "produits",
+  "stock",
+  "mouvements",
+  "entrepots",
+  "emplacements",
+  "pos",
+  "ventes",
+  "paiements",
+  "recus",
+  "achats",
+  "fournisseurs",
+  "clients",
+  "partenaires",
+  "pointage",
+  "inventaire",
+  "ia",
+  "reunions",
+  "documents",
+  "rapports",
+  "transport",
+  "crm"
+];
+
 async function getCompanyModules(companyId) {
-  const moduleKeys = [
-    "pos",
-    "ventes",
-    "achats",
-    "pointage",
-    "inventaire",
-    "ia",
-    "reunions",
-    "documents",
-    "rapports",
-    "transport",
-    "crm"
-  ];
+  const moduleKeys = COMPANY_MODULE_KEYS;
 
   if (!companyId) {
     return moduleKeys.reduce((acc, key) => {
@@ -704,17 +716,17 @@ async function ensureDefaultSubscriptionPlans() {
       price_monthly: 10000,
       max_users: 10,
       max_warehouses: 3,
-      max_products: 1000,
+      max_products: 2000,
       max_movements_monthly: 3000,
       trial_days: 15
     },
     {
       name: "Premium",
       price_monthly: 15000,
-      max_users: 0,
-      max_warehouses: 0,
-      max_products: 0,
-      max_movements_monthly: 0,
+      max_users: 30,
+      max_warehouses: 10,
+      max_products: 10000,
+      max_movements_monthly: 20000,
       trial_days: 15
     }
   ];
@@ -768,6 +780,36 @@ async function ensureDefaultSubscriptionPlans() {
       ]
     );
   }
+
+  await pool.query(`
+    UPDATE subscription_plans
+    SET
+      max_users = CASE
+        WHEN LOWER(name)='premium' AND COALESCE(max_users,0) <= 0 THEN 30
+        WHEN LOWER(name)='standard' AND COALESCE(max_users,0) <= 0 THEN 10
+        WHEN LOWER(name) IN ('essentiel','starter') AND COALESCE(max_users,0) <= 0 THEN 3
+        ELSE max_users
+      END,
+      max_warehouses = CASE
+        WHEN LOWER(name)='premium' AND COALESCE(max_warehouses,0) <= 0 THEN 10
+        WHEN LOWER(name)='standard' AND COALESCE(max_warehouses,0) <= 0 THEN 3
+        WHEN LOWER(name) IN ('essentiel','starter') AND COALESCE(max_warehouses,0) <= 0 THEN 1
+        ELSE max_warehouses
+      END,
+      max_products = CASE
+        WHEN LOWER(name)='premium' AND COALESCE(max_products,0) <= 0 THEN 10000
+        WHEN LOWER(name)='standard' AND COALESCE(max_products,0) < 2000 THEN 2000
+        WHEN LOWER(name) IN ('essentiel','starter') AND COALESCE(max_products,0) < 300 THEN 300
+        ELSE max_products
+      END,
+      max_movements_monthly = CASE
+        WHEN LOWER(name)='premium' AND COALESCE(max_movements_monthly,0) <= 0 THEN 20000
+        WHEN LOWER(name)='standard' AND COALESCE(max_movements_monthly,0) <= 0 THEN 3000
+        WHEN LOWER(name) IN ('essentiel','starter') AND COALESCE(max_movements_monthly,0) <= 0 THEN 500
+        ELSE max_movements_monthly
+      END
+    WHERE LOWER(name) IN ('essentiel','starter','standard','premium')
+  `);
 }
 
 app.get("/", (req, res) => {
@@ -935,7 +977,8 @@ app.post("/register-saas", async (req, res) => {
       password,
       plan_id,
       plan_name,
-      plan_price
+      plan_price,
+      selected_modules = {}
     } = req.body;
 
     if (!company_name || !responsible_name || !email || !password) {
@@ -1099,6 +1142,40 @@ app.post("/register-saas", async (req, res) => {
       ]
     );
 
+    const requestedModules =
+      Array.isArray(selected_modules)
+        ? selected_modules.reduce((acc, key) => {
+            acc[key] = true;
+            return acc;
+          }, {})
+        : selected_modules && typeof selected_modules === "object"
+          ? selected_modules
+          : {};
+
+    for (const moduleKey of COMPANY_MODULE_KEYS) {
+      const requestedKey =
+        moduleKey === "crm" &&
+        Object.prototype.hasOwnProperty.call(requestedModules, "partenaires")
+          ? "partenaires"
+          : moduleKey;
+      const isEnabled =
+        Object.prototype.hasOwnProperty.call(requestedModules, requestedKey)
+          ? requestedModules[requestedKey] === true
+          : true;
+
+      await pool.query(
+        `INSERT INTO company_modules
+         (company_id, module_key, is_enabled, updated_by)
+         VALUES ($1,$2,$3,$4)
+         ON CONFLICT (company_id, module_key)
+         DO UPDATE SET
+           is_enabled=EXCLUDED.is_enabled,
+           updated_by=EXCLUDED.updated_by,
+           updated_at=CURRENT_TIMESTAMP`,
+        [company.id, moduleKey, isEnabled, user.id]
+      );
+    }
+
     res.status(201).json({
       success: true,
       message: "Entreprise créée avec succès. Essai gratuit activé.",
@@ -1123,7 +1200,14 @@ app.post("/register-saas", async (req, res) => {
 app.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body;
-    const normalizedEmail = String(email || "").trim().toLowerCase();
+    const loginIdentifier = String(email || "").trim();
+    const normalizedEmail = loginIdentifier.toLowerCase();
+
+    if (!loginIdentifier || !password) {
+      return res.status(400).json({ error: "Identifiant et mot de passe obligatoires" });
+    }
+
+    const usersHasPhone = await columnExists("users", "phone");
 
     const result = await pool.query(
       `SELECT 
@@ -1137,15 +1221,16 @@ app.post("/login", async (req, res) => {
        LEFT JOIN companies c ON u.company_id = c.id
        LEFT JOIN subscriptions s ON c.id = s.company_id
        LEFT JOIN subscription_plans sp ON s.plan_id = sp.id
-       WHERE u.email = $1
+       WHERE LOWER(u.email) = LOWER($1)
+          ${usersHasPhone ? "OR regexp_replace(COALESCE(u.phone,''), '[^0-9+]', '', 'g') = regexp_replace($1, '[^0-9+]', '', 'g')" : ""}
        ORDER BY s.id DESC
        LIMIT 1`,
-      [normalizedEmail]
+      [loginIdentifier]
     );
 
     const user = result.rows[0];
 
-    if (!user) return res.status(401).json({ error: "Email incorrect" });
+    if (!user) return res.status(401).json({ error: "Identifiant incorrect" });
 
     if (user.is_active === false) {
       return res.status(403).json({ error: "Compte désactivé" });
@@ -8536,10 +8621,30 @@ app.get("/public/plans", async (req, res) => {
         id,
         name,
         price_monthly,
-        max_users,
-        max_warehouses,
-        max_products,
-        max_movements_monthly,
+        CASE
+          WHEN LOWER(name)='premium' AND COALESCE(max_users,0) <= 0 THEN 30
+          WHEN LOWER(name)='standard' AND COALESCE(max_users,0) <= 0 THEN 10
+          WHEN LOWER(name) IN ('essentiel','starter') AND COALESCE(max_users,0) <= 0 THEN 3
+          ELSE max_users
+        END AS max_users,
+        CASE
+          WHEN LOWER(name)='premium' AND COALESCE(max_warehouses,0) <= 0 THEN 10
+          WHEN LOWER(name)='standard' AND COALESCE(max_warehouses,0) <= 0 THEN 3
+          WHEN LOWER(name) IN ('essentiel','starter') AND COALESCE(max_warehouses,0) <= 0 THEN 1
+          ELSE max_warehouses
+        END AS max_warehouses,
+        CASE
+          WHEN LOWER(name)='premium' AND COALESCE(max_products,0) <= 0 THEN 10000
+          WHEN LOWER(name)='standard' AND COALESCE(max_products,0) < 2000 THEN 2000
+          WHEN LOWER(name) IN ('essentiel','starter') AND COALESCE(max_products,0) < 300 THEN 300
+          ELSE max_products
+        END AS max_products,
+        CASE
+          WHEN LOWER(name)='premium' AND COALESCE(max_movements_monthly,0) <= 0 THEN 20000
+          WHEN LOWER(name)='standard' AND COALESCE(max_movements_monthly,0) <= 0 THEN 3000
+          WHEN LOWER(name) IN ('essentiel','starter') AND COALESCE(max_movements_monthly,0) <= 0 THEN 500
+          ELSE max_movements_monthly
+        END AS max_movements_monthly,
         trial_days,
         modules,
         can_use_reports,
