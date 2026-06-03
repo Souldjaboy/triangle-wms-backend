@@ -267,6 +267,39 @@ function canManageCaisses(user) {
   return user?.is_super_admin === true || role === "super_admin" || role === "admin";
 }
 
+function canViewAccounting(user) {
+  const role = normalizeRole(user?.role);
+  return (
+    user?.is_super_admin === true ||
+    role === "super_admin" ||
+    role === "admin" ||
+    role === "comptable" ||
+    role === "direction" ||
+    role === "directeur"
+  );
+}
+
+function canManageAccounting(user) {
+  const role = normalizeRole(user?.role);
+  return (
+    user?.is_super_admin === true ||
+    role === "super_admin" ||
+    role === "admin" ||
+    role === "comptable"
+  );
+}
+
+function canApproveAccounting(user) {
+  const role = normalizeRole(user?.role);
+  return (
+    user?.is_super_admin === true ||
+    role === "super_admin" ||
+    role === "admin" ||
+    role === "direction" ||
+    role === "directeur"
+  );
+}
+
 function canAdjustPosPrice(user) {
   const role = normalizeRole(user?.role);
   return user?.is_super_admin === true || role === "super_admin" || role === "admin";
@@ -650,6 +683,7 @@ const COMPANY_MODULE_KEYS = [
   "inventaire",
   "ia",
   "reunions",
+  "comptabilite",
   "documents",
   "rapports",
   "transport",
@@ -4995,6 +5029,748 @@ app.get("/pos/reports/payments", authenticateToken, async (req, res) => {
   }
 });
 
+async function nextAccountingNumber(client, tableName, columnName, prefix, companyId) {
+  const year = new Date().getFullYear();
+  const result = await client.query(
+    `SELECT COUNT(*)::int AS count
+     FROM ${tableName}
+     WHERE company_id=$1 AND EXTRACT(YEAR FROM created_at)=$2`,
+    [companyId, year]
+  );
+  return `${prefix}-${year}-${String(Number(result.rows[0]?.count || 0) + 1).padStart(6, "0")}`;
+}
+
+async function ensureTreasuryAccount(client, companyId, currency = "FCFA") {
+  const result = await client.query(
+    `INSERT INTO treasury_accounts (company_id, currency, initial_balance, current_balance)
+     VALUES ($1,$2,0,0)
+     ON CONFLICT (company_id)
+     DO UPDATE SET company_id=EXCLUDED.company_id
+     RETURNING *`,
+    [companyId, currency || "FCFA"]
+  );
+  return result.rows[0];
+}
+
+async function createAccountingEntry(client, {
+  companyId,
+  sourceType,
+  sourceId,
+  accountLabel,
+  debit = 0,
+  credit = 0,
+  description = "",
+  createdBy = null
+}) {
+  const entryNumber = await nextAccountingNumber(
+    client,
+    "accounting_entries",
+    "entry_number",
+    "ECR",
+    companyId
+  );
+
+  await client.query(
+    `INSERT INTO accounting_entries
+     (company_id, entry_number, source_type, source_id, account_label,
+      debit, credit, description, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+    [
+      companyId,
+      entryNumber,
+      sourceType,
+      sourceId,
+      accountLabel,
+      Number(debit || 0),
+      Number(credit || 0),
+      description,
+      createdBy
+    ]
+  );
+}
+
+app.get("/accounting/dashboard", authenticateToken, async (req, res) => {
+  try {
+    if (!canViewAccounting(req.user)) {
+      return res.status(403).json({ error: "Accès comptabilité refusé." });
+    }
+
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
+    const values = isSuperAdmin ? [] : [companyId];
+    const filter = isSuperAdmin ? "" : "WHERE company_id=$1";
+    const andFilter = isSuperAdmin ? "" : "AND company_id=$1";
+
+    const treasury = await pool.query(
+      `SELECT COALESCE(SUM(current_balance),0)::numeric AS total
+       FROM treasury_accounts ${filter}`,
+      values
+    );
+    const banks = await pool.query(
+      `SELECT COALESCE(SUM(current_balance),0)::numeric AS total
+       FROM accounting_banks ${filter}`,
+      values
+    );
+    const dailyIn = await pool.query(
+      `SELECT COALESCE(SUM(amount),0)::numeric AS total
+       FROM accounting_transactions
+       WHERE direction='entrée' AND DATE(created_at)=CURRENT_DATE ${andFilter}`,
+      values
+    );
+    const dailyOut = await pool.query(
+      `SELECT COALESCE(SUM(amount),0)::numeric AS total
+       FROM accounting_transactions
+       WHERE direction='sortie' AND DATE(created_at)=CURRENT_DATE ${andFilter}`,
+      values
+    );
+    const monthExpenses = await pool.query(
+      `SELECT COALESCE(SUM(amount),0)::numeric AS total
+       FROM accounting_transactions
+       WHERE direction='sortie'
+         AND date_trunc('month', created_at)=date_trunc('month', CURRENT_DATE)
+         ${andFilter}`,
+      values
+    );
+    const requests = await pool.query(
+      `SELECT status, COUNT(*)::int AS count
+       FROM expense_requests
+       ${filter}
+       GROUP BY status`,
+      values
+    );
+    const payroll = await pool.query(
+      `SELECT COALESCE(SUM(net_amount),0)::numeric AS total
+       FROM payroll_runs
+       WHERE status IN ('brouillon','à payer','validé') ${andFilter}`,
+      values
+    );
+
+    res.json({
+      treasury_balance: Number(treasury.rows[0]?.total || 0),
+      bank_balance: Number(banks.rows[0]?.total || 0),
+      encaissements_jour: Number(dailyIn.rows[0]?.total || 0),
+      decaissements_jour: Number(dailyOut.rows[0]?.total || 0),
+      depenses_mois: Number(monthExpenses.rows[0]?.total || 0),
+      salaires_a_payer: Number(payroll.rows[0]?.total || 0),
+      demandes: requests.rows.reduce((acc, row) => {
+        acc[row.status] = Number(row.count || 0);
+        return acc;
+      }, {})
+    });
+  } catch (error) {
+    console.error("ERREUR ACCOUNTING DASHBOARD :", error);
+    res.status(500).json({ error: "Erreur dashboard comptable" });
+  }
+});
+
+app.get("/accounting/banks", authenticateToken, async (req, res) => {
+  try {
+    if (!canViewAccounting(req.user)) {
+      return res.status(403).json({ error: "Accès comptabilité refusé." });
+    }
+    const isSuperAdmin = req.user.is_super_admin === true;
+    const result = await pool.query(
+      `SELECT * FROM accounting_banks
+       ${isSuperAdmin ? "" : "WHERE company_id=$1"}
+       ORDER BY is_active DESC, bank_name ASC`,
+      isSuperAdmin ? [] : [req.user.company_id]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR ACCOUNTING BANKS :", error);
+    res.status(500).json({ error: "Erreur lecture banques" });
+  }
+});
+
+app.post("/accounting/banks", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageAccounting(req.user)) {
+      return res.status(403).json({ error: "Accès gestion comptable refusé." });
+    }
+    const {
+      bank_name,
+      account_number = "",
+      iban = "",
+      swift = req.body.swift_code || "",
+      currency = "FCFA",
+      initial_balance = 0,
+      is_active = true
+    } = req.body;
+
+    if (!bank_name) {
+      return res.status(400).json({ error: "Nom banque obligatoire." });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO accounting_banks
+       (company_id, bank_name, account_number, iban, swift, currency,
+        initial_balance, current_balance, is_active, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$7,$8,$9)
+       RETURNING *`,
+      [
+        req.user.company_id,
+        bank_name,
+        account_number,
+        iban,
+        swift,
+        currency,
+        Number(initial_balance || 0),
+        is_active !== false,
+        req.user.id
+      ]
+    );
+    await logAudit(req, "create_bank", "accounting_bank", result.rows[0].id, { bank_name });
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error("ERREUR CREATE BANK :", error);
+    res.status(500).json({ error: "Erreur création banque" });
+  }
+});
+
+app.put("/accounting/banks/:id", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageAccounting(req.user)) {
+      return res.status(403).json({ error: "Accès gestion comptable refusé." });
+    }
+    const isSuperAdmin = req.user.is_super_admin === true;
+    const {
+      bank_name,
+      account_number = "",
+      iban = "",
+      swift = "",
+      currency = "FCFA",
+      is_active = true
+    } = req.body;
+    const result = await pool.query(
+      `UPDATE accounting_banks
+       SET bank_name=$1, account_number=$2, iban=$3, swift=$4,
+           currency=$5, is_active=$6, updated_at=CURRENT_TIMESTAMP
+       WHERE id=$7 ${isSuperAdmin ? "" : "AND company_id=$8"}
+       RETURNING *`,
+      isSuperAdmin
+        ? [bank_name, account_number, iban, swift, currency, is_active !== false, req.params.id]
+        : [bank_name, account_number, iban, swift, currency, is_active !== false, req.params.id, req.user.company_id]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: "Banque introuvable." });
+    await logAudit(req, "update_bank", "accounting_bank", req.params.id, { bank_name });
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("ERREUR UPDATE BANK :", error);
+    res.status(500).json({ error: "Erreur modification banque" });
+  }
+});
+
+app.get("/accounting/transactions", authenticateToken, async (req, res) => {
+  try {
+    if (!canViewAccounting(req.user)) {
+      return res.status(403).json({ error: "Accès comptabilité refusé." });
+    }
+    const isSuperAdmin = req.user.is_super_admin === true;
+    const result = await pool.query(
+      `SELECT t.*, b.bank_name
+       FROM accounting_transactions t
+       LEFT JOIN accounting_banks b ON b.id=t.bank_id
+       ${isSuperAdmin ? "" : "WHERE t.company_id=$1"}
+       ORDER BY t.id DESC
+       LIMIT 300`,
+      isSuperAdmin ? [] : [req.user.company_id]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR ACCOUNTING TRANSACTIONS :", error);
+    res.status(500).json({ error: "Erreur lecture mouvements comptables" });
+  }
+});
+
+app.post("/accounting/transactions", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    if (!canManageAccounting(req.user)) {
+      return res.status(403).json({ error: "Accès gestion comptable refusé." });
+    }
+    const {
+      transaction_type,
+      bank_id = null,
+      amount,
+      direction,
+      category = "",
+      partner_id = null,
+      partner_name = "",
+      description = "",
+      attachment_url = ""
+    } = req.body;
+
+    const amountValue = Number(amount || 0);
+    if (!transaction_type || amountValue <= 0 || !["entrée", "sortie"].includes(direction)) {
+      return res.status(400).json({ error: "Type, sens et montant valides obligatoires." });
+    }
+
+    await client.query("BEGIN");
+    await ensureTreasuryAccount(client, req.user.company_id);
+    const transactionNumber = await nextAccountingNumber(
+      client,
+      "accounting_transactions",
+      "transaction_number",
+      direction === "entrée" ? "ENC" : "DEC",
+      req.user.company_id
+    );
+
+    if (bank_id) {
+      const bankResult = await client.query(
+        `SELECT * FROM accounting_banks
+         WHERE id=$1 AND company_id=$2
+         FOR UPDATE`,
+        [bank_id, req.user.company_id]
+      );
+      if (!bankResult.rows[0]) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "Banque introuvable." });
+      }
+      const bankDelta = direction === "entrée" ? amountValue : -amountValue;
+      await client.query(
+        `UPDATE accounting_banks
+         SET current_balance=COALESCE(current_balance,0)+$1,
+             updated_at=CURRENT_TIMESTAMP
+         WHERE id=$2`,
+        [bankDelta, bank_id]
+      );
+    }
+
+    const treasuryDelta =
+      transaction_type === "retrait_banque" || transaction_type === "encaissement_especes"
+        ? amountValue
+        : direction === "sortie"
+          ? -amountValue
+          : 0;
+
+    if (treasuryDelta !== 0) {
+      await client.query(
+        `UPDATE treasury_accounts
+         SET current_balance=COALESCE(current_balance,0)+$1,
+             updated_by=$2,
+             updated_at=CURRENT_TIMESTAMP
+         WHERE company_id=$3`,
+        [treasuryDelta, req.user.id, req.user.company_id]
+      );
+    }
+
+    const result = await client.query(
+      `INSERT INTO accounting_transactions
+       (company_id, transaction_number, transaction_type, bank_id, amount,
+        direction, category, partner_id, partner_name, description,
+        attachment_url, created_by, validated_by, validated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12,CURRENT_TIMESTAMP)
+       RETURNING *`,
+      [
+        req.user.company_id,
+        transactionNumber,
+        transaction_type,
+        bank_id || null,
+        amountValue,
+        direction,
+        category,
+        partner_id || null,
+        partner_name || "",
+        description,
+        attachment_url,
+        req.user.id
+      ]
+    );
+
+    await createAccountingEntry(client, {
+      companyId: req.user.company_id,
+      sourceType: "accounting_transaction",
+      sourceId: result.rows[0].id,
+      accountLabel: direction === "entrée" ? "Banque / Trésorerie" : "Charge / Décaissement",
+      debit: direction === "entrée" ? amountValue : 0,
+      credit: direction === "sortie" ? amountValue : 0,
+      description,
+      createdBy: req.user.id
+    });
+
+    await client.query("COMMIT");
+    await logAudit(req, "create_accounting_transaction", "accounting_transaction", result.rows[0].id, { amount: amountValue, direction });
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("ERREUR CREATE ACCOUNTING TRANSACTION :", error);
+    res.status(500).json({ error: "Erreur mouvement comptable" });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/accounting/vouchers", authenticateToken, async (req, res) => {
+  try {
+    if (!canViewAccounting(req.user)) {
+      return res.status(403).json({ error: "Accès comptabilité refusé." });
+    }
+    const isSuperAdmin = req.user.is_super_admin === true;
+    const result = await pool.query(
+      `SELECT v.*, b.bank_name
+       FROM cash_vouchers v
+       LEFT JOIN accounting_banks b ON b.id=v.bank_id
+       ${isSuperAdmin ? "" : "WHERE v.company_id=$1"}
+       ORDER BY v.id DESC
+       LIMIT 300`,
+      isSuperAdmin ? [] : [req.user.company_id]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR VOUCHERS :", error);
+    res.status(500).json({ error: "Erreur lecture bons" });
+  }
+});
+
+app.post("/accounting/vouchers", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageAccounting(req.user)) {
+      return res.status(403).json({ error: "Accès gestion comptable refusé." });
+    }
+    const {
+      voucher_type,
+      amount,
+      origin = "",
+      beneficiary = "",
+      bank_id = null,
+      partner_id = null,
+      partner_name = "",
+      reason = "",
+      expense_category = "",
+      attachment_url = ""
+    } = req.body;
+    const amountValue = Number(amount || 0);
+    if (!["encaissement", "decaissement"].includes(voucher_type) || amountValue <= 0) {
+      return res.status(400).json({ error: "Type de bon et montant valides obligatoires." });
+    }
+    const voucherNumber = await nextAccountingNumber(
+      pool,
+      "cash_vouchers",
+      "voucher_number",
+      voucher_type === "encaissement" ? "BE" : "BD",
+      req.user.company_id
+    );
+    const result = await pool.query(
+      `INSERT INTO cash_vouchers
+       (company_id, voucher_number, voucher_type, amount, origin, beneficiary,
+        bank_id, partner_id, partner_name, reason, expense_category,
+        attachment_url, status, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'soumis',$13)
+       RETURNING *`,
+      [
+        req.user.company_id,
+        voucherNumber,
+        voucher_type,
+        amountValue,
+        origin,
+        beneficiary,
+        bank_id || null,
+        partner_id || null,
+        partner_name || "",
+        reason,
+        expense_category,
+        attachment_url,
+        req.user.id
+      ]
+    );
+    await logAudit(req, "create_cash_voucher", "cash_voucher", result.rows[0].id, { voucher_type, amount: amountValue });
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error("ERREUR CREATE VOUCHER :", error);
+    res.status(500).json({ error: "Erreur création bon" });
+  }
+});
+
+app.put("/accounting/vouchers/:id/validate", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    if (!canApproveAccounting(req.user) && !canManageAccounting(req.user)) {
+      return res.status(403).json({ error: "Accès validation comptable refusé." });
+    }
+    await client.query("BEGIN");
+    const voucherResult = await client.query(
+      `SELECT *
+       FROM cash_vouchers
+       WHERE id=$1 ${req.user.is_super_admin === true ? "" : "AND company_id=$2"}
+       FOR UPDATE`,
+      req.user.is_super_admin === true ? [req.params.id] : [req.params.id, req.user.company_id]
+    );
+    const voucher = voucherResult.rows[0];
+    if (!voucher) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Bon introuvable." });
+    }
+    if (voucher.status === "validé") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "Bon déjà validé." });
+    }
+
+    await ensureTreasuryAccount(client, voucher.company_id);
+    const treasuryDelta = voucher.voucher_type === "encaissement"
+      ? Number(voucher.amount || 0)
+      : -Number(voucher.amount || 0);
+    await client.query(
+      `UPDATE treasury_accounts
+       SET current_balance=COALESCE(current_balance,0)+$1,
+           updated_by=$2,
+           updated_at=CURRENT_TIMESTAMP
+       WHERE company_id=$3`,
+      [treasuryDelta, req.user.id, voucher.company_id]
+    );
+
+    const transactionNumber = await nextAccountingNumber(
+      client,
+      "accounting_transactions",
+      "transaction_number",
+      voucher.voucher_type === "encaissement" ? "ENC" : "DEC",
+      voucher.company_id
+    );
+    await client.query(
+      `INSERT INTO accounting_transactions
+       (company_id, transaction_number, transaction_type, source_type, source_id,
+        bank_id, amount, direction, category, partner_id, partner_name,
+        description, attachment_url, created_by, validated_by, validated_at)
+       VALUES ($1,$2,$3,'cash_voucher',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13,CURRENT_TIMESTAMP)`,
+      [
+        voucher.company_id,
+        transactionNumber,
+        voucher.voucher_type,
+        voucher.id,
+        voucher.bank_id,
+        Number(voucher.amount || 0),
+        voucher.voucher_type === "encaissement" ? "entrée" : "sortie",
+        voucher.expense_category || "",
+        voucher.partner_id,
+        voucher.partner_name || "",
+        voucher.reason || "",
+        voucher.attachment_url || "",
+        req.user.id
+      ]
+    );
+
+    const updated = await client.query(
+      `UPDATE cash_vouchers
+       SET status='validé',
+           validated_by=$1,
+           validated_at=CURRENT_TIMESTAMP,
+           updated_at=CURRENT_TIMESTAMP
+       WHERE id=$2
+       RETURNING *`,
+      [req.user.id, voucher.id]
+    );
+    await client.query("COMMIT");
+    await logAudit(req, "validate_cash_voucher", "cash_voucher", voucher.id, { voucher_type: voucher.voucher_type });
+    res.json(updated.rows[0]);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("ERREUR VALIDATE VOUCHER :", error);
+    res.status(500).json({ error: "Erreur validation bon" });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/accounting/expense-requests", authenticateToken, async (req, res) => {
+  try {
+    const isSuperAdmin = req.user.is_super_admin === true;
+    const canSeeAll = canViewAccounting(req.user);
+    const whereClause = isSuperAdmin ? "true" : canSeeAll ? "company_id=$1" : "created_by=$1";
+    const values = isSuperAdmin ? [] : canSeeAll ? [req.user.company_id] : [req.user.id];
+    const result = await pool.query(
+      `SELECT *
+       FROM expense_requests
+       WHERE ${whereClause}
+       ORDER BY id DESC`,
+      values
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR EXPENSE REQUESTS :", error);
+    res.status(500).json({ error: "Erreur lecture demandes" });
+  }
+});
+
+app.post("/accounting/expense-requests", authenticateToken, async (req, res) => {
+  try {
+    const {
+      requested_amount,
+      reason,
+      description = "",
+      urgency = "normale",
+      attachment_url = ""
+    } = req.body;
+    const amountValue = Number(requested_amount || 0);
+    if (amountValue <= 0 || !reason) {
+      return res.status(400).json({ error: "Montant et motif obligatoires." });
+    }
+    const requestNumber = await nextAccountingNumber(
+      pool,
+      "expense_requests",
+      "request_number",
+      "DD",
+      req.user.company_id
+    );
+    const result = await pool.query(
+      `INSERT INTO expense_requests
+       (company_id, request_number, requested_amount, reason, description,
+        urgency, attachment_url, status, created_by, created_by_name)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'soumis',$8,$9)
+       RETURNING *`,
+      [
+        req.user.company_id,
+        requestNumber,
+        amountValue,
+        reason,
+        description,
+        urgency,
+        attachment_url,
+        req.user.id,
+        req.user.email || ""
+      ]
+    );
+    await logAudit(req, "create_expense_request", "expense_request", result.rows[0].id, { amount: amountValue });
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error("ERREUR CREATE EXPENSE REQUEST :", error);
+    res.status(500).json({ error: "Erreur création demande" });
+  }
+});
+
+app.put("/accounting/expense-requests/:id/status", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { status, rejection_reason = "", proof_url = "" } = req.body;
+    const allowed = ["validé", "refusé", "payé", "clôturé"];
+    if (!allowed.includes(status)) {
+      return res.status(400).json({ error: "Statut invalide." });
+    }
+    if ((status === "validé" || status === "refusé") && !canApproveAccounting(req.user)) {
+      return res.status(403).json({ error: "Validation réservée à la direction/admin." });
+    }
+    if ((status === "payé" || status === "clôturé") && !canManageAccounting(req.user)) {
+      return res.status(403).json({ error: "Paiement/clôture réservé au comptable/admin." });
+    }
+
+    await client.query("BEGIN");
+    const requestResult = await client.query(
+      `SELECT *
+       FROM expense_requests
+       WHERE id=$1 ${req.user.is_super_admin === true ? "" : "AND company_id=$2"}
+       FOR UPDATE`,
+      req.user.is_super_admin === true ? [req.params.id] : [req.params.id, req.user.company_id]
+    );
+    const request = requestResult.rows[0];
+    if (!request) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Demande introuvable." });
+    }
+    if (status === "clôturé" && !proof_url && !request.proof_url) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "Justificatif obligatoire pour clôturer." });
+    }
+
+    if (status === "payé" && request.status !== "payé") {
+      await ensureTreasuryAccount(client, request.company_id);
+      await client.query(
+        `UPDATE treasury_accounts
+         SET current_balance=COALESCE(current_balance,0)-$1,
+             updated_by=$2,
+             updated_at=CURRENT_TIMESTAMP
+         WHERE company_id=$3`,
+        [Number(request.requested_amount || 0), req.user.id, request.company_id]
+      );
+    }
+
+    const update = await client.query(
+      `UPDATE expense_requests
+       SET status=$1,
+           rejection_reason=CASE WHEN $1='refusé' THEN $2 ELSE rejection_reason END,
+           proof_url=COALESCE(NULLIF($3,''), proof_url),
+           approved_by=CASE WHEN $1 IN ('validé','refusé') THEN $4 ELSE approved_by END,
+           approved_at=CASE WHEN $1 IN ('validé','refusé') THEN CURRENT_TIMESTAMP ELSE approved_at END,
+           paid_by=CASE WHEN $1='payé' THEN $4 ELSE paid_by END,
+           paid_at=CASE WHEN $1='payé' THEN CURRENT_TIMESTAMP ELSE paid_at END,
+           closed_by=CASE WHEN $1='clôturé' THEN $4 ELSE closed_by END,
+           closed_at=CASE WHEN $1='clôturé' THEN CURRENT_TIMESTAMP ELSE closed_at END,
+           updated_at=CURRENT_TIMESTAMP
+       WHERE id=$5
+       RETURNING *`,
+      [status, rejection_reason, proof_url, req.user.id, request.id]
+    );
+    await client.query("COMMIT");
+    await logAudit(req, "update_expense_request_status", "expense_request", request.id, { status });
+    res.json(update.rows[0]);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("ERREUR UPDATE EXPENSE STATUS :", error);
+    res.status(500).json({ error: "Erreur changement statut demande" });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/accounting/statements", authenticateToken, async (req, res) => {
+  try {
+    if (!canViewAccounting(req.user)) {
+      return res.status(403).json({ error: "Accès comptabilité refusé." });
+    }
+    const companyId = req.user.company_id;
+    const isSuperAdmin = req.user.is_super_admin === true;
+    const values = isSuperAdmin ? [] : [companyId];
+    const filter = isSuperAdmin ? "" : "WHERE company_id=$1";
+    const andFilter = isSuperAdmin ? "" : "AND company_id=$1";
+
+    const entries = await pool.query(
+      `SELECT *
+       FROM accounting_entries
+       ${filter}
+       ORDER BY id DESC
+       LIMIT 500`,
+      values
+    );
+    const debitsCredits = await pool.query(
+      `SELECT
+         COALESCE(SUM(debit),0)::numeric AS debit,
+         COALESCE(SUM(credit),0)::numeric AS credit
+       FROM accounting_entries
+       ${filter}`,
+      values
+    );
+    const cashflow = await pool.query(
+      `SELECT direction, COALESCE(SUM(amount),0)::numeric AS total
+       FROM accounting_transactions
+       WHERE status='validé' ${andFilter}
+       GROUP BY direction`,
+      values
+    );
+    const assets = await pool.query(
+      `SELECT
+         (SELECT COALESCE(SUM(current_balance),0) FROM accounting_banks ${filter}) AS banks,
+         (SELECT COALESCE(SUM(current_balance),0) FROM treasury_accounts ${filter}) AS treasury`,
+      values
+    );
+
+    res.json({
+      bilan: {
+        actif: Number(assets.rows[0]?.banks || 0) + Number(assets.rows[0]?.treasury || 0),
+        passif: 0,
+        banques: Number(assets.rows[0]?.banks || 0),
+        tresorerie: Number(assets.rows[0]?.treasury || 0)
+      },
+      compte_resultat: {
+        produits: Number(cashflow.rows.find((row) => row.direction === "entrée")?.total || 0),
+        charges: Number(cashflow.rows.find((row) => row.direction === "sortie")?.total || 0)
+      },
+      tableau_tresorerie: cashflow.rows,
+      balance_generale: debitsCredits.rows[0],
+      grand_livre: entries.rows
+    });
+  } catch (error) {
+    console.error("ERREUR ACCOUNTING STATEMENTS :", error);
+    res.status(500).json({ error: "Erreur états financiers" });
+  }
+});
+
 app.use("/super-admin", authenticateToken, (req, res, next) => {
   if (req.user?.is_super_admin !== true && normalizeRole(req.user?.role) !== "super_admin") {
     return res.status(403).json({ error: "Accès super admin requis." });
@@ -5016,6 +5792,7 @@ app.get("/super-admin/modules", authenticateToken, async (req, res) => {
       "inventaire",
       "ia",
       "reunions",
+      "comptabilite",
       "documents",
       "rapports",
       "transport",
