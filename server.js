@@ -668,6 +668,26 @@ async function getCompanyModules(companyId) {
   }, {});
 }
 
+async function tableExists(tableName) {
+  const result = await pool.query("SELECT to_regclass($1) AS table_name", [
+    `public.${tableName}`
+  ]);
+  return Boolean(result.rows[0]?.table_name);
+}
+
+async function columnExists(tableName, columnName) {
+  const result = await pool.query(
+    `SELECT 1
+     FROM information_schema.columns
+     WHERE table_schema='public'
+       AND table_name=$1
+       AND column_name=$2
+     LIMIT 1`,
+    [tableName, columnName]
+  );
+  return result.rows.length > 0;
+}
+
 async function ensureDefaultSubscriptionPlans() {
   const defaultPlans = [
     {
@@ -1971,6 +1991,11 @@ app.post("/stock-movements", authenticateToken, async (req, res) => {
       location_code,
       warehouse_id,
       location_id,
+      partner_id = null,
+      partner_name = "",
+      partner_type = "",
+      apply_price = false,
+      unit_price = 0,
       reason,
       user_name,
       user_role
@@ -1992,14 +2017,20 @@ app.post("/stock-movements", authenticateToken, async (req, res) => {
     }
 
     const product = productCheck.rows[0];
+    const priceApplied = apply_price === true || apply_price === "true";
+    const movementUnitPrice = priceApplied ? Number(unit_price || 0) : 0;
+    const movementTotalAmount = priceApplied
+      ? Number(quantity || 0) * movementUnitPrice
+      : 0;
 
     const result = await pool.query(
       `INSERT INTO stock_movements
       (type, product_reference, product_name, quantity, source_warehouse,
        destination_warehouse, reason, status, company_id, created_by,
        created_by_name, created_by_role, location_code, warehouse_id,
-       approval_status, original_quantity, final_quantity, product_id, location_id)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+       approval_status, original_quantity, final_quantity, product_id, location_id,
+       partner_id, partner_name, partner_type, apply_price, unit_price, total_amount)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
       RETURNING *`,
       [
         type,
@@ -2020,7 +2051,13 @@ app.post("/stock-movements", authenticateToken, async (req, res) => {
         Number(quantity),
         Number(quantity),
         product.id,
-        location_id || product.location_id || null
+        location_id || product.location_id || null,
+        partner_id || null,
+        partner_name || "",
+        partner_type || "",
+        priceApplied,
+        movementUnitPrice,
+        movementTotalAmount
       ]
     );
 
@@ -3436,6 +3473,7 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
     const {
       customer_name,
       customer_phone,
+      client_name,
       client_id = null,
       items = [],
       discount_amount = 0,
@@ -3466,6 +3504,25 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
     );
     const posSettings = settingsResult.rows[0] || {};
     const caisse = await resolveSaleCaisse(client, req.user, caisse_id || cash_register_id);
+    let saleCustomerName = customer_name || client_name || "Client comptoir";
+    let saleCustomerPhone = customer_phone || "";
+
+    if (client_id) {
+      const partnerResult = await client.query(
+        `SELECT id, name, phone, address
+         FROM partners
+         WHERE id=$1 AND ($2::boolean OR company_id=$3)
+         LIMIT 1`,
+        [client_id, req.user.is_super_admin === true, companyId]
+      );
+      const partner = partnerResult.rows[0];
+
+      if (partner) {
+        saleCustomerName = partner.name || saleCustomerName;
+        saleCustomerPhone = partner.phone || saleCustomerPhone;
+      }
+    }
+
     let subtotal = 0;
     let taxAmount = 0;
     let totalProfit = 0;
@@ -3506,10 +3563,10 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
     const saleResult = await client.query(
       `INSERT INTO sales
        (company_id, warehouse_id, cash_register_id, caisse_id, nom_caisse,
-        sale_number, customer_name, customer_phone, client_id,
+        sale_number, customer_name, customer_phone, client_id, client_name,
         subtotal, discount_amount, tax_amount, total_amount, payment_method,
         payment_status, status, created_by, created_by_name, created_by_role)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,$10,0,0,$11,$12,$13,$14,$15,$16)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,0,$11,0,0,$12,$13,$14,$15,$16,$17)
        RETURNING *`,
       [
         companyId,
@@ -3518,9 +3575,10 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
         caisse?.id || null,
         caisse?.nom_caisse || "",
         saleNumber,
-        customer_name || "",
-        customer_phone || "",
+        saleCustomerName,
+        saleCustomerPhone,
         client_id || null,
+        saleCustomerName,
         Number(discount_amount || 0),
         payment_method,
         requestedPaymentStatus,
@@ -3663,8 +3721,10 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
            (type, product_reference, product_name, quantity, source_warehouse,
             destination_warehouse, reason, status, company_id, created_by,
             created_by_name, created_by_role, location_code, warehouse_id,
-            approval_status, original_quantity, final_quantity, product_id, location_id)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,'Validé',$8,$9,$10,$11,$12,$13,'Validé',$4,$4,$14,$15)`,
+            approval_status, original_quantity, final_quantity, product_id,
+            location_id, partner_id, partner_name, partner_type, apply_price,
+            unit_price, total_amount)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,'Validé',$8,$9,$10,$11,$12,$13,'Validé',$4,$4,$14,$15,$16,$17,$18,true,$19,$20)`,
           [
             "Sortie",
             product.reference,
@@ -3680,7 +3740,12 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
             product.location_code || "",
             warehouse_id || product.warehouse_id || null,
             product.id,
-            product.location_id || null
+            product.location_id || null,
+            client_id || null,
+            saleCustomerName,
+            "client",
+            unitPrice,
+            unitPrice * quantity
           ]
         );
       }
@@ -3762,7 +3827,7 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
           rowStatus,
           transactionReference,
           saleNumber,
-          customer_phone || "",
+          saleCustomerPhone,
           JSON.stringify({ sale_id: sale.id, payment_method: row.method, amount: row.amount }),
           JSON.stringify({
             sandbox: isPendingPosPaymentMethod(row.method),
@@ -3845,7 +3910,7 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
         [
           "Reçu POS",
           receiptNumber,
-          customer_name || "",
+          saleCustomerName,
           totalAmount,
           `Reçu généré depuis vente POS ${saleNumber}`,
           req.user.email || "Caissier",
@@ -8226,53 +8291,69 @@ app.get("/partners/:id/details", authenticateToken, async (req, res) => {
       return res.status(404).json({ error: "Partenaire introuvable" });
     }
 
-    const salesResult = await pool.query(
-      `SELECT id, sale_number, customer_name, customer_phone, total_amount,
-              amount_paid, amount_due, remaining_amount, payment_method,
-              payment_status, status, created_at
-       FROM sales
-       WHERE client_id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}
-       ORDER BY id DESC
-       LIMIT 100`,
-      isSuperAdmin ? [partnerId] : [partnerId, companyId]
-    );
+    const paymentsHasPartner = await columnExists("payments", "partner_id");
+    const receiptsHasPartner = await columnExists("receipts", "partner_id");
+    const documentsHasPartner = await columnExists("documents", "partner_id");
+    const salesHasClient = await columnExists("sales", "client_id");
 
-    const paymentsResult = await pool.query(
-      `SELECT id, amount, currency, payment_method, status, notes,
-              paid_at, created_at, sale_id
-       FROM payments
-       WHERE partner_id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}
-       ORDER BY id DESC
-       LIMIT 100`,
-      isSuperAdmin ? [partnerId] : [partnerId, companyId]
-    );
+    const salesResult = salesHasClient
+      ? await pool.query(
+          `SELECT id, sale_number, customer_name, customer_phone, total_amount,
+                  amount_paid, amount_due, remaining_amount, payment_method,
+                  payment_status, status, created_at
+           FROM sales
+           WHERE client_id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}
+           ORDER BY id DESC
+           LIMIT 100`,
+          isSuperAdmin ? [partnerId] : [partnerId, companyId]
+        )
+      : { rows: [] };
 
-    const receiptsResult = await pool.query(
-      `SELECT r.id, r.receipt_number, r.total_amount, r.payment_method,
-              r.payment_status, r.status, r.created_at, r.sale_id
-       FROM receipts r
-       LEFT JOIN sales s ON s.id=r.sale_id
-       WHERE (r.partner_id=$1 OR s.client_id=$1)
-       ${isSuperAdmin ? "" : "AND (r.company_id=$2 OR s.company_id=$2)"}
-       ORDER BY r.id DESC
-       LIMIT 100`,
-      isSuperAdmin ? [partnerId] : [partnerId, companyId]
-    );
+    const paymentsResult = paymentsHasPartner
+      ? await pool.query(
+          `SELECT id, amount, currency, payment_method, status, notes,
+                  paid_at, created_at, sale_id
+           FROM payments
+           WHERE partner_id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}
+           ORDER BY id DESC
+           LIMIT 100`,
+          isSuperAdmin ? [partnerId] : [partnerId, companyId]
+        )
+      : { rows: [] };
 
-    const documentsResult = await pool.query(
-      `SELECT id, document_type, document_number, client_name, total_amount,
-              status, created_by, created_at
-       FROM documents
-       WHERE partner_id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}
-       ORDER BY id DESC
-       LIMIT 100`,
-      isSuperAdmin ? [partnerId] : [partnerId, companyId]
-    );
+    const receiptPartnerCondition = receiptsHasPartner ? "r.partner_id=$1" : "false";
+    const receiptSaleCondition = salesHasClient ? "s.client_id=$1" : "false";
+    const receiptsResult =
+      receiptsHasPartner || salesHasClient
+        ? await pool.query(
+            `SELECT r.id, r.receipt_number, r.total_amount, r.payment_method,
+                    r.payment_status, r.status, r.created_at, r.sale_id
+             FROM receipts r
+             LEFT JOIN sales s ON s.id=r.sale_id
+             WHERE (${receiptPartnerCondition} OR ${receiptSaleCondition})
+             ${isSuperAdmin ? "" : "AND (r.company_id=$2 OR s.company_id=$2)"}
+             ORDER BY r.id DESC
+             LIMIT 100`,
+            isSuperAdmin ? [partnerId] : [partnerId, companyId]
+          )
+        : { rows: [] };
 
-    const purchasesTable = await pool.query("SELECT to_regclass('public.purchases') AS table_name");
+    const documentsResult = documentsHasPartner
+      ? await pool.query(
+          `SELECT id, document_type, document_number, client_name, total_amount,
+                  status, created_by, created_at
+           FROM documents
+           WHERE partner_id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}
+           ORDER BY id DESC
+           LIMIT 100`,
+          isSuperAdmin ? [partnerId] : [partnerId, companyId]
+        )
+      : { rows: [] };
+
+    const purchasesExists = await tableExists("purchases");
     let purchases = [];
 
-    if (purchasesTable.rows[0]?.table_name) {
+    if (purchasesExists) {
       const purchasesResult = await pool.query(
         `SELECT *
          FROM purchases
