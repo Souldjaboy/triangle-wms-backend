@@ -4156,9 +4156,12 @@ app.post("/pos/sales/:id/cancel", authenticateToken, async (req, res) => {
 
 app.get("/pos/receipts/:id", authenticateToken, async (req, res) => {
   try {
+    const isSuperAdmin = req.user.is_super_admin === true;
     const result = await pool.query(
-      "SELECT * FROM receipts WHERE id=$1",
-      [req.params.id]
+      `SELECT *
+       FROM receipts
+       WHERE id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}`,
+      isSuperAdmin ? [req.params.id] : [req.params.id, req.user.company_id || null]
     );
 
     if (result.rows.length === 0) {
@@ -8198,9 +8201,53 @@ app.delete("/partners/:id", authenticateToken, async (req, res) => {
   try {
     const companyId = req.user.company_id;
     const isSuperAdmin = req.user.is_super_admin === true;
+    const partnerId = req.params.id;
+
+    const partnerResult = await pool.query(
+      `SELECT *
+       FROM partners
+       WHERE id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}
+       LIMIT 1`,
+      isSuperAdmin ? [partnerId] : [partnerId, companyId]
+    );
+
+    const partner = partnerResult.rows[0];
+
+    if (!partner) {
+      return res.status(404).json({ error: "Partenaire introuvable" });
+    }
+
+    const usageChecks = await Promise.all([
+      pool.query("SELECT COUNT(*)::int AS count FROM sales WHERE client_id=$1", [partnerId]),
+      pool.query("SELECT COUNT(*)::int AS count FROM products WHERE supplier_id=$1", [partnerId]),
+      pool.query("SELECT COUNT(*)::int AS count FROM product_batches WHERE supplier_id=$1", [partnerId])
+    ]);
+
+    const usageCount = usageChecks.reduce(
+      (sum, result) => sum + Number(result.rows[0]?.count || 0),
+      0
+    );
+
+    if (usageCount > 0) {
+      const disabled = await pool.query(
+        `UPDATE partners
+         SET status='inactive'
+         WHERE id=$1
+         RETURNING *`,
+        [partnerId]
+      );
+      await logAudit(req, "partner_disabled_instead_of_delete", "partner", partnerId, {
+        usage_count: usageCount
+      });
+
+      return res.json({
+        message: "Partenaire utilisé dans l’historique : il a été désactivé au lieu d’être supprimé.",
+        partner: disabled.rows[0]
+      });
+    }
 
     let query = `DELETE FROM partners WHERE id=$1`;
-    const values = [req.params.id];
+    const values = [partnerId];
 
     if (!isSuperAdmin) {
       query += ` AND company_id=$2`;
@@ -8210,6 +8257,10 @@ app.delete("/partners/:id", authenticateToken, async (req, res) => {
     query += ` RETURNING *`;
 
     const result = await pool.query(query, values);
+    await logAudit(req, "partner_deleted", "partner", partnerId, {
+      name: partner.name,
+      type: partner.type
+    });
 
     res.json({
       message: "Partenaire supprimé",
