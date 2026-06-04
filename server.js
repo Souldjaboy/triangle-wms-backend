@@ -647,6 +647,105 @@ async function logAudit(req, action, entityType = "", entityId = null, details =
   }
 }
 
+function generateOtpCode() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+function hashVerificationSecret(value) {
+  return crypto
+    .createHash("sha256")
+    .update(`${String(value || "")}:${process.env.JWT_SECRET || JWT_SECRET}`)
+    .digest("hex");
+}
+
+function supportWhatsAppUrl() {
+  const number = String(process.env.SUPPORT_WHATSAPP_NUMBER || "").replace(/[^0-9]/g, "");
+  if (!number) return "";
+  const text = encodeURIComponent("Bonjour Triangle WMS Pro, j'ai besoin d'aide");
+  return `https://wa.me/${number}?text=${text}`;
+}
+
+function publicAppUrl() {
+  return String(process.env.APP_URL || process.env.PUBLIC_BASE_URL || process.env.FRONTEND_URL || "https://trianglewmspro.com").replace(/\/$/, "");
+}
+
+async function createVerificationCode({ companyId, userId, targetType, targetValue }) {
+  const code = generateOtpCode();
+  const token = crypto.randomBytes(24).toString("hex");
+  const codeHash = await bcrypt.hash(code, BCRYPT_ROUNDS);
+  const tokenHash = hashVerificationSecret(token);
+
+  await pool.query(
+    `INSERT INTO verification_codes
+     (company_id, user_id, target_type, target_value, code_hash, token_hash, expires_at)
+     VALUES ($1,$2,$3,$4,$5,$6,NOW() + INTERVAL '10 minutes')`,
+    [companyId || null, userId || null, targetType, targetValue, codeHash, tokenHash]
+  );
+
+  return {
+    code,
+    token,
+    verify_url: `${publicAppUrl()}/verify-${targetType}?token=${token}`
+  };
+}
+
+async function sendVerificationMessage({ targetType, targetValue, code, verifyUrl }) {
+  const isProduction = process.env.NODE_ENV === "production";
+
+  if (targetType === "email") {
+    if (!process.env.SMTP_HOST) {
+      return {
+        sent: false,
+        provider: "sandbox",
+        message: "SMTP non configuré. Code créé en base.",
+        sandbox_code: isProduction ? undefined : code,
+        verify_url: isProduction ? undefined : verifyUrl
+      };
+    }
+
+    console.log("EMAIL OTP prêt à envoyer :", { targetValue, verifyUrl });
+    return { sent: false, provider: process.env.EMAIL_PROVIDER || "smtp", message: "Provider email préparé." };
+  }
+
+  if ((process.env.SMS_PROVIDER || "sandbox") === "sandbox" || !process.env.SMS_API_KEY) {
+    return {
+      sent: false,
+      provider: "sandbox",
+      message: "SMS sandbox. Code créé en base.",
+      sandbox_code: isProduction ? undefined : code
+    };
+  }
+
+  console.log("SMS OTP prêt à envoyer :", { targetValue });
+  return { sent: false, provider: process.env.SMS_PROVIDER, message: "Provider SMS préparé." };
+}
+
+async function activateVerifiedAccount({ companyId, userId, targetType }) {
+  const userColumn = targetType === "phone" ? "phone_verified" : "email_verified";
+  const companyColumn = targetType === "phone" ? "phone_verified" : "email_verified";
+
+  await pool.query(
+    `UPDATE users
+     SET ${userColumn}=true,
+         account_status='active',
+         verification_required=false,
+         invitation_status=CASE WHEN invitation_status='pending_verification' THEN 'active' ELSE invitation_status END,
+         updated_at=CURRENT_TIMESTAMP
+     WHERE id=$1`,
+    [userId]
+  );
+
+  await pool.query(
+    `UPDATE companies
+     SET ${companyColumn}=true,
+         account_status='active',
+         subscription_status=COALESCE(NULLIF(subscription_status,''), 'trial'),
+         updated_at=CURRENT_TIMESTAMP
+     WHERE id=$1`,
+    [companyId]
+  );
+}
+
 async function createNotification({
   user_id,
   title,
@@ -1096,9 +1195,12 @@ app.post("/register-saas", async (req, res) => {
       selected_modules = {}
     } = req.body;
 
-    if (!company_name || !responsible_name || !email || !password) {
+    const cleanEmail = String(email || "").trim().toLowerCase();
+    const cleanPhone = String(phone || "").trim();
+
+    if (!company_name || !responsible_name || !password || (!cleanEmail && !cleanPhone)) {
       return res.status(400).json({
-        error: "Informations obligatoires manquantes."
+        error: "Nom entreprise, responsable, mot de passe et au moins un contact email ou téléphone sont obligatoires."
       });
     }
 
@@ -1162,17 +1264,21 @@ app.post("/register-saas", async (req, res) => {
       `
       SELECT id
       FROM users
-      WHERE email = $1
+      WHERE LOWER(email) = LOWER($1)
+         OR ($2 <> '' AND regexp_replace(COALESCE(phone,''), '[^0-9+]', '', 'g') = regexp_replace($2, '[^0-9+]', '', 'g'))
       LIMIT 1
       `,
-      [email]
+      [cleanEmail || `phone-${cleanPhone}@pending.trianglewmspro.local`, cleanPhone]
     );
 
     if (existingUser.rows.length > 0) {
       return res.status(400).json({
-        error: "Cet email existe déjà."
+        error: "Cet email ou téléphone existe déjà."
       });
     }
+
+    const trialDays = Number(plan.trial_days || 15);
+    const generatedEmail = cleanEmail || `phone-${crypto.randomBytes(8).toString("hex")}@pending.trianglewmspro.local`;
 
     const companyResult = await pool.query(
       `
@@ -1186,21 +1292,32 @@ app.post("/register-saas", async (req, res) => {
         address,
         plan_id,
         subscription_status,
-        trial_ends_at
+        trial_ends_at,
+        email_verified,
+        phone_verified,
+        account_status,
+        trial_start_date,
+        trial_end_date,
+        subscription_plan,
+        subscription_expires_at
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW() + ($9 || ' days')::interval)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW() + ($9 || ' days')::interval,$10,$11,$12,NOW(),NOW() + ($9 || ' days')::interval,$13,NOW() + ($9 || ' days')::interval)
       RETURNING *
       `,
       [
         company_name,
         business_type || "",
         responsible_name,
-        email,
-        phone || "",
+        cleanEmail,
+        cleanPhone,
         address || "",
         plan.id,
         "trial",
-        Number(plan.trial_days || 15)
+        trialDays,
+        false,
+        false,
+        "pending_verification",
+        plan.name || plan_name || ""
       ]
     );
 
@@ -1217,19 +1334,31 @@ app.post("/register-saas", async (req, res) => {
         role,
         company_id,
         is_super_admin,
-        badge_code
+        badge_code,
+        phone,
+        email_verified,
+        phone_verified,
+        account_status,
+        invitation_status,
+        verification_required
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
       RETURNING *
       `,
       [
         responsible_name,
-        email,
+        generatedEmail,
         hashedPassword,
         "admin",
         company.id,
         false,
-        `TRIANGLE-EMP-${company.id}-${Date.now()}`
+        `TRIANGLE-EMP-${company.id}-${Date.now()}`,
+        cleanPhone,
+        false,
+        false,
+        "pending_verification",
+        "pending_verification",
+        true
       ]
     );
 
@@ -1256,6 +1385,21 @@ app.post("/register-saas", async (req, res) => {
         "free_trial"
       ]
     );
+
+    const targetType = cleanEmail ? "email" : "phone";
+    const targetValue = cleanEmail || cleanPhone;
+    const verification = await createVerificationCode({
+      companyId: company.id,
+      userId: user.id,
+      targetType,
+      targetValue
+    });
+    const delivery = await sendVerificationMessage({
+      targetType,
+      targetValue,
+      code: verification.code,
+      verifyUrl: verification.verify_url
+    });
 
     const requestedModules =
       Array.isArray(selected_modules)
@@ -1293,10 +1437,17 @@ app.post("/register-saas", async (req, res) => {
 
     res.status(201).json({
       success: true,
-      message: "Entreprise créée avec succès. Essai gratuit activé.",
+      message: "Entreprise créée. Vérification obligatoire avant accès complet.",
       company,
       user,
-      plan
+      plan,
+      verification: {
+        required: true,
+        target_type: targetType,
+        target_value: targetValue,
+        delivery,
+        verify_url: verification.verify_url
+      }
     });
   } catch (error) {
     console.error("ERREUR REGISTER SAAS :", error);
@@ -1332,6 +1483,11 @@ app.post("/login", async (req, res) => {
         u.*,
         c.name AS company_name,
         c.status AS company_status,
+        c.account_status AS company_account_status,
+        c.email_verified AS company_email_verified,
+        c.phone_verified AS company_phone_verified,
+        c.trial_end_date AS company_trial_end_date,
+        c.subscription_expires_at AS company_subscription_expires_at,
         s.status AS subscription_status,
         s.end_date AS subscription_end_date,
         sp.name AS plan_name
@@ -1376,9 +1532,45 @@ app.post("/login", async (req, res) => {
       SUPER_ADMIN_EMAILS.has(String(user.email || "").trim().toLowerCase());
 
     if (!isSuperAdmin) {
+      const userVerified = user.email_verified === true || user.phone_verified === true;
+      const companyVerified =
+        user.company_email_verified === true || user.company_phone_verified === true;
+      const accountPending =
+        String(user.account_status || "").toLowerCase() === "pending_verification" ||
+        String(user.company_account_status || "").toLowerCase() === "pending_verification" ||
+        user.verification_required === true;
+
+      if (!userVerified || !companyVerified || accountPending) {
+        return res.status(403).json({
+          error: "Vérification obligatoire avant connexion complète.",
+          code: "verification_required",
+          redirect: "/verification-required",
+          user_id: user.id,
+          company_id: user.company_id,
+          target_type: user.email && !String(user.email).includes("@pending.trianglewmspro.local") ? "email" : "phone",
+          target_value: user.email && !String(user.email).includes("@pending.trianglewmspro.local") ? user.email : user.phone
+        });
+      }
+
       if (user.company_status === "suspended") {
         return res.status(403).json({
           error: "Entreprise suspendue. Veuillez contacter l’administration."
+        });
+      }
+
+      const subscriptionEnd =
+        user.company_subscription_expires_at ||
+        user.company_trial_end_date ||
+        user.subscription_end_date;
+      if (subscriptionEnd && new Date(subscriptionEnd).getTime() < Date.now()) {
+        await pool.query(
+          "UPDATE companies SET subscription_status='expired' WHERE id=$1",
+          [user.company_id]
+        ).catch(() => {});
+        return res.status(403).json({
+          error: "Votre essai gratuit ou abonnement est terminé.",
+          code: "subscription_expired",
+          redirect: "/abonnement-expire"
         });
       }
 
@@ -1437,6 +1629,8 @@ app.post("/login", async (req, res) => {
         is_super_admin: isSuperAdmin,
         subscription_status: user.subscription_status || "",
         subscription_end_date: user.subscription_end_date || "",
+        trial_end_date: user.company_trial_end_date || "",
+        subscription_expires_at: user.company_subscription_expires_at || "",
         plan_name: user.plan_name || "",
         profile_image_url: user.profile_image_url || "",
         force_password_change: user.force_password_change === true,
@@ -1446,6 +1640,189 @@ app.post("/login", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Erreur login SaaS" });
+  }
+});
+
+app.get("/support/config", async (req, res) => {
+  res.json({
+    whatsapp_url: supportWhatsAppUrl(),
+    whatsapp_enabled: Boolean(supportWhatsAppUrl())
+  });
+});
+
+app.post("/support/contact", async (req, res) => {
+  try {
+    const { name, entreprise, company_id, user_id, email, phone, message, page_actuelle, source_page } = req.body;
+
+    if (!message || String(message).trim().length < 3) {
+      return res.status(400).json({ error: "Message support obligatoire." });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO support_requests
+       (company_id, user_id, name, email, phone, message, source_page, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'nouveau')
+       RETURNING *`,
+      [
+        optionalNumber(company_id),
+        optionalNumber(user_id),
+        name || entreprise || "",
+        email || "",
+        phone || "",
+        message,
+        source_page || page_actuelle || ""
+      ]
+    );
+
+    res.status(201).json({
+      success: true,
+      request: result.rows[0],
+      whatsapp_url: supportWhatsAppUrl()
+    });
+  } catch (error) {
+    console.error("ERREUR SUPPORT CONTACT :", error);
+    res.status(500).json({ error: "Erreur demande support" });
+  }
+});
+
+app.post("/verification/verify", async (req, res) => {
+  try {
+    const { code, token, target_type, target_value, user_id } = req.body;
+
+    if (!code && !token) {
+      return res.status(400).json({ error: "Code ou token obligatoire." });
+    }
+
+    const values = [];
+    let filter = "used_at IS NULL AND expires_at > NOW()";
+
+    if (token) {
+      values.push(hashVerificationSecret(token));
+      filter += ` AND token_hash=$${values.length}`;
+    } else {
+      if (target_type) {
+        values.push(target_type);
+        filter += ` AND target_type=$${values.length}`;
+      }
+      if (target_value) {
+        values.push(target_value);
+        filter += ` AND target_value=$${values.length}`;
+      }
+      if (user_id) {
+        values.push(Number(user_id));
+        filter += ` AND user_id=$${values.length}`;
+      }
+    }
+
+    const result = await pool.query(
+      `SELECT * FROM verification_codes
+       WHERE ${filter}
+       ORDER BY id DESC
+       LIMIT 1`,
+      values
+    );
+
+    const verification = result.rows[0];
+
+    if (!verification) {
+      return res.status(400).json({ error: "Code expiré ou introuvable." });
+    }
+
+    if (Number(verification.attempts || 0) >= 5) {
+      return res.status(429).json({ error: "Trop de tentatives. Demandez un nouveau code." });
+    }
+
+    if (code) {
+      const validCode = await bcrypt.compare(String(code || ""), verification.code_hash);
+      if (!validCode) {
+        await pool.query(
+          "UPDATE verification_codes SET attempts=attempts+1 WHERE id=$1",
+          [verification.id]
+        );
+        return res.status(400).json({ error: "Code incorrect." });
+      }
+    }
+
+    await pool.query(
+      "UPDATE verification_codes SET used_at=NOW() WHERE id=$1",
+      [verification.id]
+    );
+    await activateVerifiedAccount({
+      companyId: verification.company_id,
+      userId: verification.user_id,
+      targetType: verification.target_type
+    });
+
+    await logAudit(
+      { ...req, user: { id: verification.user_id, company_id: verification.company_id, role: "verification" } },
+      `verify_${verification.target_type}`,
+      "verification_code",
+      verification.id,
+      { target_type: verification.target_type }
+    );
+
+    res.json({
+      success: true,
+      message: "Vérification réussie. Vous pouvez vous connecter.",
+      redirect: "/login"
+    });
+  } catch (error) {
+    console.error("ERREUR VERIFICATION :", error);
+    res.status(500).json({ error: "Erreur vérification" });
+  }
+});
+
+app.post("/verification/resend", async (req, res) => {
+  try {
+    const { target_type, target_value, user_id } = req.body;
+    const targetType = target_type === "phone" ? "phone" : "email";
+    const targetValue = String(target_value || "").trim();
+
+    if (!targetValue && !user_id) {
+      return res.status(400).json({ error: "Contact ou utilisateur obligatoire." });
+    }
+
+    const userResult = await pool.query(
+      `SELECT id, company_id, email, phone
+       FROM users
+       WHERE ($1::int IS NOT NULL AND id=$1)
+          OR ($2 <> '' AND LOWER(email)=LOWER($2))
+          OR ($3 <> '' AND regexp_replace(COALESCE(phone,''), '[^0-9+]', '', 'g') = regexp_replace($3, '[^0-9+]', '', 'g'))
+       LIMIT 1`,
+      [
+        optionalNumber(user_id),
+        targetType === "email" ? targetValue : "",
+        targetType === "phone" ? targetValue : ""
+      ]
+    );
+
+    const user = userResult.rows[0];
+    if (!user) return res.status(404).json({ error: "Utilisateur introuvable." });
+
+    const finalTargetValue = targetType === "phone" ? user.phone : user.email;
+    const verification = await createVerificationCode({
+      companyId: user.company_id,
+      userId: user.id,
+      targetType,
+      targetValue: finalTargetValue
+    });
+    const delivery = await sendVerificationMessage({
+      targetType,
+      targetValue: finalTargetValue,
+      code: verification.code,
+      verifyUrl: verification.verify_url
+    });
+
+    res.json({
+      success: true,
+      message: "Nouveau code généré.",
+      target_type: targetType,
+      target_value: finalTargetValue,
+      delivery
+    });
+  } catch (error) {
+    console.error("ERREUR RESEND VERIFICATION :", error);
+    res.status(500).json({ error: "Erreur renvoi code" });
   }
 });
 
