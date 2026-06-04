@@ -180,15 +180,14 @@ function getCompanyFilter(req) {
   const userIsSuperAdmin =
     req.user?.is_super_admin === true ||
     normalizeRole(req.user?.role) === "super_admin";
-  const requestedCompanyId = req.headers["x-company-id"];
-  const companyId =
-    userIsSuperAdmin && requestedCompanyId
-      ? requestedCompanyId
-      : req.user?.company_id || null;
+  const companyId = userIsSuperAdmin
+    ? getEffectiveCompanyId(req)
+    : req.user?.company_id || null;
 
   return {
     companyId,
-    isSuperAdmin: userIsSuperAdmin
+    isSuperAdmin: userIsSuperAdmin,
+    shouldFilterByCompany: !userIsSuperAdmin || Boolean(companyId)
   };
 }
 
@@ -211,6 +210,19 @@ function getEffectiveCompanyId(req, fallback = null) {
     return getRequestedActiveCompanyId(req) || Number(req.user?.company_id || 0) || fallback || null;
   }
   return Number(req.user?.company_id || 0) || fallback || null;
+}
+
+async function getCompanySettingsForCompany(clientOrPool, companyId) {
+  const result = await clientOrPool.query(
+    `SELECT *
+     FROM company_settings
+     WHERE ($1::int IS NULL OR company_id=$1)
+     ORDER BY CASE WHEN company_id=$1 THEN 0 ELSE 1 END, id ASC
+     LIMIT 1`,
+    [companyId || null]
+  );
+
+  return result.rows[0] || null;
 }
 
 function normalizeRole(role) {
@@ -3524,7 +3536,7 @@ app.put("/stock-movements/:id/reject", authenticateToken, async (req, res) => {
 /* POS / CAISSE */
 app.get("/pos/products/search", authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.company_id;
+    const companyId = getEffectiveCompanyId(req);
     const isSuperAdmin = req.user.is_super_admin === true;
     const q = String(req.query.q || "").trim();
     const search = `%${q}%`;
@@ -3575,7 +3587,7 @@ app.get("/pos/products/search", authenticateToken, async (req, res) => {
 
 app.get("/pos/settings", authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.company_id;
+    const companyId = getEffectiveCompanyId(req);
     const result = await pool.query(
       `INSERT INTO pos_settings (company_id, default_tax_rate)
        VALUES ($1, 18)
@@ -3597,7 +3609,7 @@ app.put(
   authorizeRoles("admin", "super_admin"),
   async (req, res) => {
     try {
-      const companyId = req.user.company_id;
+      const companyId = getEffectiveCompanyId(req);
       const {
         pos_enabled,
         default_tax_rate,
@@ -3657,7 +3669,7 @@ app.put(
   authorizeRoles("admin", "super_admin"),
   async (req, res) => {
     try {
-      const companyId = req.user.company_id;
+      const companyId = getEffectiveCompanyId(req);
       const isSuperAdmin = req.user.is_super_admin === true;
       const {
         purchase_price,
@@ -3745,10 +3757,11 @@ app.put(
 
 app.get("/pos/alerts", authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.company_id;
+    const companyId = getEffectiveCompanyId(req);
     const isSuperAdmin = req.user.is_super_admin === true;
-    const values = isSuperAdmin ? [] : [companyId];
-    const companyClause = isSuperAdmin ? "" : "AND company_id=$1";
+    const shouldFilterByCompany = !isSuperAdmin || Boolean(companyId);
+    const values = shouldFilterByCompany ? [companyId] : [];
+    const companyClause = shouldFilterByCompany ? "AND company_id=$1" : "";
 
     const lowStock = await pool.query(
       `SELECT 'stock_faible' AS type, id, reference, name, stock, minimum_stock
@@ -3809,7 +3822,7 @@ app.get("/pos/payment-settings", authenticateToken, async (req, res) => {
       return res.status(403).json({ error: "Accès admin requis." });
     }
 
-    const companyId = req.user.company_id;
+    const companyId = getEffectiveCompanyId(req);
     const result = await pool.query(
       `SELECT id, company_id, provider_key, provider, public_key,
               secret_key_encrypted, client_id, client_secret_encrypted,
@@ -3846,7 +3859,7 @@ app.put("/pos/payment-settings", authenticateToken, async (req, res) => {
       return res.status(403).json({ error: "Accès admin requis." });
     }
 
-    const companyId = req.user.company_id;
+    const companyId = getEffectiveCompanyId(req);
     const {
       provider_key,
       provider,
@@ -3962,7 +3975,7 @@ app.post("/pos/payment-settings/test", authenticateToken, async (req, res) => {
     }
 
     const { provider_key } = req.body;
-    const companyId = req.user.company_id;
+    const companyId = getEffectiveCompanyId(req);
 
     const result = await pool.query(
       `UPDATE payment_settings
@@ -3990,7 +4003,7 @@ app.post("/pos/payment-settings/test", authenticateToken, async (req, res) => {
 
 app.get("/products/:id/batches", authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.company_id;
+    const companyId = getEffectiveCompanyId(req);
     const isSuperAdmin = req.user.is_super_admin === true;
 
     const result = await pool.query(
@@ -4015,7 +4028,7 @@ app.post("/products/:id/batches", authenticateToken, async (req, res) => {
       return res.status(403).json({ error: "Vous avez un accès lecture seule." });
     }
 
-    const companyId = req.user.company_id;
+    const companyId = getEffectiveCompanyId(req);
     const {
       lot_number,
       supplier_id,
@@ -4220,9 +4233,7 @@ async function finalizePaidPosSale(client, saleId, user = {}) {
   }
 
   const receiptNumber = `REC-${new Date().getFullYear()}-${String(sale.id).padStart(6, "0")}`;
-  const companySettingsResult = await client.query(
-    "SELECT * FROM company_settings ORDER BY id ASC LIMIT 1"
-  );
+  const companySettings = await getCompanySettingsForCompany(client, sale.company_id);
 
   const updatedSaleResult = await client.query(
     `UPDATE sales
@@ -4258,7 +4269,7 @@ async function finalizePaidPosSale(client, saleId, user = {}) {
         JSON.stringify({
           sale: updatedSale,
           items: saleItems,
-          company_settings: companySettingsResult.rows[0] || null
+          company_settings: companySettings
         }),
         Number(sale.total_amount || 0),
         sale.payment_method,
@@ -4319,7 +4330,7 @@ async function finalizePaidPosSale(client, saleId, user = {}) {
     sale: updatedSale,
     items: saleItems,
     receipt,
-    company_settings: companySettingsResult.rows[0] || null
+    company_settings: companySettings
   };
 }
 
@@ -4383,7 +4394,7 @@ app.get("/pos/caisses", authenticateToken, async (req, res) => {
       return res.status(403).json({ error: "Accès POS refusé." });
     }
 
-    const companyId = req.user.company_id || null;
+    const companyId = getEffectiveCompanyId(req);
     const isManager = canManageCaisses(req.user);
     const values = [];
     let query = `
@@ -4393,7 +4404,7 @@ app.get("/pos/caisses", authenticateToken, async (req, res) => {
       WHERE c.actif=true
     `;
 
-    if (!req.user.is_super_admin) {
+    if (!req.user.is_super_admin || companyId) {
       values.push(companyId);
       query += ` AND (c.company_id=$${values.length} OR c.company_id IS NULL)`;
     }
@@ -4426,7 +4437,7 @@ app.post("/pos/caisses", authenticateToken, async (req, res) => {
        VALUES ($1,$2,$3,'fermée',$4,$4)
        RETURNING *`,
       [
-        req.user.company_id || null,
+        getEffectiveCompanyId(req),
         nom_caisse || "Caisse principale",
         code_caisse || `CAISSE-${Date.now()}`,
         Number(solde_initial || 0)
@@ -4455,7 +4466,7 @@ app.put("/pos/caisses/:id", authenticateToken, async (req, res) => {
     `;
 
     if (!req.user.is_super_admin) {
-      values.push(req.user.company_id || null);
+      values.push(getEffectiveCompanyId(req));
       query += " AND company_id=$5";
     }
 
@@ -4479,7 +4490,7 @@ app.delete("/pos/caisses/:id", authenticateToken, async (req, res) => {
     let query = "UPDATE caisses SET actif=false, updated_at=CURRENT_TIMESTAMP WHERE id=$1";
 
     if (!req.user.is_super_admin) {
-      values.push(req.user.company_id || null);
+      values.push(getEffectiveCompanyId(req));
       query += " AND company_id=$2";
     }
 
@@ -4551,11 +4562,11 @@ app.get("/pos/caisses/report", authenticateToken, async (req, res) => {
     }
 
     const { date_from, date_to } = req.query;
-    const companyId = req.user.company_id || null;
+    const companyId = getEffectiveCompanyId(req);
     const values = [];
     let filter = "WHERE c.actif=true";
 
-    if (!req.user.is_super_admin) {
+    if (!req.user.is_super_admin || companyId) {
       values.push(companyId);
       filter += ` AND (c.company_id=$${values.length} OR c.company_id IS NULL)`;
     }
@@ -4608,7 +4619,12 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
       return res.status(403).json({ error: "Accès POS refusé." });
     }
 
-    const companyId = req.user.company_id;
+    const companyId = getEffectiveCompanyId(req);
+    if (!companyId) {
+      return res.status(400).json({
+        error: "Entreprise active introuvable. Sélectionnez une entreprise avant de vendre."
+      });
+    }
     const {
       customer_name,
       customer_phone,
@@ -5010,9 +5026,7 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
       [paymentTransaction?.id || null, paymentReference || saleNumber, sale.id]
     );
 
-    const companySettingsResult = await client.query(
-      "SELECT * FROM company_settings ORDER BY id ASC LIMIT 1"
-    );
+    const companySettings = await getCompanySettingsForCompany(client, companyId);
     let receipt = null;
 
     if (shouldFinalizeImmediately) {
@@ -5030,7 +5044,7 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
           JSON.stringify({
             sale: updatedSale.rows[0],
             items: saleItems,
-            company_settings: companySettingsResult.rows[0] || null
+            company_settings: companySettings
           }),
           totalAmount,
           payment_method,
@@ -5095,7 +5109,7 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
       sale: updatedSale.rows[0],
       items: saleItems,
       receipt,
-      company_settings: companySettingsResult.rows[0] || null,
+      company_settings: companySettings,
       payment_transaction: paymentTransaction,
       payment_required: requestedPaymentStatus !== "payé"
     });
@@ -5110,8 +5124,9 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
 
 app.get("/pos/sales", authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.company_id;
+    const companyId = getEffectiveCompanyId(req);
     const isSuperAdmin = req.user.is_super_admin === true;
+    const shouldFilterByCompany = !isSuperAdmin || Boolean(companyId);
     const {
       q = "",
       date_from,
@@ -5131,7 +5146,7 @@ app.get("/pos/sales", authenticateToken, async (req, res) => {
                  LEFT JOIN caisses c ON c.id = sales.caisse_id
                  WHERE 1=1`;
 
-    if (!isSuperAdmin) {
+    if (shouldFilterByCompany) {
       values.push(companyId);
       query += ` AND sales.company_id=$${values.length}`;
     }
@@ -5206,13 +5221,14 @@ app.get("/pos/sales", authenticateToken, async (req, res) => {
 
 app.get("/pos/sales-summary", authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.company_id;
+    const companyId = getEffectiveCompanyId(req);
     const isSuperAdmin = req.user.is_super_admin === true;
+    const shouldFilterByCompany = !isSuperAdmin || Boolean(companyId);
     const { date_from, date_to, payment_method, status, cash_register_id } = req.query;
     const values = [];
     let where = "WHERE 1=1";
 
-    if (!isSuperAdmin) {
+    if (shouldFilterByCompany) {
       values.push(companyId);
       where += ` AND sales.company_id=$${values.length}`;
     }
@@ -5295,14 +5311,15 @@ app.get("/pos/sales-summary", authenticateToken, async (req, res) => {
 
 app.get("/pos/sales/:id", authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.company_id;
+    const companyId = getEffectiveCompanyId(req);
     const isSuperAdmin = req.user.is_super_admin === true;
+    const shouldFilterByCompany = !isSuperAdmin || Boolean(companyId);
 
     const saleResult = await pool.query(
       `SELECT *
        FROM sales
-       WHERE id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}`,
-      isSuperAdmin ? [req.params.id] : [req.params.id, companyId]
+       WHERE id=$1 ${shouldFilterByCompany ? "AND company_id=$2" : ""}`,
+      shouldFilterByCompany ? [req.params.id, companyId] : [req.params.id]
     );
 
     if (saleResult.rows.length === 0) {
@@ -5317,15 +5334,13 @@ app.get("/pos/sales/:id", authenticateToken, async (req, res) => {
       "SELECT * FROM receipts WHERE sale_id=$1 ORDER BY id DESC LIMIT 1",
       [req.params.id]
     );
-    const companySettingsResult = await pool.query(
-      "SELECT * FROM company_settings ORDER BY id ASC LIMIT 1"
-    );
+    const companySettings = await getCompanySettingsForCompany(pool, saleResult.rows[0].company_id || companyId);
 
     res.json({
       sale: saleResult.rows[0],
       items: itemsResult.rows,
       receipt: receiptResult.rows[0] || null,
-      company_settings: companySettingsResult.rows[0] || null
+      company_settings: companySettings
     });
   } catch (error) {
     console.error("ERREUR POS SALE DETAIL :", error);
@@ -5341,16 +5356,17 @@ app.post("/pos/sales/:id/cancel", authenticateToken, async (req, res) => {
       return res.status(403).json({ error: "Seul un admin peut annuler une vente." });
     }
 
-    const companyId = req.user.company_id;
+    const companyId = getEffectiveCompanyId(req);
+    const shouldFilterByCompany = req.user.is_super_admin !== true || Boolean(companyId);
     const { reason } = req.body;
 
     await client.query("BEGIN");
 
     const saleResult = await client.query(
       `SELECT * FROM sales
-       WHERE id=$1 ${req.user.is_super_admin === true ? "" : "AND company_id=$2"}
+       WHERE id=$1 ${shouldFilterByCompany ? "AND company_id=$2" : ""}
        FOR UPDATE`,
-      req.user.is_super_admin === true ? [req.params.id] : [req.params.id, companyId]
+      shouldFilterByCompany ? [req.params.id, companyId] : [req.params.id]
     );
     const sale = saleResult.rows[0];
 
@@ -5406,11 +5422,13 @@ app.post("/pos/sales/:id/cancel", authenticateToken, async (req, res) => {
 app.get("/pos/receipts/:id", authenticateToken, async (req, res) => {
   try {
     const isSuperAdmin = req.user.is_super_admin === true;
+    const companyId = getEffectiveCompanyId(req);
+    const shouldFilterByCompany = !isSuperAdmin || Boolean(companyId);
     const result = await pool.query(
       `SELECT *
        FROM receipts
-       WHERE id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}`,
-      isSuperAdmin ? [req.params.id] : [req.params.id, req.user.company_id || null]
+       WHERE id=$1 ${shouldFilterByCompany ? "AND company_id=$2" : ""}`,
+      shouldFilterByCompany ? [req.params.id, companyId] : [req.params.id]
     );
 
     if (result.rows.length === 0) {
@@ -5430,8 +5448,9 @@ app.get("/pos/reports/daily", authenticateToken, async (req, res) => {
       return res.status(403).json({ error: "Accès refusé : module réservé à la direction" });
     }
 
-    const companyId = req.user.company_id;
+    const companyId = getEffectiveCompanyId(req);
     const isSuperAdmin = req.user.is_super_admin === true;
+    const shouldFilterByCompany = !isSuperAdmin || Boolean(companyId);
     const date = req.query.date || new Date().toISOString().slice(0, 10);
 
     const sales = await pool.query(
@@ -5439,8 +5458,8 @@ app.get("/pos/reports/daily", authenticateToken, async (req, res) => {
               COALESCE(SUM(total_amount),0)::numeric AS revenue
        FROM sales
        WHERE DATE(created_at)=$1
-       ${isSuperAdmin ? "" : "AND company_id=$2"}`,
-      isSuperAdmin ? [date] : [date, companyId]
+       ${shouldFilterByCompany ? "AND company_id=$2" : ""}`,
+      shouldFilterByCompany ? [date, companyId] : [date]
     );
 
     const payments = await pool.query(
@@ -5448,10 +5467,10 @@ app.get("/pos/reports/daily", authenticateToken, async (req, res) => {
               COALESCE(SUM(total_amount),0)::numeric AS total
        FROM sales
        WHERE DATE(created_at)=$1
-       ${isSuperAdmin ? "" : "AND company_id=$2"}
+       ${shouldFilterByCompany ? "AND company_id=$2" : ""}
        GROUP BY payment_method
        ORDER BY total DESC`,
-      isSuperAdmin ? [date] : [date, companyId]
+      shouldFilterByCompany ? [date, companyId] : [date]
     );
 
     res.json({
@@ -5486,7 +5505,7 @@ app.post("/pos/payments", authenticateToken, async (req, res) => {
        VALUES ($1,$2,'FCFA',$3,$4,$5,CURRENT_TIMESTAMP,$6,$4)
        RETURNING *`,
       [
-        req.user.company_id || null,
+        getEffectiveCompanyId(req),
         Number(amount || 0),
         payment_method,
         payment_status,
@@ -5504,16 +5523,17 @@ app.post("/pos/payments", authenticateToken, async (req, res) => {
 
 app.get("/payments", authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.company_id;
+    const companyId = getEffectiveCompanyId(req);
     const isSuperAdmin = req.user.is_super_admin === true;
+    const shouldFilterByCompany = !isSuperAdmin || Boolean(companyId);
     const result = await pool.query(
       `SELECT pt.*, s.sale_number, s.customer_name
        FROM payment_transactions pt
        LEFT JOIN sales s ON s.id = pt.sale_id
-       WHERE 1=1 ${isSuperAdmin ? "" : "AND pt.company_id=$1"}
+       WHERE 1=1 ${shouldFilterByCompany ? "AND pt.company_id=$1" : ""}
        ORDER BY pt.id DESC
        LIMIT 200`,
-      isSuperAdmin ? [] : [companyId]
+      shouldFilterByCompany ? [companyId] : []
     );
 
     res.json(result.rows);
@@ -5525,14 +5545,15 @@ app.get("/payments", authenticateToken, async (req, res) => {
 
 app.get("/payments/:id", authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.company_id;
+    const companyId = getEffectiveCompanyId(req);
     const isSuperAdmin = req.user.is_super_admin === true;
+    const shouldFilterByCompany = !isSuperAdmin || Boolean(companyId);
     const result = await pool.query(
       `SELECT pt.*, s.sale_number, s.customer_name
        FROM payment_transactions pt
        LEFT JOIN sales s ON s.id = pt.sale_id
-       WHERE pt.id=$1 ${isSuperAdmin ? "" : "AND pt.company_id=$2"}`,
-      isSuperAdmin ? [req.params.id] : [req.params.id, companyId]
+       WHERE pt.id=$1 ${shouldFilterByCompany ? "AND pt.company_id=$2" : ""}`,
+      shouldFilterByCompany ? [req.params.id, companyId] : [req.params.id]
     );
 
     if (result.rows.length === 0) {
@@ -5571,7 +5592,7 @@ app.post("/payments/initiate", authenticateToken, async (req, res) => {
        VALUES ($1,$2,$3,$4,$5,$6,'pending',$7,$8,$9,$10,$11,$11,$12)
        RETURNING *`,
       [
-        req.user.company_id || null,
+        getEffectiveCompanyId(req),
         sale_id,
         providerKey,
         payment_method,
@@ -5881,19 +5902,20 @@ app.get("/pos/reports/products", authenticateToken, async (req, res) => {
       return res.status(403).json({ error: "Accès refusé : module réservé à la direction" });
     }
 
-    const companyId = req.user.company_id;
+    const companyId = getEffectiveCompanyId(req);
     const isSuperAdmin = req.user.is_super_admin === true;
+    const shouldFilterByCompany = !isSuperAdmin || Boolean(companyId);
 
     const result = await pool.query(
       `SELECT product_reference, product_name,
               SUM(quantity)::int AS quantity_sold,
               COALESCE(SUM(total_price),0)::numeric AS total
        FROM sale_items
-       ${isSuperAdmin ? "" : "WHERE company_id=$1"}
+       ${shouldFilterByCompany ? "WHERE company_id=$1" : ""}
        GROUP BY product_reference, product_name
        ORDER BY quantity_sold DESC
        LIMIT 50`,
-      isSuperAdmin ? [] : [companyId]
+      shouldFilterByCompany ? [companyId] : []
     );
 
     res.json(result.rows);
@@ -5909,18 +5931,19 @@ app.get("/pos/reports/payments", authenticateToken, async (req, res) => {
       return res.status(403).json({ error: "Accès refusé : module réservé à la direction" });
     }
 
-    const companyId = req.user.company_id;
+    const companyId = getEffectiveCompanyId(req);
     const isSuperAdmin = req.user.is_super_admin === true;
+    const shouldFilterByCompany = !isSuperAdmin || Boolean(companyId);
 
     const result = await pool.query(
       `SELECT payment_method, payment_status,
               COUNT(*)::int AS count,
               COALESCE(SUM(total_amount),0)::numeric AS total
        FROM sales
-       ${isSuperAdmin ? "" : "WHERE company_id=$1"}
+       ${shouldFilterByCompany ? "WHERE company_id=$1" : ""}
        GROUP BY payment_method, payment_status
        ORDER BY total DESC`,
-      isSuperAdmin ? [] : [companyId]
+      shouldFilterByCompany ? [companyId] : []
     );
 
     res.json(result.rows);
@@ -7569,9 +7592,9 @@ app.post("/documents/from-movement/:id", authenticateToken, async (req, res) => 
 });
 
 /* HISTORIQUE INVENTAIRE SAAS */
-app.get("/inventory-history", async (req, res) => {
+app.get("/inventory-history", authenticateToken, async (req, res) => {
   try {
-    const { companyId, isSuperAdmin } = getCompanyFilter(req);
+    const { companyId, shouldFilterByCompany } = getCompanyFilter(req);
 
     let query = `
       SELECT * FROM inventory_history
@@ -7579,7 +7602,7 @@ app.get("/inventory-history", async (req, res) => {
 
     let values = [];
 
-    if (!isSuperAdmin) {
+    if (shouldFilterByCompany) {
       query += ` WHERE company_id = $1 `;
       values.push(companyId);
     }
@@ -8118,10 +8141,17 @@ app.get("/scan/resolve/:code", authenticateToken, async (req, res) => {
 });
 
 /* ACTIVITÉS */
-app.get("/activities", async (req, res) => {
+app.get("/activities", authenticateToken, async (req, res) => {
   try {
+    const companyId = getEffectiveCompanyId(req);
+    const isSuperAdmin = req.user.is_super_admin === true;
+    const hasCompanyColumn = await columnExists("user_activities", "company_id");
+    const shouldFilterByCompany = hasCompanyColumn && (!isSuperAdmin || Boolean(companyId));
     const result = await pool.query(
-      "SELECT * FROM user_activities ORDER BY id DESC"
+      `SELECT * FROM user_activities
+       ${shouldFilterByCompany ? "WHERE company_id=$1" : ""}
+       ORDER BY id DESC`,
+      shouldFilterByCompany ? [companyId] : []
     );
 
     res.json(result.rows);
@@ -8978,7 +9008,7 @@ app.get("/attendance/today", authenticateToken, async (req, res) => {
 /* POINTAGES DU JOUR SAAS */
 app.get("/attendance/today", authenticateToken, async (req, res) => {
   try {
-    const { companyId, isSuperAdmin } = getCompanyFilter(req);
+    const { companyId, shouldFilterByCompany } = getCompanyFilter(req);
 
     let query = `
       SELECT ar.*, u.fullname, u.email, u.role, u.profile_image_url
@@ -8989,7 +9019,7 @@ app.get("/attendance/today", authenticateToken, async (req, res) => {
 
     let values = [];
 
-    if (!isSuperAdmin) {
+    if (shouldFilterByCompany) {
       query += ` AND u.company_id = $1 `;
       values.push(companyId);
     }
@@ -11493,9 +11523,10 @@ app.put("/super-admin/users/:id/password", authenticateToken, authorizeRoles("su
 app.get("/dashboard-stats", authenticateToken, async (req, res) => {
   try {
     const isSuperAdmin = req.user?.is_super_admin === true;
-    const companyId = req.user?.company_id || null;
-    const companyFilter = isSuperAdmin ? "" : " WHERE company_id=$1";
-    const values = isSuperAdmin ? [] : [companyId];
+    const companyId = getEffectiveCompanyId(req);
+    const shouldFilterByCompany = !isSuperAdmin || Boolean(companyId);
+    const companyFilter = shouldFilterByCompany ? " WHERE company_id=$1" : "";
+    const values = shouldFilterByCompany ? [companyId] : [];
 
     const totalProduits = await pool.query(`SELECT COUNT(*) FROM products${companyFilter}`, values);
     const totalStock = await pool.query(
@@ -11514,22 +11545,26 @@ app.get("/dashboard-stats", authenticateToken, async (req, res) => {
     );
 
     const mouvementsAttente = await pool.query(
-      `SELECT COUNT(*) FROM stock_movements WHERE status='En attente'${isSuperAdmin ? "" : " AND company_id=$1"}`,
+      `SELECT COUNT(*) FROM stock_movements WHERE status='En attente'${shouldFilterByCompany ? " AND company_id=$1" : ""}`,
       values
     );
 
     const stockFaible = await pool.query(
-      `SELECT COUNT(*) FROM products WHERE stock > 0 AND stock <= minimum_stock${isSuperAdmin ? "" : " AND company_id=$1"}`,
+      `SELECT COUNT(*) FROM products WHERE stock > 0 AND stock <= minimum_stock${shouldFilterByCompany ? " AND company_id=$1" : ""}`,
       values
     );
 
     const ruptureStock = await pool.query(
-      `SELECT COUNT(*) FROM products WHERE stock <= 0${isSuperAdmin ? "" : " AND company_id=$1"}`,
+      `SELECT COUNT(*) FROM products WHERE stock <= 0${shouldFilterByCompany ? " AND company_id=$1" : ""}`,
       values
     );
 
+    const activitiesHaveCompany = await columnExists("user_activities", "company_id");
     const activitesRecentes = await pool.query(
-      "SELECT * FROM user_activities ORDER BY id DESC LIMIT 5"
+      `SELECT * FROM user_activities
+       ${activitiesHaveCompany && shouldFilterByCompany ? "WHERE company_id=$1" : ""}
+       ORDER BY id DESC LIMIT 5`,
+      activitiesHaveCompany && shouldFilterByCompany ? values : []
     );
 
     const derniersMouvements = await pool.query(
