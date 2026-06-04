@@ -1020,7 +1020,8 @@ const COMPANY_MODULE_KEYS = [
   "documents",
   "rapports",
   "transport",
-  "crm"
+  "crm",
+  "marketplace"
 ];
 
 async function getCompanyModules(companyId) {
@@ -8128,6 +8129,806 @@ app.post("/documents/from-movement/:id", authenticateToken, async (req, res) => 
   }
 });
 
+/* TRIANGLE MARKETPLACE B2B/B2C */
+function canManageMarketplaceVendor(user) {
+  const role = normalizeRole(user?.role);
+  return (
+    user?.is_super_admin === true ||
+    role === "super_admin" ||
+    role === "admin" ||
+    role === "marketplace_vendor" ||
+    role === "marketplace_admin"
+  );
+}
+
+function canAdminMarketplace(user) {
+  const role = normalizeRole(user?.role);
+  return user?.is_super_admin === true || role === "super_admin" || role === "marketplace_admin";
+}
+
+async function getOrCreateMarketplaceCart(clientOrPool, user) {
+  const existing = await clientOrPool.query(
+    `SELECT *
+     FROM marketplace_carts
+     WHERE user_id=$1
+       AND status='active'
+     ORDER BY id DESC
+     LIMIT 1`,
+    [user.id]
+  );
+  if (existing.rows[0]) return existing.rows[0];
+
+  const created = await clientOrPool.query(
+    `INSERT INTO marketplace_carts (user_id, company_id, customer_email, status)
+     VALUES ($1,$2,$3,'active')
+     RETURNING *`,
+    [user.id, user.company_id || null, user.email || ""]
+  );
+  return created.rows[0];
+}
+
+async function getMarketplaceCartPayload(user) {
+  const cart = await getOrCreateMarketplaceCart(pool, user);
+  const items = await pool.query(
+    `SELECT ci.*, mp.title, mp.image_url, mp.status AS marketplace_status,
+            p.reference, p.name AS product_name, p.stock,
+            c.name AS vendor_name
+     FROM marketplace_cart_items ci
+     JOIN marketplace_products mp ON mp.id=ci.marketplace_product_id
+     LEFT JOIN products p ON p.id=ci.product_id
+     LEFT JOIN companies c ON c.id=ci.vendor_company_id
+     WHERE ci.cart_id=$1
+     ORDER BY ci.id ASC`,
+    [cart.id]
+  );
+  const total = items.rows.reduce((sum, item) => sum + Number(item.total_price || 0), 0);
+  return { cart, items: items.rows, total };
+}
+
+async function finalizeMarketplaceOrder(client, orderId, user = {}) {
+  const orderResult = await client.query(
+    "SELECT * FROM marketplace_orders WHERE id=$1 FOR UPDATE",
+    [orderId]
+  );
+  const order = orderResult.rows[0];
+  if (!order) throw new Error("Commande marketplace introuvable.");
+
+  if (["paid", "payé", "completed", "confirmée", "confirmed"].includes(String(order.payment_status || "").toLowerCase())) {
+    return order;
+  }
+
+  const itemsResult = await client.query(
+    "SELECT * FROM marketplace_order_items WHERE order_id=$1 ORDER BY id ASC",
+    [order.id]
+  );
+
+  for (const item of itemsResult.rows) {
+    const productResult = await client.query(
+      `SELECT *
+       FROM products
+       WHERE id=$1
+         AND company_id=$2
+       FOR UPDATE`,
+      [item.product_id, order.vendor_company_id]
+    );
+    const product = productResult.rows[0];
+    if (!product) throw new Error(`Produit marketplace introuvable : ${item.product_name || item.product_id}`);
+
+    const quantity = Number(item.quantity || 0);
+    if (Number(product.stock || 0) < quantity) {
+      throw new Error(`Stock insuffisant pour ${product.reference || product.name}.`);
+    }
+
+    await client.query(
+      `UPDATE products
+       SET stock=COALESCE(stock,0)-$1,
+           updated_at=CURRENT_TIMESTAMP
+       WHERE id=$2`,
+      [quantity, product.id]
+    );
+
+    await client.query(
+      `INSERT INTO stock_movements
+       (type, product_reference, product_name, quantity, source_warehouse,
+        destination_warehouse, reason, status, company_id, created_by,
+        created_by_name, created_by_role, product_id, location_id,
+        warehouse_id, approval_status, original_quantity, final_quantity)
+       VALUES ('Sortie',$1,$2,$3,$4,$5,$6,'Validé',$7,$8,$9,$10,$11,$12,$13,'Validé',$3,$3)`,
+      [
+        product.reference || item.product_reference || "",
+        product.name || item.product_name || "",
+        quantity,
+        product.warehouse || "",
+        order.delivery_address || "Marketplace",
+        `Commande marketplace ${order.order_number}`,
+        order.vendor_company_id,
+        user.id || order.customer_user_id || null,
+        user.email || order.customer_email || "Marketplace",
+        user.role || "marketplace",
+        product.id,
+        product.location_id || null,
+        product.warehouse_id || null
+      ]
+    );
+  }
+
+  const paidOrder = await client.query(
+    `UPDATE marketplace_orders
+     SET payment_status='paid',
+         status='paid',
+         updated_at=CURRENT_TIMESTAMP
+     WHERE id=$1
+     RETURNING *`,
+    [order.id]
+  );
+
+  const paymentResult = await client.query(
+    `INSERT INTO marketplace_payments
+     (order_id, company_id, amount, currency, method, status, provider_reference,
+      paid_at, created_by)
+     VALUES ($1,$2,$3,'FCFA',$4,'paid',$5,CURRENT_TIMESTAMP,$6)
+     RETURNING *`,
+    [
+      order.id,
+      order.vendor_company_id,
+      Number(order.total_amount || 0),
+      order.payment_method || "Espèces",
+      order.order_number,
+      user.id || order.customer_user_id || null
+    ]
+  );
+
+  const accountingPayment = await client.query(
+    `INSERT INTO payments
+     (company_id, amount, currency, payment_method, payment_reference,
+      status, notes, paid_at, payment_status)
+     VALUES ($1,$2,'FCFA',$3,$4,'paid',$5,CURRENT_TIMESTAMP,'paid')
+     RETURNING *`,
+    [
+      order.vendor_company_id,
+      Number(order.total_amount || 0),
+      order.payment_method || "Espèces",
+      order.order_number,
+      `Paiement marketplace ${order.order_number}`
+    ]
+  );
+
+  await recordPosPaymentAccounting(client, {
+    sale: {
+      id: order.id,
+      company_id: order.vendor_company_id,
+      total_amount: Number(order.total_amount || 0),
+      payment_method: order.payment_method || "Espèces",
+      sale_number: order.order_number,
+      customer_name: order.customer_name || order.customer_email || "Client marketplace",
+      created_by: user.id || order.customer_user_id || null
+    },
+    payment: accountingPayment.rows[0],
+    user,
+    amount: Number(order.total_amount || 0)
+  });
+
+  const documentNumber = `FAC-MKP-${new Date().getFullYear()}-${String(order.id).padStart(6, "0")}`;
+  const documentResult = await client.query(
+    `INSERT INTO documents
+     (document_type, document_number, client_name, client_phone, client_address,
+      total_amount, observation, created_by, company_id, related_entity_type,
+      related_entity_id, status)
+     VALUES ('Facture marketplace',$1,$2,$3,$4,$5,$6,$7,$8,'marketplace_order',$9,'Validé')
+     RETURNING *`,
+    [
+      documentNumber,
+      order.customer_name || order.customer_email || "",
+      order.customer_phone || "",
+      order.delivery_address || "",
+      Number(order.total_amount || 0),
+      `Facture générée depuis commande marketplace ${order.order_number}`,
+      user.email || "Marketplace",
+      order.vendor_company_id,
+      order.id
+    ]
+  );
+
+  for (const item of itemsResult.rows) {
+    await client.query(
+      `INSERT INTO document_items
+       (document_id, product_reference, product_name, quantity, unit_price, total_price)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [
+        documentResult.rows[0].id,
+        item.product_reference || "",
+        item.product_name || "",
+        Number(item.quantity || 0),
+        Number(item.unit_price || 0),
+        Number(item.total_price || 0)
+      ]
+    );
+  }
+
+  await createNotification({
+    user_id: order.customer_user_id,
+    title: "Commande marketplace payée",
+    message: `Votre commande ${order.order_number} est payée.`,
+    type: "marketplace_order_paid",
+    company_id: order.buyer_company_id || order.vendor_company_id,
+    related_entity_type: "marketplace_order",
+    related_entity_id: order.id,
+    action_url: `/client/orders/${order.id}`
+  });
+
+  return { ...paidOrder.rows[0], payment: paymentResult.rows[0] };
+}
+
+app.get("/marketplace/products", async (req, res) => {
+  try {
+    const { q = "", vendor_company_id = "", category = "" } = req.query;
+    const values = [];
+    let where = "WHERE mp.status='published'";
+
+    if (q) {
+      values.push(`%${q}%`);
+      where += ` AND (mp.title ILIKE $${values.length} OR p.reference ILIKE $${values.length} OR p.name ILIKE $${values.length})`;
+    }
+    if (vendor_company_id) {
+      values.push(Number(vendor_company_id));
+      where += ` AND mp.company_id=$${values.length}`;
+    }
+    if (category) {
+      values.push(String(category));
+      where += ` AND mp.category=$${values.length}`;
+    }
+
+    const result = await pool.query(
+      `SELECT mp.*, p.reference, p.name AS product_name, p.stock,
+              COALESCE(p.stock, mp.available_stock, 0) AS display_stock,
+              c.name AS vendor_name
+       FROM marketplace_products mp
+       LEFT JOIN products p ON p.id=mp.product_id
+       LEFT JOIN companies c ON c.id=mp.company_id
+       ${where}
+       ORDER BY mp.id DESC
+       LIMIT 100`,
+      values
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR MARKETPLACE PRODUCTS :", error);
+    res.status(500).json({ error: "Erreur lecture produits marketplace" });
+  }
+});
+
+app.get("/marketplace/products/:id", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT mp.*, p.reference, p.name AS product_name, p.stock, p.minimum_stock,
+              p.location_code, p.warehouse, c.name AS vendor_name
+       FROM marketplace_products mp
+       LEFT JOIN products p ON p.id=mp.product_id
+       LEFT JOIN companies c ON c.id=mp.company_id
+       WHERE mp.id=$1
+         AND mp.status='published'
+       LIMIT 1`,
+      [req.params.id]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: "Produit marketplace introuvable" });
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("ERREUR MARKETPLACE PRODUCT DETAIL :", error);
+    res.status(500).json({ error: "Erreur détail produit marketplace" });
+  }
+});
+
+app.get("/marketplace/vendors", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT DISTINCT c.id, c.name,
+              COALESCE(mvs.store_name, c.name) AS store_name,
+              mvs.store_description, mvs.logo_url,
+              COUNT(mp.id)::int AS products_count
+       FROM companies c
+       JOIN marketplace_products mp ON mp.company_id=c.id AND mp.status='published'
+       LEFT JOIN marketplace_vendor_settings mvs ON mvs.company_id=c.id
+       GROUP BY c.id, c.name, mvs.store_name, mvs.store_description, mvs.logo_url
+       ORDER BY store_name ASC`
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR MARKETPLACE VENDORS :", error);
+    res.status(500).json({ error: "Erreur lecture vendeurs marketplace" });
+  }
+});
+
+app.post("/marketplace/customers/register", async (req, res) => {
+  try {
+    const { fullname, email, phone, password } = req.body || {};
+    const cleanEmail = String(email || "").trim().toLowerCase();
+    const cleanPhone = String(phone || "").trim();
+    if (!fullname || (!cleanEmail && !cleanPhone) || !password) {
+      return res.status(400).json({ error: "Nom, contact et mot de passe obligatoires." });
+    }
+
+    const passwordHash = await bcrypt.hash(String(password), BCRYPT_ROUNDS);
+    const userResult = await pool.query(
+      `INSERT INTO users
+       (fullname, email, phone, password, role, is_active, account_status,
+        verification_required, created_at)
+       VALUES ($1,$2,$3,$4,'customer',true,'pending_verification',true,NOW())
+       RETURNING id, fullname, email, phone, role`,
+      [fullname, cleanEmail, cleanPhone, passwordHash]
+    );
+    const user = userResult.rows[0];
+
+    await pool.query(
+      `INSERT INTO marketplace_profiles
+       (user_id, profile_type, full_name, email, phone, status)
+       VALUES ($1,'customer',$2,$3,$4,'active')`,
+      [user.id, fullname, cleanEmail, cleanPhone]
+    );
+
+    const targetType = cleanEmail ? "email" : "phone";
+    const targetValue = cleanEmail || cleanPhone;
+    const verification = await createVerificationCode({
+      companyId: null,
+      userId: user.id,
+      targetType,
+      targetValue
+    });
+    const delivery = await sendVerificationMessage({
+      targetType,
+      targetValue,
+      code: verification.code,
+      verifyUrl: verification.verify_url
+    });
+
+    res.status(201).json({
+      success: true,
+      user,
+      verification: {
+        required: true,
+        target_type: targetType,
+        target_value: targetValue,
+        delivery
+      }
+    });
+  } catch (error) {
+    console.error("ERREUR MARKETPLACE CUSTOMER REGISTER :", error);
+    res.status(500).json({ error: error.detail || error.message || "Erreur inscription client marketplace" });
+  }
+});
+
+app.get("/marketplace/cart", authenticateToken, async (req, res) => {
+  try {
+    res.json(await getMarketplaceCartPayload(req.user));
+  } catch (error) {
+    console.error("ERREUR MARKETPLACE CART :", error);
+    res.status(500).json({ error: "Erreur panier marketplace" });
+  }
+});
+
+app.post("/marketplace/cart/items", authenticateToken, async (req, res) => {
+  try {
+    const { marketplace_product_id, quantity = 1 } = req.body || {};
+    const qty = Math.max(Number(quantity || 1), 1);
+    const productResult = await pool.query(
+      `SELECT mp.*, p.stock, p.id AS base_product_id
+       FROM marketplace_products mp
+       LEFT JOIN products p ON p.id=mp.product_id
+       WHERE mp.id=$1
+         AND mp.status='published'
+       LIMIT 1`,
+      [marketplace_product_id]
+    );
+    const product = productResult.rows[0];
+    if (!product) return res.status(404).json({ error: "Produit marketplace introuvable" });
+    const availableStock = Number(product.stock ?? product.available_stock ?? 0);
+    if (availableStock < qty) {
+      return res.status(400).json({ error: "Stock insuffisant pour ce produit." });
+    }
+
+    const cart = await getOrCreateMarketplaceCart(pool, req.user);
+    const existing = await pool.query(
+      `SELECT * FROM marketplace_cart_items
+       WHERE cart_id=$1 AND marketplace_product_id=$2
+       LIMIT 1`,
+      [cart.id, product.id]
+    );
+    if (existing.rows[0]) {
+      const nextQty = Number(existing.rows[0].quantity || 0) + qty;
+      if (availableStock < nextQty) {
+        return res.status(400).json({ error: "Stock insuffisant pour cette quantité." });
+      }
+      await pool.query(
+        `UPDATE marketplace_cart_items
+         SET quantity=$1,
+             unit_price=$2,
+             total_price=$1*$2,
+             updated_at=CURRENT_TIMESTAMP
+         WHERE id=$3`,
+        [nextQty, Number(product.price || 0), existing.rows[0].id]
+      );
+    } else {
+      await pool.query(
+        `INSERT INTO marketplace_cart_items
+         (cart_id, marketplace_product_id, vendor_company_id, product_id,
+          quantity, unit_price, total_price)
+         VALUES ($1,$2,$3,$4,$5,$6,$5*$6)`,
+        [cart.id, product.id, product.company_id, product.product_id, qty, Number(product.price || 0)]
+      );
+    }
+
+    res.status(201).json(await getMarketplaceCartPayload(req.user));
+  } catch (error) {
+    console.error("ERREUR MARKETPLACE CART ADD :", error);
+    res.status(500).json({ error: "Erreur ajout panier marketplace" });
+  }
+});
+
+app.delete("/marketplace/cart/items/:id", authenticateToken, async (req, res) => {
+  try {
+    const cart = await getOrCreateMarketplaceCart(pool, req.user);
+    await pool.query(
+      "DELETE FROM marketplace_cart_items WHERE id=$1 AND cart_id=$2",
+      [req.params.id, cart.id]
+    );
+    res.json(await getMarketplaceCartPayload(req.user));
+  } catch (error) {
+    console.error("ERREUR MARKETPLACE CART DELETE :", error);
+    res.status(500).json({ error: "Erreur suppression panier marketplace" });
+  }
+});
+
+app.post("/marketplace/orders", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const {
+      customer_name = req.user.fullname || req.user.email || "",
+      customer_email = req.user.email || "",
+      customer_phone = req.user.phone || "",
+      delivery_address = "",
+      payment_method = "Espèces",
+      notes = ""
+    } = req.body || {};
+    const cart = await getOrCreateMarketplaceCart(client, req.user);
+    const itemsResult = await client.query(
+      "SELECT * FROM marketplace_cart_items WHERE cart_id=$1 ORDER BY id ASC",
+      [cart.id]
+    );
+    if (itemsResult.rows.length === 0) return res.status(400).json({ error: "Panier vide." });
+
+    await client.query("BEGIN");
+    const groups = itemsResult.rows.reduce((acc, item) => {
+      const key = String(item.vendor_company_id || 0);
+      acc[key] = acc[key] || [];
+      acc[key].push(item);
+      return acc;
+    }, {});
+    const orders = [];
+
+    for (const [vendorCompanyId, rows] of Object.entries(groups)) {
+      const subtotal = rows.reduce((sum, item) => sum + Number(item.total_price || 0), 0);
+      const orderNumber = await nextAccountingNumber(
+        client,
+        "marketplace_orders",
+        "order_number",
+        "MKP",
+        Number(vendorCompanyId || 0)
+      );
+      const orderResult = await client.query(
+        `INSERT INTO marketplace_orders
+         (order_number, customer_user_id, buyer_company_id, vendor_company_id,
+          customer_name, customer_email, customer_phone, delivery_address,
+          order_type, status, payment_status, payment_method, subtotal,
+          delivery_fee, total_amount, notes)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending_payment','pending',$10,$11,0,$11,$12)
+         RETURNING *`,
+        [
+          orderNumber,
+          req.user.id,
+          req.user.company_id || null,
+          Number(vendorCompanyId || 0),
+          customer_name,
+          customer_email,
+          customer_phone,
+          delivery_address,
+          req.user.company_id ? "b2b" : "b2c",
+          payment_method,
+          subtotal,
+          notes
+        ]
+      );
+      const order = orderResult.rows[0];
+      for (const item of rows) {
+        const product = await client.query(
+          "SELECT reference, name FROM products WHERE id=$1 LIMIT 1",
+          [item.product_id]
+        );
+        await client.query(
+          `INSERT INTO marketplace_order_items
+           (order_id, marketplace_product_id, vendor_company_id, product_id,
+            product_reference, product_name, quantity, unit_price, total_price)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+          [
+            order.id,
+            item.marketplace_product_id,
+            item.vendor_company_id,
+            item.product_id,
+            product.rows[0]?.reference || "",
+            product.rows[0]?.name || "",
+            item.quantity,
+            item.unit_price,
+            item.total_price
+          ]
+        );
+      }
+      orders.push(order);
+    }
+
+    await client.query("UPDATE marketplace_carts SET status='ordered', updated_at=CURRENT_TIMESTAMP WHERE id=$1", [cart.id]);
+    await client.query("COMMIT");
+    res.status(201).json({ orders });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("ERREUR MARKETPLACE ORDER CREATE :", error);
+    res.status(500).json({ error: error.detail || error.message || "Erreur création commande marketplace" });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/marketplace/orders/my", authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT o.*, c.name AS vendor_name
+       FROM marketplace_orders o
+       LEFT JOIN companies c ON c.id=o.vendor_company_id
+       WHERE o.customer_user_id=$1
+          OR ($2::int IS NOT NULL AND o.buyer_company_id=$2)
+       ORDER BY o.id DESC`,
+      [req.user.id, req.user.company_id || null]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR MARKETPLACE MY ORDERS :", error);
+    res.status(500).json({ error: "Erreur commandes marketplace" });
+  }
+});
+
+app.get("/marketplace/orders/:id", authenticateToken, async (req, res) => {
+  try {
+    const orderResult = await pool.query(
+      `SELECT o.*, c.name AS vendor_name
+       FROM marketplace_orders o
+       LEFT JOIN companies c ON c.id=o.vendor_company_id
+       WHERE o.id=$1
+         AND (
+           o.customer_user_id=$2
+           OR o.vendor_company_id=$3
+           OR o.buyer_company_id=$3
+           OR $4::boolean=true
+         )
+       LIMIT 1`,
+      [req.params.id, req.user.id, req.user.company_id || null, req.user.is_super_admin === true]
+    );
+    const order = orderResult.rows[0];
+    if (!order) return res.status(404).json({ error: "Commande marketplace introuvable" });
+    const items = await pool.query("SELECT * FROM marketplace_order_items WHERE order_id=$1 ORDER BY id ASC", [order.id]);
+    const payments = await pool.query("SELECT * FROM marketplace_payments WHERE order_id=$1 ORDER BY id DESC", [order.id]);
+    res.json({ order, items: items.rows, payments: payments.rows });
+  } catch (error) {
+    console.error("ERREUR MARKETPLACE ORDER DETAIL :", error);
+    res.status(500).json({ error: "Erreur détail commande marketplace" });
+  }
+});
+
+app.get("/marketplace/vendor/products", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageMarketplaceVendor(req.user)) return res.status(403).json({ error: "Accès vendeur marketplace refusé." });
+    const companyId = getEffectiveCompanyId(req);
+    const result = await pool.query(
+      `SELECT mp.*, p.reference, p.name AS product_name, p.stock
+       FROM marketplace_products mp
+       LEFT JOIN products p ON p.id=mp.product_id
+       WHERE mp.company_id=$1
+       ORDER BY mp.id DESC`,
+      [companyId]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR VENDOR PRODUCTS :", error);
+    res.status(500).json({ error: "Erreur produits vendeur marketplace" });
+  }
+});
+
+app.post("/marketplace/vendor/products", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageMarketplaceVendor(req.user)) return res.status(403).json({ error: "Accès vendeur marketplace refusé." });
+    const companyId = getEffectiveCompanyId(req);
+    const { product_id, title, description = "", category = "", price = 0, image_url = "", is_b2b = true, is_b2c = true } = req.body || {};
+    const product = await pool.query("SELECT * FROM products WHERE id=$1 AND company_id=$2", [product_id, companyId]);
+    if (!product.rows[0]) return res.status(404).json({ error: "Produit source introuvable dans cette entreprise." });
+    const result = await pool.query(
+      `INSERT INTO marketplace_products
+       (company_id, product_id, title, description, category, price, image_url,
+        available_stock, is_b2b, is_b2c, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+       RETURNING *`,
+      [
+        companyId,
+        product_id,
+        title || product.rows[0].name,
+        description,
+        category || product.rows[0].category || "",
+        Number(price || product.rows[0].sale_price || product.rows[0].price || 0),
+        image_url || product.rows[0].image_url || "",
+        Number(product.rows[0].stock || 0),
+        is_b2b !== false,
+        is_b2c !== false,
+        req.user.id
+      ]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error("ERREUR CREATE VENDOR PRODUCT :", error);
+    res.status(500).json({ error: error.detail || error.message || "Erreur publication produit marketplace" });
+  }
+});
+
+app.put("/marketplace/vendor/products/:id", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageMarketplaceVendor(req.user)) return res.status(403).json({ error: "Accès vendeur marketplace refusé." });
+    const companyId = getEffectiveCompanyId(req);
+    const { title, description = "", category = "", price = 0, image_url = "", status = "published", is_b2b = true, is_b2c = true } = req.body || {};
+    const result = await pool.query(
+      `UPDATE marketplace_products
+       SET title=$1, description=$2, category=$3, price=$4, image_url=$5,
+           status=$6, is_b2b=$7, is_b2c=$8, updated_at=CURRENT_TIMESTAMP
+       WHERE id=$9 AND company_id=$10
+       RETURNING *`,
+      [title, description, category, Number(price || 0), image_url, status, is_b2b !== false, is_b2c !== false, req.params.id, companyId]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: "Produit marketplace introuvable" });
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("ERREUR UPDATE VENDOR PRODUCT :", error);
+    res.status(500).json({ error: "Erreur modification produit marketplace" });
+  }
+});
+
+app.delete("/marketplace/vendor/products/:id", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageMarketplaceVendor(req.user)) return res.status(403).json({ error: "Accès vendeur marketplace refusé." });
+    const companyId = getEffectiveCompanyId(req);
+    const result = await pool.query(
+      `UPDATE marketplace_products
+       SET status='inactive', updated_at=CURRENT_TIMESTAMP
+       WHERE id=$1 AND company_id=$2
+       RETURNING *`,
+      [req.params.id, companyId]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: "Produit marketplace introuvable" });
+    res.json({ message: "Produit marketplace désactivé.", product: result.rows[0] });
+  } catch (error) {
+    console.error("ERREUR DELETE VENDOR PRODUCT :", error);
+    res.status(500).json({ error: "Erreur désactivation produit marketplace" });
+  }
+});
+
+app.get("/marketplace/vendor/orders", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageMarketplaceVendor(req.user)) return res.status(403).json({ error: "Accès vendeur marketplace refusé." });
+    const companyId = getEffectiveCompanyId(req);
+    const result = await pool.query(
+      `SELECT *
+       FROM marketplace_orders
+       WHERE vendor_company_id=$1
+       ORDER BY id DESC`,
+      [companyId]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR VENDOR ORDERS :", error);
+    res.status(500).json({ error: "Erreur commandes vendeur marketplace" });
+  }
+});
+
+app.put("/marketplace/vendor/orders/:id/status", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    if (!canManageMarketplaceVendor(req.user)) return res.status(403).json({ error: "Accès vendeur marketplace refusé." });
+    const companyId = getEffectiveCompanyId(req);
+    const { status, payment_status } = req.body || {};
+    await client.query("BEGIN");
+    const orderCheck = await client.query(
+      "SELECT * FROM marketplace_orders WHERE id=$1 AND vendor_company_id=$2 FOR UPDATE",
+      [req.params.id, companyId]
+    );
+    if (!orderCheck.rows[0]) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Commande marketplace introuvable" });
+    }
+    let result;
+    if (["paid", "payé", "confirmée", "confirmed"].includes(String(payment_status || status || "").toLowerCase())) {
+      result = await finalizeMarketplaceOrder(client, req.params.id, req.user);
+    } else {
+      const update = await client.query(
+        `UPDATE marketplace_orders
+         SET status=COALESCE(NULLIF($1,''), status),
+             payment_status=COALESCE(NULLIF($2,''), payment_status),
+             updated_at=CURRENT_TIMESTAMP
+         WHERE id=$3
+         RETURNING *`,
+        [status || "", payment_status || "", req.params.id]
+      );
+      result = update.rows[0];
+    }
+    await client.query("COMMIT");
+    res.json(result);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("ERREUR VENDOR ORDER STATUS :", error);
+    res.status(500).json({ error: error.detail || error.message || "Erreur statut commande marketplace" });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/super-admin/marketplace", authenticateToken, async (req, res) => {
+  try {
+    if (!canAdminMarketplace(req.user)) return res.status(403).json({ error: "Accès super admin marketplace refusé." });
+    const [products, orders, vendors, customers] = await Promise.all([
+      pool.query("SELECT COUNT(*)::int AS total FROM marketplace_products"),
+      pool.query("SELECT COUNT(*)::int AS total, COALESCE(SUM(total_amount),0)::numeric AS amount FROM marketplace_orders"),
+      pool.query("SELECT COUNT(DISTINCT company_id)::int AS total FROM marketplace_products"),
+      pool.query("SELECT COUNT(*)::int AS total FROM marketplace_profiles WHERE profile_type='customer'")
+    ]);
+    res.json({
+      products: products.rows[0],
+      orders: orders.rows[0],
+      vendors: vendors.rows[0],
+      customers: customers.rows[0]
+    });
+  } catch (error) {
+    console.error("ERREUR SUPER ADMIN MARKETPLACE :", error);
+    res.status(500).json({ error: "Erreur overview marketplace" });
+  }
+});
+
+app.get("/super-admin/marketplace/orders", authenticateToken, async (req, res) => {
+  try {
+    if (!canAdminMarketplace(req.user)) return res.status(403).json({ error: "Accès super admin marketplace refusé." });
+    const result = await pool.query("SELECT * FROM marketplace_orders ORDER BY id DESC LIMIT 200");
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: "Erreur commandes marketplace super admin" });
+  }
+});
+
+app.get("/super-admin/marketplace/vendors", authenticateToken, async (req, res) => {
+  try {
+    if (!canAdminMarketplace(req.user)) return res.status(403).json({ error: "Accès super admin marketplace refusé." });
+    const result = await pool.query(
+      `SELECT c.id, c.name, COUNT(mp.id)::int AS products_count
+       FROM companies c
+       LEFT JOIN marketplace_products mp ON mp.company_id=c.id
+       GROUP BY c.id, c.name
+       ORDER BY c.name ASC`
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: "Erreur vendeurs marketplace super admin" });
+  }
+});
+
+app.get("/super-admin/marketplace/customers", authenticateToken, async (req, res) => {
+  try {
+    if (!canAdminMarketplace(req.user)) return res.status(403).json({ error: "Accès super admin marketplace refusé." });
+    const result = await pool.query("SELECT * FROM marketplace_profiles WHERE profile_type='customer' ORDER BY id DESC LIMIT 200");
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: "Erreur clients marketplace super admin" });
+  }
+});
+
 /* HISTORIQUE INVENTAIRE SAAS */
 app.get("/inventory-history", authenticateToken, async (req, res) => {
   try {
@@ -10794,6 +11595,9 @@ function chooseAssistantTools(message) {
   if (/document|reçu|bon|rapport/.test(text)) tools.add("get_documents");
   if (/entrepôt|entrepot|warehouse/.test(text)) tools.add("get_warehouses");
   if (/emplacement|location|rayon|bin/.test(text)) tools.add("get_locations");
+  if (/marketplace|catalogue|commande|vendeur|acheteur|client final|b2b|b2c/.test(text)) {
+    tools.add("get_marketplace_summary");
+  }
 
   if (/combien de produits|nombre de produits/.test(text)) tools.add("get_products");
   if (/combien de stock|stock total|stock reste/.test(text)) tools.add("get_stock");
@@ -11011,6 +11815,41 @@ async function runAssistantTool(toolName, user) {
     return result.rows;
   }
 
+  if (toolName === "get_marketplace_summary") {
+    const scopeValues = [];
+    const companyScope = assistantScope(user, scopeValues);
+    const productWhere = companyScope ? `WHERE ${companyScope.replaceAll("company_id", "mp.company_id")}` : "";
+    const orderWhere = companyScope ? `WHERE ${companyScope.replaceAll("company_id", "o.vendor_company_id")}` : "";
+
+    const products = await pool.query(
+      `SELECT COUNT(*)::int AS total_products,
+              COUNT(*) FILTER (WHERE status='published')::int AS published_products
+       FROM marketplace_products mp ${productWhere}`,
+      scopeValues
+    );
+    const orders = await pool.query(
+      `SELECT COUNT(*)::int AS total_orders,
+              COALESCE(SUM(total_amount),0)::numeric AS total_amount,
+              COUNT(*) FILTER (WHERE payment_status='paid')::int AS paid_orders
+       FROM marketplace_orders o ${orderWhere}`,
+      scopeValues
+    );
+    const recentOrders = await pool.query(
+      `SELECT id, order_number, customer_name, total_amount, payment_status,
+              status, created_at
+       FROM marketplace_orders o ${orderWhere}
+       ORDER BY created_at DESC NULLS LAST, id DESC
+       LIMIT 10`,
+      scopeValues
+    );
+
+    return {
+      products: products.rows[0],
+      orders: orders.rows[0],
+      recent_orders: recentOrders.rows
+    };
+  }
+
   return null;
 }
 
@@ -11061,6 +11900,10 @@ function buildLocalAssistantAnswer(message, toolResults) {
       lines.push(`- Entrepôts : ${Array.isArray(item.data) ? item.data.length : 0} affiché(s).`);
     } else if (item.tool === "get_locations") {
       lines.push(`- Emplacements : ${Array.isArray(item.data) ? item.data.length : 0} affiché(s).`);
+    } else if (item.tool === "get_marketplace_summary") {
+      lines.push(
+        `- Marketplace : ${item.data?.products?.published_products || 0} produit(s) publié(s), ${item.data?.orders?.total_orders || 0} commande(s), total ${Number(item.data?.orders?.total_amount || 0).toLocaleString("fr-FR", { maximumFractionDigits: 0 })} FCFA.`
+      );
     }
   }
 
