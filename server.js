@@ -426,6 +426,184 @@ function maskSecret(value) {
   return "••••••••";
 }
 
+function socialTokenCryptoKey() {
+  return crypto
+    .createHash("sha256")
+    .update(process.env.SOCIAL_AUTH_SECRET || process.env.JWT_SECRET || "triangle-wms-social-secret")
+    .digest();
+}
+
+function encryptSocialToken(value) {
+  if (!value) return "";
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", socialTokenCryptoKey(), iv);
+  const encrypted = Buffer.concat([cipher.update(String(value), "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `${iv.toString("hex")}:${tag.toString("hex")}:${encrypted.toString("hex")}`;
+}
+
+function socialProviderConfig(provider) {
+  const appUrl = publicAppUrl();
+  const callbackUrl = `${appUrl}/api/auth/social/${provider}/callback`;
+  const configs = {
+    google: {
+      label: "Google",
+      clientId: process.env.GOOGLE_CLIENT_ID,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+      authUrl: "https://accounts.google.com/o/oauth2/v2/auth",
+      tokenUrl: "https://oauth2.googleapis.com/token",
+      userInfoUrl: "https://openidconnect.googleapis.com/v1/userinfo",
+      scope: "profile email",
+      callbackUrl
+    },
+    facebook: {
+      label: "Facebook",
+      clientId: process.env.FACEBOOK_CLIENT_ID,
+      clientSecret: process.env.FACEBOOK_CLIENT_SECRET,
+      authUrl: "https://www.facebook.com/v19.0/dialog/oauth",
+      tokenUrl: "https://graph.facebook.com/v19.0/oauth/access_token",
+      userInfoUrl: "https://graph.facebook.com/me?fields=id,first_name,last_name,name,email,picture",
+      scope: "public_profile email",
+      callbackUrl
+    },
+    instagram: {
+      label: "Instagram",
+      clientId: process.env.INSTAGRAM_CLIENT_ID,
+      clientSecret: process.env.INSTAGRAM_CLIENT_SECRET,
+      authUrl: process.env.INSTAGRAM_AUTH_URL || "",
+      tokenUrl: process.env.INSTAGRAM_TOKEN_URL || "",
+      userInfoUrl: process.env.INSTAGRAM_USERINFO_URL || "",
+      scope: "user_profile",
+      callbackUrl
+    },
+    tiktok: {
+      label: "TikTok",
+      clientId: process.env.TIKTOK_CLIENT_ID,
+      clientSecret: process.env.TIKTOK_CLIENT_SECRET,
+      authUrl: process.env.TIKTOK_AUTH_URL || "",
+      tokenUrl: process.env.TIKTOK_TOKEN_URL || "",
+      userInfoUrl: process.env.TIKTOK_USERINFO_URL || "",
+      scope: "user.info.basic",
+      callbackUrl
+    }
+  };
+
+  return configs[provider] || null;
+}
+
+function socialProviderEnabled(provider) {
+  const config = socialProviderConfig(provider);
+  return Boolean(config?.clientId && config?.clientSecret && config?.authUrl && config?.tokenUrl && config?.userInfoUrl);
+}
+
+function normalizeSocialProfile(provider, rawProfile) {
+  if (provider === "google") {
+    return {
+      provider_user_id: String(rawProfile.sub || ""),
+      email: rawProfile.email || "",
+      email_verified: rawProfile.email_verified === true,
+      name: rawProfile.name || [rawProfile.given_name, rawProfile.family_name].filter(Boolean).join(" "),
+      first_name: rawProfile.given_name || "",
+      last_name: rawProfile.family_name || "",
+      avatar_url: rawProfile.picture || ""
+    };
+  }
+
+  if (provider === "facebook") {
+    return {
+      provider_user_id: String(rawProfile.id || ""),
+      email: rawProfile.email || "",
+      email_verified: Boolean(rawProfile.email),
+      name: rawProfile.name || [rawProfile.first_name, rawProfile.last_name].filter(Boolean).join(" "),
+      first_name: rawProfile.first_name || "",
+      last_name: rawProfile.last_name || "",
+      avatar_url: rawProfile.picture?.data?.url || ""
+    };
+  }
+
+  return {
+    provider_user_id: String(rawProfile.id || rawProfile.sub || rawProfile.open_id || rawProfile.union_id || ""),
+    email: rawProfile.email || "",
+    email_verified: Boolean(rawProfile.email_verified || rawProfile.email),
+    name: rawProfile.name || rawProfile.display_name || rawProfile.username || "",
+    first_name: rawProfile.first_name || "",
+    last_name: rawProfile.last_name || "",
+    avatar_url: rawProfile.picture || rawProfile.avatar_url || ""
+  };
+}
+
+async function buildLoginResponseForUser(userId) {
+  const result = await pool.query(
+    `SELECT u.*,
+            c.name AS company_name,
+            c.status AS company_status,
+            c.subscription_status AS company_subscription_status,
+            c.subscription_expires_at AS company_subscription_expires_at,
+            c.trial_end_date AS company_trial_end_date,
+            s.status AS subscription_status,
+            s.end_date AS subscription_end_date,
+            sp.name AS plan_name
+     FROM users u
+     LEFT JOIN companies c ON u.company_id=c.id
+     LEFT JOIN subscriptions s ON c.id=s.company_id
+     LEFT JOIN subscription_plans sp ON s.plan_id=sp.id
+     WHERE u.id=$1
+     ORDER BY s.id DESC
+     LIMIT 1`,
+    [userId]
+  );
+  const user = result.rows[0];
+  if (!user) return null;
+
+  const normalizedEmail = String(user.email || "").trim().toLowerCase();
+  const isSuperAdmin =
+    user.is_super_admin === true ||
+    normalizeRole(user.role) === "super_admin" ||
+    SUPER_ADMIN_EMAILS.has(normalizedEmail);
+
+  const subscriptionStatus =
+    user.subscription_status || user.company_subscription_status || "";
+
+  const token = jwt.sign(
+    {
+      id: user.id,
+      email: user.email,
+      role: isSuperAdmin ? "super_admin" : user.role,
+      company_id: user.company_id,
+      is_super_admin: isSuperAdmin,
+      subscription_status: subscriptionStatus
+    },
+    JWT_SECRET,
+    { expiresIn: "1d" }
+  );
+
+  const companyModules = isSuperAdmin
+    ? await getCompanyModules(null)
+    : await getCompanyModules(user.company_id);
+
+  return {
+    token,
+    user: {
+      id: user.id,
+      fullname: user.fullname,
+      email: user.email,
+      role: isSuperAdmin ? "super_admin" : user.role,
+      company_id: user.company_id,
+      company_name: user.company_name || "",
+      company_status: user.company_status || "",
+      is_super_admin: isSuperAdmin,
+      subscription_status: subscriptionStatus,
+      subscription_end_date: user.subscription_end_date || "",
+      trial_end_date: user.company_trial_end_date || "",
+      subscription_expires_at: user.company_subscription_expires_at || "",
+      plan_name: user.plan_name || "",
+      profile_image_url: user.profile_image_url || "",
+      force_password_change: user.force_password_change === true,
+      modules: companyModules
+    }
+  };
+}
+
 function isExternalPaymentMethod(method) {
   return ["Carte bancaire", "Orange Money", "Moov Money", "Wave", "Virement"].includes(String(method || ""));
 }
@@ -1648,6 +1826,277 @@ app.get("/support/config", async (req, res) => {
     whatsapp_url: supportWhatsAppUrl(),
     whatsapp_enabled: Boolean(supportWhatsAppUrl())
   });
+});
+
+app.get("/auth/social/providers", async (req, res) => {
+  const providers = ["google", "facebook", "instagram", "tiktok"].map((provider) => {
+    const config = socialProviderConfig(provider);
+    return {
+      provider,
+      label: config?.label || provider,
+      enabled: socialProviderEnabled(provider),
+      scopes: config?.scope || ""
+    };
+  });
+
+  providers.push({
+    provider: "whatsapp",
+    label: "WhatsApp",
+    enabled: true,
+    scopes: "phone_otp",
+    otp_only: true
+  });
+
+  res.json({ providers });
+});
+
+app.get("/auth/social/:provider/start", async (req, res) => {
+  try {
+    const provider = String(req.params.provider || "").toLowerCase();
+    const mode = String(req.query.mode || "login");
+
+    if (provider === "whatsapp") {
+      return res.redirect(`${publicAppUrl()}/verify-phone`);
+    }
+
+    const config = socialProviderConfig(provider);
+    if (!config || !socialProviderEnabled(provider)) {
+      return res.redirect(`${publicAppUrl()}/login?social_error=${encodeURIComponent("Provider OAuth non configuré")}`);
+    }
+
+    const state = jwt.sign(
+      {
+        provider,
+        mode: mode === "register" ? "register" : "login",
+        nonce: crypto.randomBytes(12).toString("hex")
+      },
+      JWT_SECRET,
+      { expiresIn: "10m" }
+    );
+
+    const authUrl = new URL(config.authUrl);
+    authUrl.searchParams.set("client_id", config.clientId);
+    authUrl.searchParams.set("redirect_uri", config.callbackUrl);
+    authUrl.searchParams.set("response_type", "code");
+    authUrl.searchParams.set("scope", config.scope);
+    authUrl.searchParams.set("state", state);
+    if (provider === "google") {
+      authUrl.searchParams.set("access_type", "offline");
+      authUrl.searchParams.set("prompt", "select_account");
+    }
+
+    res.redirect(authUrl.toString());
+  } catch (error) {
+    console.error("ERREUR SOCIAL START :", error);
+    res.redirect(`${publicAppUrl()}/login?social_error=${encodeURIComponent("Erreur démarrage OAuth")}`);
+  }
+});
+
+app.get("/auth/social/:provider/callback", async (req, res) => {
+  try {
+    const provider = String(req.params.provider || "").toLowerCase();
+    const { code, state } = req.query;
+    const config = socialProviderConfig(provider);
+
+    if (!code || !state || !config || !socialProviderEnabled(provider)) {
+      return res.redirect(`${publicAppUrl()}/login?social_error=${encodeURIComponent("OAuth incomplet ou non configuré")}`);
+    }
+
+    let statePayload;
+    try {
+      statePayload = jwt.verify(String(state), JWT_SECRET);
+    } catch {
+      return res.redirect(`${publicAppUrl()}/login?social_error=${encodeURIComponent("Session OAuth expirée")}`);
+    }
+
+    if (statePayload.provider !== provider) {
+      return res.redirect(`${publicAppUrl()}/login?social_error=${encodeURIComponent("Provider OAuth invalide")}`);
+    }
+
+    const tokenResponse = await fetch(config.tokenUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: config.clientId,
+        client_secret: config.clientSecret,
+        redirect_uri: config.callbackUrl,
+        grant_type: "authorization_code",
+        code: String(code)
+      })
+    });
+    const tokenPayload = await tokenResponse.json().catch(() => ({}));
+
+    if (!tokenResponse.ok || !tokenPayload.access_token) {
+      return res.redirect(`${publicAppUrl()}/login?social_error=${encodeURIComponent("Impossible de récupérer le profil social")}`);
+    }
+
+    const profileUrl = new URL(config.userInfoUrl);
+    const profileHeaders = {};
+    if (provider === "facebook") {
+      profileUrl.searchParams.set("access_token", tokenPayload.access_token);
+    } else {
+      profileHeaders.Authorization = `Bearer ${tokenPayload.access_token}`;
+    }
+
+    const profileResponse = await fetch(profileUrl.toString(), { headers: profileHeaders });
+    const rawProfile = await profileResponse.json().catch(() => ({}));
+
+    if (!profileResponse.ok) {
+      return res.redirect(`${publicAppUrl()}/login?social_error=${encodeURIComponent("Profil social inaccessible")}`);
+    }
+
+    const profile = normalizeSocialProfile(provider, rawProfile);
+    if (!profile.provider_user_id) {
+      return res.redirect(`${publicAppUrl()}/login?social_error=${encodeURIComponent("Identifiant social manquant")}`);
+    }
+
+    let userId = null;
+    const existingSocial = await pool.query(
+      "SELECT user_id FROM social_accounts WHERE provider=$1 AND provider_user_id=$2 LIMIT 1",
+      [provider, profile.provider_user_id]
+    );
+
+    if (existingSocial.rows[0]) {
+      userId = existingSocial.rows[0].user_id;
+    } else if (profile.email) {
+      const existingUser = await pool.query(
+        "SELECT id FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1",
+        [profile.email]
+      );
+      if (existingUser.rows[0]) userId = existingUser.rows[0].id;
+    }
+
+    if (!userId) {
+      await ensureDefaultSubscriptionPlans();
+      const planResult = await pool.query(
+        "SELECT * FROM subscription_plans ORDER BY price_monthly ASC, id ASC LIMIT 1"
+      );
+      const plan = planResult.rows[0] || {};
+      const displayName = profile.name || `${provider} utilisateur`;
+      const generatedEmail =
+        profile.email ||
+        `${provider}-${profile.provider_user_id}@social.trianglewmspro.local`;
+      const randomPassword = await hashPassword(crypto.randomBytes(24).toString("hex"));
+
+      const companyResult = await pool.query(
+        `INSERT INTO companies
+         (name, responsible_name, email, phone, plan_id, subscription_status,
+          trial_ends_at, email_verified, phone_verified, account_status,
+          trial_start_date, trial_end_date, subscription_plan, subscription_expires_at)
+         VALUES ($1,$2,$3,'',$4,'trial',NOW() + INTERVAL '15 days',$5,false,'active',
+                 NOW(),NOW() + INTERVAL '15 days',$6,NOW() + INTERVAL '15 days')
+         RETURNING *`,
+        [
+          `Entreprise de ${displayName}`,
+          displayName,
+          profile.email || "",
+          plan.id || null,
+          profile.email_verified === true,
+          plan.name || "Trial"
+        ]
+      );
+      const company = companyResult.rows[0];
+      const userResult = await pool.query(
+        `INSERT INTO users
+         (fullname, email, password, role, company_id, is_super_admin,
+          profile_image_url, email_verified, phone_verified, account_status,
+          invitation_status, verification_required, badge_code)
+         VALUES ($1,$2,$3,'admin',$4,false,$5,$6,false,'active','active',false,$7)
+         RETURNING id`,
+        [
+          displayName,
+          generatedEmail,
+          randomPassword,
+          company.id,
+          profile.avatar_url || "",
+          profile.email_verified === true,
+          `TRIANGLE-SOCIAL-${company.id}-${Date.now()}`
+        ]
+      );
+      userId = userResult.rows[0].id;
+
+      await pool.query(
+        `INSERT INTO subscriptions
+         (company_id, plan_id, start_date, end_date, status, payment_status)
+         VALUES ($1,$2,NOW(),NOW() + INTERVAL '15 days','trial','free_trial')`,
+        [company.id, plan.id || null]
+      );
+    }
+
+    await pool.query(
+      `INSERT INTO social_accounts
+       (user_id, provider, provider_user_id, email, phone, avatar_url, scopes_granted,
+        access_token_encrypted, refresh_token_encrypted)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       ON CONFLICT (provider, provider_user_id)
+       DO UPDATE SET
+         user_id=EXCLUDED.user_id,
+         email=EXCLUDED.email,
+         phone=EXCLUDED.phone,
+         avatar_url=EXCLUDED.avatar_url,
+         scopes_granted=EXCLUDED.scopes_granted,
+         access_token_encrypted=EXCLUDED.access_token_encrypted,
+         refresh_token_encrypted=EXCLUDED.refresh_token_encrypted,
+         updated_at=CURRENT_TIMESTAMP`,
+      [
+        userId,
+        provider,
+        profile.provider_user_id,
+        profile.email || "",
+        "",
+        profile.avatar_url || "",
+        config.scope,
+        encryptSocialToken(tokenPayload.access_token),
+        encryptSocialToken(tokenPayload.refresh_token || "")
+      ]
+    );
+
+    if (profile.email_verified && profile.email) {
+      await pool.query(
+        `UPDATE users
+         SET email_verified=true,
+             account_status='active',
+             verification_required=false,
+             profile_image_url=COALESCE(NULLIF(profile_image_url,''), $2)
+         WHERE id=$1`,
+        [userId, profile.avatar_url || ""]
+      );
+    }
+
+    await logAudit(
+      { ...req, user: { id: userId, role: "social_auth", company_id: null } },
+      "social_login",
+      "social_account",
+      userId,
+      { provider, scopes: config.scope }
+    );
+
+    const loginPayload = await buildLoginResponseForUser(userId);
+    if (!loginPayload) {
+      return res.redirect(`${publicAppUrl()}/login?social_error=${encodeURIComponent("Compte Triangle introuvable")}`);
+    }
+
+    const encoded = Buffer.from(JSON.stringify(loginPayload)).toString("base64url");
+    res.redirect(`${publicAppUrl()}/social-auth?payload=${encoded}`);
+  } catch (error) {
+    console.error("ERREUR SOCIAL CALLBACK :", error);
+    res.redirect(`${publicAppUrl()}/login?social_error=${encodeURIComponent("Erreur connexion sociale")}`);
+  }
+});
+
+app.delete("/auth/social/:provider", authenticateToken, async (req, res) => {
+  try {
+    const provider = String(req.params.provider || "").toLowerCase();
+    await pool.query(
+      "DELETE FROM social_accounts WHERE user_id=$1 AND provider=$2",
+      [req.user.id, provider]
+    );
+    await logAudit(req, "unlink_social_account", "social_account", req.user.id, { provider });
+    res.json({ success: true, message: "Compte social délié." });
+  } catch (error) {
+    console.error("ERREUR UNLINK SOCIAL :", error);
+    res.status(500).json({ error: "Erreur suppression liaison sociale" });
+  }
 });
 
 app.post("/support/contact", async (req, res) => {
