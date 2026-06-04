@@ -815,20 +815,22 @@ async function logActivity(user_name, user_role, action, module, details) {
 
 async function logAudit(req, action, entityType = "", entityId = null, details = {}) {
   try {
+    const headers = req?.headers || {};
+    const user = req?.user || {};
     await pool.query(
       `INSERT INTO audit_logs
        (user_id, user_email, user_role, company_id, action, entity_type, entity_id, ip_address, user_agent, details)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
       [
-        req.user?.id || null,
-        req.user?.email || "",
-        req.user?.role || "",
-        req.user?.company_id || null,
+        user.id || null,
+        user.email || "",
+        user.role || "",
+        getEffectiveCompanyId(req || {}) || user.company_id || null,
         action,
         entityType,
         entityId,
-        req.ip || req.headers["x-forwarded-for"] || "",
-        typeof req.get === "function" ? req.get("user-agent") || "" : "",
+        req?.ip || headers["x-forwarded-for"] || "",
+        typeof req?.get === "function" ? req.get("user-agent") || "" : "",
         JSON.stringify(details || {})
       ]
     );
@@ -4751,15 +4753,45 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
       const productResult = await client.query(
         `SELECT *
          FROM products
-         WHERE id=$1 AND company_id=$2
+         WHERE id=$1
+           AND (company_id=$2 OR company_id IS NULL)
          FOR UPDATE`,
         [item.product_id, companyId]
       );
 
-      const product = productResult.rows[0];
+      let product = productResult.rows[0];
 
       if (!product) {
+        const existingProduct = await client.query(
+          `SELECT id, reference, name, company_id
+           FROM products
+           WHERE id=$1
+           LIMIT 1`,
+          [item.product_id]
+        );
+        const found = existingProduct.rows[0];
+
+        if (found) {
+          throw new Error(
+            `Produit ${
+              found.reference || found.name || found.id
+            } appartient à une autre entreprise. Entreprise active : ${companyId}.`
+          );
+        }
+
         throw new Error("Produit introuvable dans cette entreprise.");
+      }
+
+      if (!product.company_id) {
+        const assignedProduct = await client.query(
+          `UPDATE products
+           SET company_id=$1,
+               updated_at=CURRENT_TIMESTAMP
+           WHERE id=$2
+           RETURNING *`,
+          [companyId, product.id]
+        );
+        product = assignedProduct.rows[0];
       }
 
       if (product.blocked_for_sale) {
@@ -5638,7 +5670,16 @@ async function updateSandboxPayment(req, res, nextStatus) {
 
   try {
     const { transaction_id, provider_reference } = req.body;
-    const safeReference = String(provider_reference || "").trim();
+    const numericTransactionId =
+      transaction_id !== undefined &&
+      transaction_id !== null &&
+      String(transaction_id).trim() !== "" &&
+      Number.isInteger(Number(transaction_id))
+        ? Number(transaction_id)
+        : null;
+    const safeReference = String(
+      provider_reference || (!numericTransactionId ? transaction_id || "" : "")
+    ).trim();
     console.log("Sandbox simulation request:", req.body);
     console.log("Reference received:", safeReference || transaction_id || "");
     await client.query("BEGIN");
@@ -5646,13 +5687,13 @@ async function updateSandboxPayment(req, res, nextStatus) {
     const transactionResult = await client.query(
       `SELECT *
        FROM payment_transactions
-       WHERE ($1::int IS NOT NULL AND id=$1::int)
-          OR ($2::text <> '' AND LOWER(TRIM(provider_reference))=LOWER(TRIM($2)))
-          OR ($2::text <> '' AND LOWER(TRIM(external_reference))=LOWER(TRIM($2)))
+       WHERE ($1::integer IS NOT NULL AND id=$1::integer)
+          OR ($2::text <> '' AND LOWER(TRIM(provider_reference::text))=LOWER(TRIM($2::text)))
+          OR ($2::text <> '' AND LOWER(TRIM(external_reference::text))=LOWER(TRIM($2::text)))
        ORDER BY id DESC
        LIMIT 1
        FOR UPDATE`,
-      [transaction_id || null, safeReference]
+      [numericTransactionId, safeReference]
     );
 
     if (transactionResult.rows.length === 0) {
@@ -5685,8 +5726,8 @@ async function updateSandboxPayment(req, res, nextStatus) {
 
     await client.query(
       `UPDATE payment_transactions
-       SET status=$1,
-           paid_at=CASE WHEN $1='paid' THEN CURRENT_TIMESTAMP ELSE paid_at END,
+       SET status=$1::varchar,
+           paid_at=CASE WHEN $1::text='paid' THEN CURRENT_TIMESTAMP ELSE paid_at END,
            response_payload=$2,
            provider_response=$2,
            updated_at=CURRENT_TIMESTAMP
@@ -5699,7 +5740,7 @@ async function updateSandboxPayment(req, res, nextStatus) {
     );
 
     await client.query(
-      `UPDATE sale_payments SET status=$1 WHERE transaction_id=$2`,
+      `UPDATE sale_payments SET status=$1::varchar WHERE transaction_id=$2`,
       [nextStatus, transaction.id]
     );
 
@@ -6130,6 +6171,33 @@ function getAccountingScope(req, requireCompany = false) {
   return { isSuperAdmin, companyId, values, filter, andFilter };
 }
 
+function logAccountingError(route, error, req, extra = {}) {
+  const payload = req?.body && typeof req.body === "object" ? { ...req.body } : req?.body;
+  console.error(`[ACCOUNTING ERROR] ${route}`, {
+    message: error?.message,
+    stack: error?.stack,
+    postgres: {
+      code: error?.code,
+      detail: error?.detail,
+      hint: error?.hint,
+      table: error?.table,
+      column: error?.column,
+      constraint: error?.constraint,
+      routine: error?.routine
+    },
+    context: {
+      company_id: getEffectiveCompanyId(req),
+      user_id: req?.user?.id || null,
+      role: req?.user?.role || "",
+      bank_id: payload?.bank_id || req?.params?.bank_id || null,
+      caisse_id: payload?.caisse_id || req?.params?.caisse_id || null,
+      transaction_number: payload?.transaction_number || extra.transaction_number || null,
+      ...extra
+    },
+    payload
+  });
+}
+
 app.get("/accounting/dashboard", authenticateToken, async (req, res) => {
   try {
     if (!canViewAccounting(req.user)) {
@@ -6209,7 +6277,7 @@ app.get("/accounting/dashboard", authenticateToken, async (req, res) => {
       }, {})
     });
   } catch (error) {
-    console.error("ERREUR ACCOUNTING DASHBOARD :", error);
+    logAccountingError("/accounting/dashboard", error, req);
     res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Erreur dashboard comptable" });
   }
 });
@@ -6281,7 +6349,7 @@ app.get("/accounting/caisses", authenticateToken, async (req, res) => {
     );
     res.json(result.rows);
   } catch (error) {
-    console.error("ERREUR ACCOUNTING CAISSES :", error);
+    logAccountingError("GET /accounting/caisses", error, req);
     res.status(500).json({ error: "Erreur lecture caisses comptables" });
   }
 });
@@ -6324,7 +6392,7 @@ app.get("/accounting/banks", authenticateToken, async (req, res) => {
     );
     res.json(result.rows);
   } catch (error) {
-    console.error("ERREUR ACCOUNTING BANKS :", error);
+    logAccountingError("GET /accounting/banks", error, req);
     res.status(500).json({ error: "Erreur lecture banques" });
   }
 });
@@ -6370,7 +6438,7 @@ app.post("/accounting/banks", authenticateToken, async (req, res) => {
     await logAudit(req, "create_bank", "accounting_bank", result.rows[0].id, { bank_name });
     res.status(201).json(result.rows[0]);
   } catch (error) {
-    console.error("ERREUR CREATE BANK :", error);
+    logAccountingError("POST /accounting/banks", error, req);
     res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Erreur création banque" });
   }
 });
@@ -6381,6 +6449,7 @@ app.put("/accounting/banks/:id", authenticateToken, async (req, res) => {
       return res.status(403).json({ error: "Accès gestion comptable refusé." });
     }
     const isSuperAdmin = req.user.is_super_admin === true;
+    const companyId = getEffectiveCompanyId(req);
     const {
       bank_name,
       account_number = "",
@@ -6403,8 +6472,34 @@ app.put("/accounting/banks/:id", authenticateToken, async (req, res) => {
     await logAudit(req, "update_bank", "accounting_bank", req.params.id, { bank_name });
     res.json(result.rows[0]);
   } catch (error) {
-    console.error("ERREUR UPDATE BANK :", error);
+    logAccountingError("PUT /accounting/banks/:id", error, req, { bank_id: req.params.id });
     res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Erreur modification banque" });
+  }
+});
+
+app.delete("/accounting/banks/:id", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageAccounting(req.user)) {
+      return res.status(403).json({ error: "Accès gestion comptable refusé." });
+    }
+    const isSuperAdmin = req.user.is_super_admin === true;
+    const companyId = getEffectiveCompanyId(req);
+    const result = await pool.query(
+      `UPDATE accounting_banks
+       SET is_active=false,
+           updated_at=CURRENT_TIMESTAMP
+       WHERE id=$1 ${isSuperAdmin && !companyId ? "" : "AND company_id=$2"}
+       RETURNING *`,
+      isSuperAdmin && !companyId ? [req.params.id] : [req.params.id, companyId || req.user.company_id]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: "Banque introuvable." });
+    await logAudit(req, "deactivate_bank", "accounting_bank", req.params.id, {
+      bank_name: result.rows[0].bank_name
+    });
+    res.json({ message: "Banque désactivée.", bank: result.rows[0] });
+  } catch (error) {
+    logAccountingError("DELETE /accounting/banks/:id", error, req, { bank_id: req.params.id });
+    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Erreur suppression banque" });
   }
 });
 
@@ -6426,7 +6521,7 @@ app.get("/accounting/transactions", authenticateToken, async (req, res) => {
     );
     res.json(result.rows);
   } catch (error) {
-    console.error("ERREUR ACCOUNTING TRANSACTIONS :", error);
+    logAccountingError("GET /accounting/transactions", error, req);
     res.status(500).json({ error: "Erreur lecture mouvements comptables" });
   }
 });
@@ -6516,11 +6611,13 @@ app.post("/accounting/transactions", authenticateToken, async (req, res) => {
     }
 
     const treasuryDelta =
-      !bank && !caisse && (transaction_type === "encaissement_especes" || direction === "entrée")
+      transaction_type === "retrait_banque" && bank && !caisse
         ? amountValue
-        : !bank && !caisse && direction === "sortie"
-          ? -amountValue
-          : 0;
+        : !bank && !caisse && (transaction_type === "encaissement_especes" || direction === "entrée")
+          ? amountValue
+          : !bank && !caisse && direction === "sortie"
+            ? -amountValue
+            : 0;
 
     if (treasuryDelta !== 0) {
       if (treasuryDelta < 0) {
@@ -6670,7 +6767,7 @@ app.post("/accounting/transactions", authenticateToken, async (req, res) => {
     res.status(201).json(result.rows[0]);
   } catch (error) {
     await client.query("ROLLBACK");
-    console.error("ERREUR CREATE ACCOUNTING TRANSACTION :", error);
+    logAccountingError("POST /accounting/transactions", error, req);
     res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Erreur mouvement comptable" });
   } finally {
     client.release();
@@ -6695,7 +6792,7 @@ app.get("/accounting/vouchers", authenticateToken, async (req, res) => {
     );
     res.json(result.rows);
   } catch (error) {
-    console.error("ERREUR VOUCHERS :", error);
+    logAccountingError("GET /accounting/vouchers", error, req);
     res.status(500).json({ error: "Erreur lecture bons" });
   }
 });
@@ -6759,7 +6856,7 @@ app.post("/accounting/vouchers", authenticateToken, async (req, res) => {
     await logAudit(req, "create_cash_voucher", "cash_voucher", result.rows[0].id, { voucher_type, amount: amountValue });
     res.status(201).json(result.rows[0]);
   } catch (error) {
-    console.error("ERREUR CREATE VOUCHER :", error);
+    logAccountingError("POST /accounting/vouchers", error, req);
     res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Erreur création bon" });
   }
 });
@@ -6774,9 +6871,11 @@ app.put("/accounting/vouchers/:id/validate", authenticateToken, async (req, res)
     const voucherResult = await client.query(
       `SELECT *
        FROM cash_vouchers
-       WHERE id=$1 ${req.user.is_super_admin === true ? "" : "AND company_id=$2"}
+       WHERE id=$1 ${isSuperAdminUser(req.user) && !getEffectiveCompanyId(req) ? "" : "AND company_id=$2"}
        FOR UPDATE`,
-      req.user.is_super_admin === true ? [req.params.id] : [req.params.id, req.user.company_id]
+      isSuperAdminUser(req.user) && !getEffectiveCompanyId(req)
+        ? [req.params.id]
+        : [req.params.id, getEffectiveCompanyId(req) || req.user.company_id]
     );
     const voucher = voucherResult.rows[0];
     if (!voucher) {
@@ -6931,24 +7030,65 @@ app.put("/accounting/vouchers/:id/validate", authenticateToken, async (req, res)
     res.json(updated.rows[0]);
   } catch (error) {
     await client.query("ROLLBACK");
-    console.error("ERREUR VALIDATE VOUCHER :", error);
+    logAccountingError("PUT /accounting/vouchers/:id/validate", error, req);
     res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Erreur validation bon" });
   } finally {
     client.release();
   }
 });
 
+app.put("/accounting/vouchers/:id/reject", authenticateToken, async (req, res) => {
+  try {
+    if (!canApproveAccounting(req.user) && !canManageAccounting(req.user)) {
+      return res.status(403).json({ error: "Accès refus bon comptable refusé." });
+    }
+    const isGlobalSuperAdmin = isSuperAdminUser(req.user) && !getEffectiveCompanyId(req);
+    const values = [
+      "refusé",
+      req.body?.rejection_reason || req.body?.reason || "",
+      req.user.id,
+      req.params.id
+    ];
+    let query = `
+      UPDATE cash_vouchers
+      SET status=$1,
+          rejection_reason=$2,
+          validated_by=$3,
+          validated_at=CURRENT_TIMESTAMP,
+          updated_at=CURRENT_TIMESTAMP
+      WHERE id=$4
+    `;
+    if (!isGlobalSuperAdmin) {
+      values.push(getEffectiveCompanyId(req) || req.user.company_id);
+      query += " AND company_id=$5";
+    }
+    query += " RETURNING *";
+
+    const result = await pool.query(query, values);
+    if (!result.rows[0]) return res.status(404).json({ error: "Bon introuvable." });
+    await logAudit(req, "reject_cash_voucher", "cash_voucher", req.params.id, {
+      reason: req.body?.rejection_reason || req.body?.reason || ""
+    });
+    res.json(result.rows[0]);
+  } catch (error) {
+    logAccountingError("PUT /accounting/vouchers/:id/reject", error, req);
+    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Erreur refus bon" });
+  }
+});
+
 app.get("/accounting/expense-requests", authenticateToken, async (req, res) => {
   try {
+    if (!canViewAccounting(req.user)) {
+      return res.status(403).json({ error: "Accès comptabilité refusé." });
+    }
     const isSuperAdmin = isSuperAdminUser(req.user);
-    const canSeeAll = canViewAccounting(req.user);
     const activeCompanyId = getEffectiveCompanyId(req);
     const whereClause = isSuperAdmin
       ? activeCompanyId ? "company_id=$1" : "true"
-      : canSeeAll ? "company_id=$1" : "created_by=$1";
+      : "company_id=$1";
     const values = isSuperAdmin
       ? activeCompanyId ? [activeCompanyId] : []
-      : canSeeAll ? [req.user.company_id] : [req.user.id];
+      : [req.user.company_id];
     const result = await pool.query(
       `SELECT *
        FROM expense_requests
@@ -6958,13 +7098,16 @@ app.get("/accounting/expense-requests", authenticateToken, async (req, res) => {
     );
     res.json(result.rows);
   } catch (error) {
-    console.error("ERREUR EXPENSE REQUESTS :", error);
+    logAccountingError("GET /accounting/expense-requests", error, req);
     res.status(500).json({ error: "Erreur lecture demandes" });
   }
 });
 
 app.post("/accounting/expense-requests", authenticateToken, async (req, res) => {
   try {
+    if (!canViewAccounting(req.user)) {
+      return res.status(403).json({ error: "Accès comptabilité refusé." });
+    }
     const {
       requested_amount,
       reason,
@@ -7005,7 +7148,7 @@ app.post("/accounting/expense-requests", authenticateToken, async (req, res) => 
     await logAudit(req, "create_expense_request", "expense_request", result.rows[0].id, { amount: amountValue });
     res.status(201).json(result.rows[0]);
   } catch (error) {
-    console.error("ERREUR CREATE EXPENSE REQUEST :", error);
+    logAccountingError("POST /accounting/expense-requests", error, req);
     res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Erreur création demande" });
   }
 });
@@ -7027,12 +7170,13 @@ app.put("/accounting/expense-requests/:id/status", authenticateToken, async (req
     }
 
     await client.query("BEGIN");
+    const isGlobalSuperAdmin = isSuperAdminUser(req.user) && !getEffectiveCompanyId(req);
     const requestResult = await client.query(
       `SELECT *
        FROM expense_requests
-       WHERE id=$1 ${req.user.is_super_admin === true ? "" : "AND company_id=$2"}
+       WHERE id=$1 ${isGlobalSuperAdmin ? "" : "AND company_id=$2"}
        FOR UPDATE`,
-      req.user.is_super_admin === true ? [req.params.id] : [req.params.id, req.user.company_id]
+      isGlobalSuperAdmin ? [req.params.id] : [req.params.id, getEffectiveCompanyId(req) || req.user.company_id]
     );
     const request = requestResult.rows[0];
     if (!request) {
@@ -7082,7 +7226,7 @@ app.put("/accounting/expense-requests/:id/status", authenticateToken, async (req
     res.json(update.rows[0]);
   } catch (error) {
     await client.query("ROLLBACK");
-    console.error("ERREUR UPDATE EXPENSE STATUS :", error);
+    logAccountingError("PUT /accounting/expense-requests/:id/status", error, req);
     res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Erreur changement statut demande" });
   } finally {
     client.release();
@@ -7149,7 +7293,7 @@ app.get("/accounting/statements", authenticateToken, async (req, res) => {
       grand_livre: entries.rows
     });
   } catch (error) {
-    console.error("ERREUR ACCOUNTING STATEMENTS :", error);
+    logAccountingError("GET /accounting/statements", error, req);
     res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Erreur états financiers" });
   }
 });
@@ -10209,12 +10353,19 @@ async function getAssistantModuleKnowledge(message) {
   const search = `%${String(message || "").trim()}%`;
 
   try {
+    const hasActiveColumn = await columnExists("ai_module_knowledge", "active");
+    const hasIsActiveColumn = await columnExists("ai_module_knowledge", "is_active");
+    const activeFilter = hasActiveColumn
+      ? "active=true AND"
+      : hasIsActiveColumn
+        ? "is_active=true AND"
+        : "";
     const result = await pool.query(
       `SELECT module_key, module_name, description, role_explanation,
               available_actions, pages, permissions, data_sources, examples
        FROM ai_module_knowledge
-       WHERE active=true
-         AND (
+       WHERE ${activeFilter}
+         (
            module_key ILIKE $1 OR module_name ILIKE $1
            OR description ILIKE $1 OR role_explanation ILIKE $1
          )
@@ -10340,7 +10491,7 @@ async function runAssistantTool(toolName, user) {
 
   if (toolName === "get_accounting_summary") {
     const banks = await pool.query(
-      `SELECT id, bank_name, account_number, currency, current_balance, active
+      `SELECT id, bank_name, account_number, currency, current_balance, is_active
        FROM accounting_banks ${where}
        ORDER BY id DESC
        LIMIT 30`,
