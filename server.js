@@ -1021,7 +1021,11 @@ const COMPANY_MODULE_KEYS = [
   "rapports",
   "transport",
   "crm",
-  "marketplace"
+  "marketplace",
+  "automobile",
+  "immobilier",
+  "hotel",
+  "restaurant"
 ];
 
 async function getCompanyModules(companyId) {
@@ -2913,6 +2917,14 @@ app.post("/products", authenticateToken, async (req, res) => {
       location_code,
       minimum_stock,
       image_url,
+      purchase_price,
+      sale_price,
+      rental_price,
+      daily_price,
+      monthly_price,
+      is_sellable,
+      is_rentable,
+      product_type,
       user_name,
       user_role
     } = req.body;
@@ -2936,11 +2948,20 @@ app.post("/products", authenticateToken, async (req, res) => {
     location_code,
     minimum_stock,
     image_url,
+    purchase_price,
+    sale_price,
+    rental_price,
+    daily_price,
+    monthly_price,
+    is_sellable,
+    is_rentable,
+    product_type,
     company_id
   )
   VALUES (
     $1,$2,$3,$4,$5,$6,$7,$8,
-    $9,$10,$11,$12,$13,$14,$15,$16,$17
+    $9,$10,$11,$12,$13,$14,$15,$16,
+    $17,$18,$19,$20,$21,$22,$23,$24,$25
   )
   RETURNING *`,
       [
@@ -2960,6 +2981,14 @@ app.post("/products", authenticateToken, async (req, res) => {
         location_code || "",
         Number(minimum_stock || 5),
         image_url || "",
+        Number(purchase_price || 0),
+        Number(sale_price || 0),
+        Number(rental_price || 0),
+        Number(daily_price || 0),
+        Number(monthly_price || 0),
+        is_sellable !== false,
+        is_rentable === true,
+        product_type || "stock_normal",
         companyId
       ]
     );
@@ -3010,6 +3039,14 @@ app.put(
       location_code,
       minimum_stock,
       image_url,
+      purchase_price,
+      sale_price,
+      rental_price,
+      daily_price,
+      monthly_price,
+      is_sellable,
+      is_rentable,
+      product_type,
       user_name,
       user_role
     } = req.body;
@@ -3031,6 +3068,14 @@ app.put(
       location_code || "",
       Number(minimum_stock || 5),
       image_url || "",
+      Number(purchase_price || 0),
+      Number(sale_price || 0),
+      Number(rental_price || 0),
+      Number(daily_price || 0),
+      Number(monthly_price || 0),
+      is_sellable !== false,
+      is_rentable === true,
+      product_type || "stock_normal",
       id
     ];
 
@@ -3039,8 +3084,11 @@ app.put(
       SET reference=$1, name=$2, category=$3, stock=$4, warehouse=$5,
           status=$6, unit=$7, weight=$8, dimensions=$9, barcode=$10,
           description=$11, is_active=$12, location_id=$13, location_code=$14,
-          minimum_stock=$15, image_url=$16
-      WHERE id=$17
+          minimum_stock=$15, image_url=$16, purchase_price=$17,
+          sale_price=$18, rental_price=$19, daily_price=$20,
+          monthly_price=$21, is_sellable=$22, is_rentable=$23,
+          product_type=$24
+      WHERE id=$25
     `;
 
     if (!isSuperAdmin) {
@@ -8929,6 +8977,927 @@ app.get("/super-admin/marketplace/customers", authenticateToken, async (req, res
   }
 });
 
+/* MODULES METIERS : AUTOMOBILE / IMMOBILIER / RESTAURANT */
+function canViewBusinessModule(user) {
+  const role = normalizeRole(user?.role);
+  return (
+    user?.is_super_admin === true ||
+    role === "super_admin" ||
+    role === "admin" ||
+    role === "directeur" ||
+    role === "direction" ||
+    role === "comptable" ||
+    role === "caissier" ||
+    role === "vendeur" ||
+    role === "serveur" ||
+    role === "cuisine" ||
+    role === "magasinier" ||
+    role === "employe" ||
+    role === "employé"
+  );
+}
+
+function canManageBusinessModule(user) {
+  const role = normalizeRole(user?.role);
+  return (
+    user?.is_super_admin === true ||
+    role === "super_admin" ||
+    role === "admin" ||
+    role === "directeur" ||
+    role === "direction" ||
+    role === "comptable" ||
+    role === "caissier" ||
+    role === "vendeur" ||
+    role === "serveur" ||
+    role === "cuisine"
+  );
+}
+
+function getBusinessCompanyScope(req, alias = "") {
+  const { companyId, shouldFilterByCompany } = getCompanyFilter(req);
+  const prefix = alias ? `${alias}.` : "";
+  const values = [];
+  let clause = "";
+
+  if (shouldFilterByCompany) {
+    values.push(companyId);
+    clause = `WHERE ${prefix}company_id=$1`;
+  }
+
+  return { companyId, shouldFilterByCompany, clause, values };
+}
+
+async function recordBusinessPayment(client, {
+  companyId,
+  amount,
+  category,
+  sourceType,
+  sourceId,
+  description,
+  partnerName = "",
+  user = {},
+  documentType = "Reçu"
+}) {
+  const amountValue = Number(amount || 0);
+  if (!companyId || amountValue <= 0) return null;
+
+  const transactionNumber = await nextAccountingNumber(
+    client,
+    "accounting_transactions",
+    "transaction_number",
+    "METIER",
+    companyId
+  );
+
+  const transaction = await client.query(
+    `INSERT INTO accounting_transactions
+     (company_id, transaction_number, transaction_type, source_type, source_id,
+      amount, currency, direction, category, partner_name, description, status,
+      source_label, destination_label, created_by, validated_by, validated_at)
+     VALUES ($1,$2,'encaissement_metier',$3,$4,$5,'FCFA','entrée',$6,$7,$8,
+             'validé',$9,'Trésorerie',$10,$10,CURRENT_TIMESTAMP)
+     RETURNING *`,
+    [
+      companyId,
+      transactionNumber,
+      sourceType,
+      sourceId,
+      amountValue,
+      category,
+      partnerName,
+      description,
+      category,
+      user?.id || null
+    ]
+  );
+
+  const documentNumber = await nextAccountingNumber(
+    client,
+    "documents",
+    "document_number",
+    "DOC-METIER",
+    companyId
+  );
+
+  await client.query(
+    `INSERT INTO documents
+     (document_type, document_number, client_name, total_amount, observation,
+      created_by, company_id, related_entity_type, related_entity_id, status)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'Validé')`,
+    [
+      documentType,
+      documentNumber,
+      partnerName,
+      amountValue,
+      description,
+      user?.email || user?.fullname || "Triangle WMS",
+      companyId,
+      sourceType,
+      sourceId
+    ]
+  );
+
+  return transaction.rows[0];
+}
+
+app.get("/automobile/dashboard", authenticateToken, async (req, res) => {
+  try {
+    if (!canViewBusinessModule(req.user)) return res.status(403).json({ error: "Accès automobile refusé." });
+    const { clause, values } = getBusinessCompanyScope(req);
+    const vehicleFilter = clause || "";
+    const rentalFilter = clause || "";
+    const salesFilter = clause || "";
+    const [vehicles, rentals, sales] = await Promise.all([
+      pool.query(`SELECT COUNT(*)::int AS total,
+                         COUNT(*) FILTER (WHERE statut='disponible')::int AS disponibles,
+                         COUNT(*) FILTER (WHERE statut='loué' OR statut='loue')::int AS loues,
+                         COUNT(*) FILTER (WHERE statut='vendu')::int AS vendus
+                  FROM vehicles ${vehicleFilter}`, values),
+      pool.query(`SELECT COUNT(*)::int AS total,
+                         COALESCE(SUM(total_amount),0)::numeric AS total_amount,
+                         COALESCE(SUM(paid_amount),0)::numeric AS paid_amount
+                  FROM vehicle_rentals ${rentalFilter}`, values),
+      pool.query(`SELECT COUNT(*)::int AS total,
+                         COALESCE(SUM(sale_price),0)::numeric AS sale_amount,
+                         COALESCE(SUM(amount_paid),0)::numeric AS paid_amount,
+                         COALESCE(SUM(remaining_amount),0)::numeric AS remaining_amount
+                  FROM vehicle_sales ${salesFilter}`, values)
+    ]);
+    res.json({ vehicles: vehicles.rows[0], rentals: rentals.rows[0], sales: sales.rows[0] });
+  } catch (error) {
+    console.error("ERREUR AUTOMOBILE DASHBOARD :", error);
+    res.status(500).json({ error: "Erreur dashboard automobile" });
+  }
+});
+
+app.get("/automobile/vehicles", authenticateToken, async (req, res) => {
+  try {
+    if (!canViewBusinessModule(req.user)) return res.status(403).json({ error: "Accès automobile refusé." });
+    const { clause, values } = getBusinessCompanyScope(req);
+    const result = await pool.query(`SELECT * FROM vehicles ${clause} ORDER BY id DESC LIMIT 200`, values);
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: "Erreur lecture véhicules" });
+  }
+});
+
+app.post("/automobile/vehicles", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageBusinessModule(req.user)) return res.status(403).json({ error: "Accès modification automobile refusé." });
+    const companyId = getEffectiveCompanyId(req);
+    const {
+      product_id, marque, modele, immatriculation, numero_chassis, annee,
+      couleur, kilometrage, carburant, statut = "disponible",
+      prix_vente, prix_location_jour, prix_location_mois
+    } = req.body || {};
+    const result = await pool.query(
+      `INSERT INTO vehicles
+       (company_id, product_id, marque, modele, immatriculation, numero_chassis,
+        annee, couleur, kilometrage, carburant, statut, prix_vente,
+        prix_location_jour, prix_location_mois, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+       RETURNING *`,
+      [
+        companyId, product_id || null, marque || "", modele || "",
+        immatriculation || "", numero_chassis || "", annee || null,
+        couleur || "", Number(kilometrage || 0), carburant || "", statut,
+        Number(prix_vente || 0), Number(prix_location_jour || 0),
+        Number(prix_location_mois || 0), req.user.id
+      ]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error("ERREUR CREATION VEHICULE :", error);
+    res.status(500).json({ error: "Erreur création véhicule" });
+  }
+});
+
+app.put("/automobile/vehicles/:id", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageBusinessModule(req.user)) return res.status(403).json({ error: "Accès modification automobile refusé." });
+    const companyId = getEffectiveCompanyId(req);
+    const isSuper = isSuperAdminUser(req.user);
+    const fields = req.body || {};
+    const result = await pool.query(
+      `UPDATE vehicles SET
+         marque=COALESCE($1,marque), modele=COALESCE($2,modele),
+         immatriculation=COALESCE($3,immatriculation), numero_chassis=COALESCE($4,numero_chassis),
+         annee=COALESCE($5,annee), couleur=COALESCE($6,couleur),
+         kilometrage=COALESCE($7,kilometrage), carburant=COALESCE($8,carburant),
+         statut=COALESCE($9,statut), prix_vente=COALESCE($10,prix_vente),
+         prix_location_jour=COALESCE($11,prix_location_jour),
+         prix_location_mois=COALESCE($12,prix_location_mois),
+         updated_at=CURRENT_TIMESTAMP
+       WHERE id=$13 ${isSuper && !companyId ? "" : "AND company_id=$14"}
+       RETURNING *`,
+      [
+        fields.marque ?? null, fields.modele ?? null, fields.immatriculation ?? null,
+        fields.numero_chassis ?? null, fields.annee ?? null, fields.couleur ?? null,
+        fields.kilometrage ?? null, fields.carburant ?? null, fields.statut ?? null,
+        fields.prix_vente ?? null, fields.prix_location_jour ?? null,
+        fields.prix_location_mois ?? null, req.params.id, companyId
+      ]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: "Véhicule introuvable" });
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: "Erreur modification véhicule" });
+  }
+});
+
+app.get("/automobile/rentals", authenticateToken, async (req, res) => {
+  try {
+    if (!canViewBusinessModule(req.user)) return res.status(403).json({ error: "Accès automobile refusé." });
+    const { clause, values } = getBusinessCompanyScope(req, "r");
+    const result = await pool.query(
+      `SELECT r.*, v.marque, v.modele, v.immatriculation
+       FROM vehicle_rentals r
+       LEFT JOIN vehicles v ON v.id=r.vehicle_id
+       ${clause}
+       ORDER BY r.id DESC LIMIT 200`,
+      values
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: "Erreur locations véhicules" });
+  }
+});
+
+app.post("/automobile/rentals", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    if (!canManageBusinessModule(req.user)) return res.status(403).json({ error: "Accès location véhicule refusé." });
+    const companyId = getEffectiveCompanyId(req);
+    const { vehicle_id, client_name, client_phone, start_date, end_date, price_per_day, total_amount, deposit_amount, paid_amount } = req.body || {};
+    await client.query("BEGIN");
+    const rental = await client.query(
+      `INSERT INTO vehicle_rentals
+       (company_id, vehicle_id, client_name, client_phone, start_date, end_date,
+        price_per_day, total_amount, deposit_amount, paid_amount, status, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+       RETURNING *`,
+      [
+        companyId, vehicle_id || null, client_name || "", client_phone || "",
+        start_date || null, end_date || null, Number(price_per_day || 0),
+        Number(total_amount || 0), Number(deposit_amount || 0),
+        Number(paid_amount || 0), Number(paid_amount || 0) > 0 ? "actif" : "en_attente",
+        req.user.id
+      ]
+    );
+    if (vehicle_id) {
+      await client.query("UPDATE vehicles SET statut='loué', updated_at=CURRENT_TIMESTAMP WHERE id=$1 AND company_id=$2", [vehicle_id, companyId]);
+    }
+    if (Number(paid_amount || 0) > 0) {
+      await recordBusinessPayment(client, {
+        companyId,
+        amount: paid_amount,
+        category: "Location véhicule",
+        sourceType: "vehicle_rental",
+        sourceId: rental.rows[0].id,
+        description: `Paiement location véhicule ${rental.rows[0].id}`,
+        partnerName: client_name || "",
+        user: req.user,
+        documentType: "Reçu location véhicule"
+      });
+    }
+    await client.query("COMMIT");
+    res.status(201).json(rental.rows[0]);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("ERREUR LOCATION VEHICULE :", error);
+    res.status(500).json({ error: error.message || "Erreur location véhicule" });
+  } finally {
+    client.release();
+  }
+});
+
+app.put("/automobile/rentals/:id/status", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageBusinessModule(req.user)) return res.status(403).json({ error: "Accès location véhicule refusé." });
+    const companyId = getEffectiveCompanyId(req);
+    const { status } = req.body || {};
+    const result = await pool.query(
+      `UPDATE vehicle_rentals SET status=$1, updated_at=CURRENT_TIMESTAMP
+       WHERE id=$2 AND ($3::int IS NULL OR company_id=$3)
+       RETURNING *`,
+      [status || "terminé", req.params.id, companyId]
+    );
+    if (result.rows[0]?.vehicle_id && ["terminé", "termine", "annulé", "annule"].includes(String(status || "").toLowerCase())) {
+      await pool.query("UPDATE vehicles SET statut='disponible', updated_at=CURRENT_TIMESTAMP WHERE id=$1", [result.rows[0].vehicle_id]);
+    }
+    res.json(result.rows[0] || {});
+  } catch (error) {
+    res.status(500).json({ error: "Erreur statut location véhicule" });
+  }
+});
+
+app.get("/automobile/sales", authenticateToken, async (req, res) => {
+  try {
+    if (!canViewBusinessModule(req.user)) return res.status(403).json({ error: "Accès automobile refusé." });
+    const { clause, values } = getBusinessCompanyScope(req, "s");
+    const result = await pool.query(
+      `SELECT s.*, v.marque, v.modele, v.immatriculation
+       FROM vehicle_sales s
+       LEFT JOIN vehicles v ON v.id=s.vehicle_id
+       ${clause}
+       ORDER BY s.id DESC LIMIT 200`,
+      values
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: "Erreur ventes véhicules" });
+  }
+});
+
+app.post("/automobile/sales", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    if (!canManageBusinessModule(req.user)) return res.status(403).json({ error: "Accès vente véhicule refusé." });
+    const companyId = getEffectiveCompanyId(req);
+    const { vehicle_id, client_name, client_phone, sale_price, amount_paid, payment_plan } = req.body || {};
+    const remaining = Math.max(Number(sale_price || 0) - Number(amount_paid || 0), 0);
+    await client.query("BEGIN");
+    const sale = await client.query(
+      `INSERT INTO vehicle_sales
+       (company_id, vehicle_id, client_name, client_phone, sale_price,
+        amount_paid, remaining_amount, payment_plan, status, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+       RETURNING *`,
+      [
+        companyId, vehicle_id || null, client_name || "", client_phone || "",
+        Number(sale_price || 0), Number(amount_paid || 0), remaining,
+        payment_plan || "comptant", remaining > 0 ? "partiel" : "payé", req.user.id
+      ]
+    );
+    if (vehicle_id && remaining <= 0) {
+      await client.query("UPDATE vehicles SET statut='vendu', updated_at=CURRENT_TIMESTAMP WHERE id=$1 AND company_id=$2", [vehicle_id, companyId]);
+    }
+    if (Number(amount_paid || 0) > 0) {
+      await recordBusinessPayment(client, {
+        companyId,
+        amount: amount_paid,
+        category: "Vente véhicule",
+        sourceType: "vehicle_sale",
+        sourceId: sale.rows[0].id,
+        description: `Paiement vente véhicule ${sale.rows[0].id}`,
+        partnerName: client_name || "",
+        user: req.user,
+        documentType: "Reçu vente véhicule"
+      });
+    }
+    await client.query("COMMIT");
+    res.status(201).json(sale.rows[0]);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("ERREUR VENTE VEHICULE :", error);
+    res.status(500).json({ error: error.message || "Erreur vente véhicule" });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/immobilier/dashboard", authenticateToken, async (req, res) => {
+  try {
+    if (!canViewBusinessModule(req.user)) return res.status(403).json({ error: "Accès immobilier refusé." });
+    const { clause, values } = getBusinessCompanyScope(req);
+    const [propertiesResult, rentals, sales, reservations] = await Promise.all([
+      pool.query(`SELECT COUNT(*)::int AS total,
+                         COUNT(*) FILTER (WHERE status='disponible')::int AS disponibles,
+                         COUNT(*) FILTER (WHERE status='loué' OR status='loue')::int AS loues,
+                         COUNT(*) FILTER (WHERE status='vendu')::int AS vendus
+                  FROM properties ${clause}`, values),
+      pool.query(`SELECT COUNT(*)::int AS total, COALESCE(SUM(paid_amount),0)::numeric AS paid_amount FROM property_rentals ${clause}`, values),
+      pool.query(`SELECT COUNT(*)::int AS total, COALESCE(SUM(amount_paid),0)::numeric AS paid_amount, COALESCE(SUM(remaining_amount),0)::numeric AS remaining_amount FROM property_sales ${clause}`, values),
+      pool.query(`SELECT COUNT(*)::int AS total, COALESCE(SUM(paid_amount),0)::numeric AS paid_amount FROM hotel_reservations ${clause}`, values)
+    ]);
+    res.json({ properties: propertiesResult.rows[0], rentals: rentals.rows[0], sales: sales.rows[0], reservations: reservations.rows[0] });
+  } catch (error) {
+    res.status(500).json({ error: "Erreur dashboard immobilier" });
+  }
+});
+
+app.get("/immobilier/properties", authenticateToken, async (req, res) => {
+  try {
+    if (!canViewBusinessModule(req.user)) return res.status(403).json({ error: "Accès immobilier refusé." });
+    const { clause, values } = getBusinessCompanyScope(req);
+    const result = await pool.query(`SELECT * FROM properties ${clause} ORDER BY id DESC LIMIT 200`, values);
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: "Erreur lecture biens" });
+  }
+});
+
+app.post("/immobilier/properties", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageBusinessModule(req.user)) return res.status(403).json({ error: "Accès modification immobilier refusé." });
+    const companyId = getEffectiveCompanyId(req);
+    const { type, title, description, address, city, surface, rooms_count, price_sale, price_rent_day, price_rent_month, status } = req.body || {};
+    const result = await pool.query(
+      `INSERT INTO properties
+       (company_id, type, title, description, address, city, surface,
+        rooms_count, price_sale, price_rent_day, price_rent_month, status, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+       RETURNING *`,
+      [
+        companyId, type || "maison", title || "", description || "",
+        address || "", city || "", Number(surface || 0), Number(rooms_count || 0),
+        Number(price_sale || 0), Number(price_rent_day || 0),
+        Number(price_rent_month || 0), status || "disponible", req.user.id
+      ]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error("ERREUR CREATION BIEN :", error);
+    res.status(500).json({ error: "Erreur création bien immobilier" });
+  }
+});
+
+app.get("/immobilier/rentals", authenticateToken, async (req, res) => {
+  try {
+    if (!canViewBusinessModule(req.user)) return res.status(403).json({ error: "Accès immobilier refusé." });
+    const { clause, values } = getBusinessCompanyScope(req, "r");
+    const result = await pool.query(
+      `SELECT r.*, p.title, p.type, p.address
+       FROM property_rentals r
+       LEFT JOIN properties p ON p.id=r.property_id
+       ${clause}
+       ORDER BY r.id DESC LIMIT 200`,
+      values
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: "Erreur locations immobilières" });
+  }
+});
+
+app.post("/immobilier/rentals", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    if (!canManageBusinessModule(req.user)) return res.status(403).json({ error: "Accès location immobilier refusé." });
+    const companyId = getEffectiveCompanyId(req);
+    const { property_id, client_name, client_phone, start_date, end_date, total_amount, deposit_amount, paid_amount } = req.body || {};
+    await client.query("BEGIN");
+    const rental = await client.query(
+      `INSERT INTO property_rentals
+       (company_id, property_id, client_name, client_phone, start_date, end_date,
+        total_amount, deposit_amount, paid_amount, status, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+       RETURNING *`,
+      [
+        companyId, property_id || null, client_name || "", client_phone || "",
+        start_date || null, end_date || null, Number(total_amount || 0),
+        Number(deposit_amount || 0), Number(paid_amount || 0),
+        Number(paid_amount || 0) > 0 ? "actif" : "en_attente", req.user.id
+      ]
+    );
+    if (property_id) {
+      await client.query("UPDATE properties SET status='loué', updated_at=CURRENT_TIMESTAMP WHERE id=$1 AND company_id=$2", [property_id, companyId]);
+    }
+    if (Number(paid_amount || 0) > 0) {
+      await recordBusinessPayment(client, {
+        companyId,
+        amount: paid_amount,
+        category: "Location immobilière",
+        sourceType: "property_rental",
+        sourceId: rental.rows[0].id,
+        description: `Paiement location immobilière ${rental.rows[0].id}`,
+        partnerName: client_name || "",
+        user: req.user,
+        documentType: "Reçu location immobilière"
+      });
+    }
+    await client.query("COMMIT");
+    res.status(201).json(rental.rows[0]);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    res.status(500).json({ error: error.message || "Erreur location immobilière" });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/immobilier/sales", authenticateToken, async (req, res) => {
+  try {
+    if (!canViewBusinessModule(req.user)) return res.status(403).json({ error: "Accès immobilier refusé." });
+    const { clause, values } = getBusinessCompanyScope(req, "s");
+    const result = await pool.query(
+      `SELECT s.*, p.title, p.type, p.address
+       FROM property_sales s
+       LEFT JOIN properties p ON p.id=s.property_id
+       ${clause}
+       ORDER BY s.id DESC LIMIT 200`,
+      values
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: "Erreur ventes immobilières" });
+  }
+});
+
+app.post("/immobilier/sales", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    if (!canManageBusinessModule(req.user)) return res.status(403).json({ error: "Accès vente immobilier refusé." });
+    const companyId = getEffectiveCompanyId(req);
+    const { property_id, client_name, client_phone, sale_price, amount_paid, payment_plan } = req.body || {};
+    const remaining = Math.max(Number(sale_price || 0) - Number(amount_paid || 0), 0);
+    await client.query("BEGIN");
+    const sale = await client.query(
+      `INSERT INTO property_sales
+       (company_id, property_id, client_name, client_phone, sale_price,
+        amount_paid, remaining_amount, payment_plan, status, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+       RETURNING *`,
+      [
+        companyId, property_id || null, client_name || "", client_phone || "",
+        Number(sale_price || 0), Number(amount_paid || 0), remaining,
+        payment_plan || "comptant", remaining > 0 ? "partiel" : "payé", req.user.id
+      ]
+    );
+    if (property_id && remaining <= 0) {
+      await client.query("UPDATE properties SET status='vendu', updated_at=CURRENT_TIMESTAMP WHERE id=$1 AND company_id=$2", [property_id, companyId]);
+    }
+    if (Number(amount_paid || 0) > 0) {
+      await recordBusinessPayment(client, {
+        companyId,
+        amount: amount_paid,
+        category: "Vente immobilière",
+        sourceType: "property_sale",
+        sourceId: sale.rows[0].id,
+        description: `Paiement vente immobilière ${sale.rows[0].id}`,
+        partnerName: client_name || "",
+        user: req.user,
+        documentType: "Reçu vente immobilière"
+      });
+    }
+    await client.query("COMMIT");
+    res.status(201).json(sale.rows[0]);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    res.status(500).json({ error: error.message || "Erreur vente immobilière" });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/immobilier/hotel/reservations", authenticateToken, async (req, res) => {
+  try {
+    if (!canViewBusinessModule(req.user)) return res.status(403).json({ error: "Accès hôtel refusé." });
+    const { clause, values } = getBusinessCompanyScope(req, "r");
+    const result = await pool.query(
+      `SELECT r.*, p.title
+       FROM hotel_reservations r
+       LEFT JOIN properties p ON p.id=r.property_id
+       ${clause}
+       ORDER BY r.id DESC LIMIT 200`,
+      values
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: "Erreur réservations hôtel" });
+  }
+});
+
+app.post("/immobilier/hotel/reservations", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    if (!canManageBusinessModule(req.user)) return res.status(403).json({ error: "Accès réservation hôtel refusé." });
+    const companyId = getEffectiveCompanyId(req);
+    const { property_id, room_number, client_name, client_phone, checkin_date, checkout_date, nights, price_per_night, total_amount, paid_amount, status } = req.body || {};
+    await client.query("BEGIN");
+    const reservation = await client.query(
+      `INSERT INTO hotel_reservations
+       (company_id, property_id, room_number, client_name, client_phone,
+        checkin_date, checkout_date, nights, price_per_night, total_amount,
+        paid_amount, status, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+       RETURNING *`,
+      [
+        companyId, property_id || null, room_number || "", client_name || "",
+        client_phone || "", checkin_date || null, checkout_date || null,
+        Number(nights || 1), Number(price_per_night || 0),
+        Number(total_amount || 0), Number(paid_amount || 0),
+        status || "confirmé", req.user.id
+      ]
+    );
+    if (property_id) {
+      await client.query("UPDATE properties SET status='réservé', updated_at=CURRENT_TIMESTAMP WHERE id=$1 AND company_id=$2", [property_id, companyId]);
+    }
+    if (Number(paid_amount || 0) > 0) {
+      await recordBusinessPayment(client, {
+        companyId,
+        amount: paid_amount,
+        category: "Réservation hôtel",
+        sourceType: "hotel_reservation",
+        sourceId: reservation.rows[0].id,
+        description: `Paiement réservation hôtel ${reservation.rows[0].id}`,
+        partnerName: client_name || "",
+        user: req.user,
+        documentType: "Facture hôtel"
+      });
+    }
+    await client.query("COMMIT");
+    res.status(201).json(reservation.rows[0]);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    res.status(500).json({ error: error.message || "Erreur réservation hôtel" });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/restaurant/dashboard", authenticateToken, async (req, res) => {
+  try {
+    if (!canViewBusinessModule(req.user)) return res.status(403).json({ error: "Accès restaurant refusé." });
+    const { clause, values } = getBusinessCompanyScope(req);
+    const [tables, menu, orders, calls] = await Promise.all([
+      pool.query(`SELECT COUNT(*)::int AS total,
+                         COUNT(*) FILTER (WHERE status='libre')::int AS libres,
+                         COUNT(*) FILTER (WHERE status='occupée' OR status='occupee')::int AS occupees
+                  FROM restaurant_tables ${clause}`, values),
+      pool.query(`SELECT COUNT(*)::int AS total FROM restaurant_menu_items ${clause}`, values),
+      pool.query(`SELECT COUNT(*)::int AS total,
+                         COALESCE(SUM(total_amount),0)::numeric AS total_amount,
+                         COUNT(*) FILTER (WHERE order_status='préparation' OR order_status='preparation')::int AS preparation
+                  FROM restaurant_orders ${clause}`, values),
+      pool.query(`SELECT COUNT(*)::int AS total FROM restaurant_call_requests ${clause}`, values)
+    ]);
+    res.json({ tables: tables.rows[0], menu: menu.rows[0], orders: orders.rows[0], calls: calls.rows[0] });
+  } catch (error) {
+    res.status(500).json({ error: "Erreur dashboard restaurant" });
+  }
+});
+
+app.get("/restaurant/tables", authenticateToken, async (req, res) => {
+  try {
+    if (!canViewBusinessModule(req.user)) return res.status(403).json({ error: "Accès restaurant refusé." });
+    const { clause, values } = getBusinessCompanyScope(req);
+    const result = await pool.query(`SELECT * FROM restaurant_tables ${clause} ORDER BY id DESC LIMIT 200`, values);
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: "Erreur tables restaurant" });
+  }
+});
+
+app.post("/restaurant/tables", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageBusinessModule(req.user)) return res.status(403).json({ error: "Accès modification restaurant refusé." });
+    const companyId = getEffectiveCompanyId(req);
+    const { table_number, status = "libre" } = req.body || {};
+    const result = await pool.query(
+      `INSERT INTO restaurant_tables (company_id, table_number, qr_code, status, created_by)
+       VALUES ($1,$2,$3,$4,$5)
+       RETURNING *`,
+      [
+        companyId,
+        table_number || "",
+        `/restaurant/public/${companyId}/table/{{id}}`,
+        status,
+        req.user.id
+      ]
+    );
+    const qrCode = `/restaurant/public/${companyId}/table/${result.rows[0].id}`;
+    const updated = await pool.query("UPDATE restaurant_tables SET qr_code=$1 WHERE id=$2 RETURNING *", [qrCode, result.rows[0].id]);
+    res.status(201).json(updated.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: "Erreur création table" });
+  }
+});
+
+app.get("/restaurant/menu-items", authenticateToken, async (req, res) => {
+  try {
+    if (!canViewBusinessModule(req.user)) return res.status(403).json({ error: "Accès restaurant refusé." });
+    const { clause, values } = getBusinessCompanyScope(req);
+    const result = await pool.query(`SELECT * FROM restaurant_menu_items ${clause} ORDER BY id DESC LIMIT 200`, values);
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: "Erreur menu restaurant" });
+  }
+});
+
+app.post("/restaurant/menu-items", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageBusinessModule(req.user)) return res.status(403).json({ error: "Accès modification restaurant refusé." });
+    const companyId = getEffectiveCompanyId(req);
+    const { product_id, name, description, category, price, image, is_available = true, preparation_time } = req.body || {};
+    const result = await pool.query(
+      `INSERT INTO restaurant_menu_items
+       (company_id, product_id, name, description, category, price, image,
+        is_available, preparation_time, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+       RETURNING *`,
+      [
+        companyId, product_id || null, name || "", description || "",
+        category || "", Number(price || 0), image || "",
+        is_available !== false, Number(preparation_time || 0), req.user.id
+      ]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: "Erreur création plat" });
+  }
+});
+
+app.get("/restaurant/orders", authenticateToken, async (req, res) => {
+  try {
+    if (!canViewBusinessModule(req.user)) return res.status(403).json({ error: "Accès restaurant refusé." });
+    const { clause, values } = getBusinessCompanyScope(req, "o");
+    const result = await pool.query(
+      `SELECT o.*, t.table_number
+       FROM restaurant_orders o
+       LEFT JOIN restaurant_tables t ON t.id=o.table_id
+       ${clause}
+       ORDER BY o.id DESC LIMIT 200`,
+      values
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: "Erreur commandes restaurant" });
+  }
+});
+
+app.post("/restaurant/orders", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    if (!canManageBusinessModule(req.user)) return res.status(403).json({ error: "Accès commande restaurant refusé." });
+    const companyId = getEffectiveCompanyId(req);
+    const { table_id, customer_name, customer_phone, items = [], payment_status = "pending", order_status = "nouvelle" } = req.body || {};
+    await client.query("BEGIN");
+    let total = 0;
+    const cleanItems = Array.isArray(items) ? items : [];
+    for (const item of cleanItems) {
+      total += Number(item.quantity || 1) * Number(item.unit_price || item.price || 0);
+    }
+    const order = await client.query(
+      `INSERT INTO restaurant_orders
+       (company_id, table_id, customer_name, customer_phone, total_amount,
+        payment_status, order_status, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       RETURNING *`,
+      [companyId, table_id || null, customer_name || "", customer_phone || "", total, payment_status, order_status, req.user.id]
+    );
+    for (const item of cleanItems) {
+      const qty = Number(item.quantity || 1);
+      const unitPrice = Number(item.unit_price || item.price || 0);
+      await client.query(
+        `INSERT INTO restaurant_order_items
+         (order_id, menu_item_id, quantity, unit_price, total_price, notes)
+         VALUES ($1,$2,$3,$4,$5,$6)`,
+        [order.rows[0].id, item.menu_item_id || item.id || null, qty, unitPrice, qty * unitPrice, item.notes || ""]
+      );
+    }
+    if (table_id) {
+      await client.query("UPDATE restaurant_tables SET status='occupée', updated_at=CURRENT_TIMESTAMP WHERE id=$1 AND company_id=$2", [table_id, companyId]);
+    }
+    await createNotification({
+      title: "Nouvelle commande restaurant",
+      message: `Commande table ${table_id || "-"} reçue.`,
+      type: "restaurant_order",
+      company_id: companyId,
+      related_entity_type: "restaurant_order",
+      related_entity_id: order.rows[0].id,
+      action_url: "/restaurant/commandes",
+      created_by: req.user.id
+    });
+    await client.query("COMMIT");
+    res.status(201).json(order.rows[0]);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("ERREUR COMMANDE RESTAURANT :", error);
+    res.status(500).json({ error: error.message || "Erreur commande restaurant" });
+  } finally {
+    client.release();
+  }
+});
+
+app.put("/restaurant/orders/:id/status", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    if (!canManageBusinessModule(req.user)) return res.status(403).json({ error: "Accès commande restaurant refusé." });
+    const companyId = getEffectiveCompanyId(req);
+    const { order_status, payment_status } = req.body || {};
+    await client.query("BEGIN");
+    const result = await client.query(
+      `UPDATE restaurant_orders
+       SET order_status=COALESCE($1,order_status),
+           payment_status=COALESCE($2,payment_status),
+           updated_at=CURRENT_TIMESTAMP
+       WHERE id=$3 AND company_id=$4
+       RETURNING *`,
+      [order_status || null, payment_status || null, req.params.id, companyId]
+    );
+    if (!result.rows[0]) throw new Error("Commande restaurant introuvable.");
+    if (["paid", "payé", "paye"].includes(String(payment_status || "").toLowerCase())) {
+      await recordBusinessPayment(client, {
+        companyId,
+        amount: result.rows[0].total_amount,
+        category: "Restaurant",
+        sourceType: "restaurant_order",
+        sourceId: result.rows[0].id,
+        description: `Paiement commande restaurant ${result.rows[0].id}`,
+        partnerName: result.rows[0].customer_name || "",
+        user: req.user,
+        documentType: "Ticket restaurant"
+      });
+    }
+    await client.query("COMMIT");
+    res.json(result.rows[0]);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    res.status(500).json({ error: error.message || "Erreur statut commande restaurant" });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/restaurant/public/:companyId/table/:tableId", async (req, res) => {
+  try {
+    const companyId = Number(req.params.companyId);
+    const tableId = Number(req.params.tableId);
+    const [table, menu] = await Promise.all([
+      pool.query("SELECT id, table_number, status FROM restaurant_tables WHERE id=$1 AND company_id=$2", [tableId, companyId]),
+      pool.query("SELECT id, name, description, category, price, image, preparation_time FROM restaurant_menu_items WHERE company_id=$1 AND is_available=true ORDER BY category ASC, name ASC", [companyId])
+    ]);
+    if (!table.rows[0]) return res.status(404).json({ error: "Table introuvable" });
+    res.json({ table: table.rows[0], menu: menu.rows });
+  } catch (error) {
+    res.status(500).json({ error: "Erreur menu public restaurant" });
+  }
+});
+
+app.post("/restaurant/public/:companyId/table/:tableId/orders", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const companyId = Number(req.params.companyId);
+    const tableId = Number(req.params.tableId);
+    const { customer_name, customer_phone, items = [] } = req.body || {};
+    const cleanItems = Array.isArray(items) ? items : [];
+    if (cleanItems.length === 0) return res.status(400).json({ error: "Panier vide." });
+    await client.query("BEGIN");
+    let total = 0;
+    const itemRows = [];
+    for (const item of cleanItems) {
+      const menuItem = await client.query(
+        "SELECT * FROM restaurant_menu_items WHERE id=$1 AND company_id=$2 AND is_available=true",
+        [item.menu_item_id || item.id, companyId]
+      );
+      if (!menuItem.rows[0]) throw new Error("Plat introuvable.");
+      const qty = Number(item.quantity || 1);
+      const unitPrice = Number(menuItem.rows[0].price || 0);
+      total += qty * unitPrice;
+      itemRows.push({ id: menuItem.rows[0].id, quantity: qty, unit_price: unitPrice, notes: item.notes || "" });
+    }
+    const order = await client.query(
+      `INSERT INTO restaurant_orders
+       (company_id, table_id, customer_name, customer_phone, total_amount,
+        payment_status, order_status)
+       VALUES ($1,$2,$3,$4,$5,'pending','nouvelle')
+       RETURNING *`,
+      [companyId, tableId, customer_name || "", customer_phone || "", total]
+    );
+    for (const item of itemRows) {
+      await client.query(
+        `INSERT INTO restaurant_order_items
+         (order_id, menu_item_id, quantity, unit_price, total_price, notes)
+         VALUES ($1,$2,$3,$4,$5,$6)`,
+        [order.rows[0].id, item.id, item.quantity, item.unit_price, item.quantity * item.unit_price, item.notes]
+      );
+    }
+    await client.query("UPDATE restaurant_tables SET status='occupée', updated_at=CURRENT_TIMESTAMP WHERE id=$1 AND company_id=$2", [tableId, companyId]);
+    await createNotification({
+      title: "Nouvelle commande QR table",
+      message: `Commande publique table ${tableId} reçue.`,
+      type: "restaurant_order",
+      company_id: companyId,
+      related_entity_type: "restaurant_order",
+      related_entity_id: order.rows[0].id,
+      action_url: "/restaurant/commandes"
+    });
+    await client.query("COMMIT");
+    res.status(201).json(order.rows[0]);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    res.status(500).json({ error: error.message || "Erreur commande publique restaurant" });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/restaurant/public/:companyId/table/:tableId/call", async (req, res) => {
+  try {
+    const { message = "Appel serveur" } = req.body || {};
+    const result = await pool.query(
+      `INSERT INTO restaurant_call_requests (company_id, table_id, message)
+       VALUES ($1,$2,$3)
+       RETURNING *`,
+      [Number(req.params.companyId), Number(req.params.tableId), message]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: "Erreur appel serveur" });
+  }
+});
+
 /* HISTORIQUE INVENTAIRE SAAS */
 app.get("/inventory-history", authenticateToken, async (req, res) => {
   try {
@@ -11598,6 +12567,15 @@ function chooseAssistantTools(message) {
   if (/marketplace|catalogue|commande|vendeur|acheteur|client final|b2b|b2c/.test(text)) {
     tools.add("get_marketplace_summary");
   }
+  if (/automobile|voiture|vehicule|véhicule|garage|parking|location voiture/.test(text)) {
+    tools.add("get_automobile_summary");
+  }
+  if (/immobilier|maison|terrain|appartement|villa|hotel|hôtel|chambre|reservation|réservation/.test(text)) {
+    tools.add("get_real_estate_summary");
+  }
+  if (/restaurant|table|menu|plat|cuisine|serveur|commande restaurant/.test(text)) {
+    tools.add("get_restaurant_summary");
+  }
 
   if (/combien de produits|nombre de produits/.test(text)) tools.add("get_products");
   if (/combien de stock|stock total|stock reste/.test(text)) tools.add("get_stock");
@@ -11850,6 +12828,81 @@ async function runAssistantTool(toolName, user) {
     };
   }
 
+  if (toolName === "get_automobile_summary") {
+    const vehicles = await pool.query(
+      `SELECT COUNT(*)::int AS total,
+              COUNT(*) FILTER (WHERE statut='disponible')::int AS disponibles,
+              COUNT(*) FILTER (WHERE statut='loué' OR statut='loue')::int AS loues,
+              COUNT(*) FILTER (WHERE statut='vendu')::int AS vendus
+       FROM vehicles ${where}`,
+      values
+    );
+    const rentals = await pool.query(
+      `SELECT COUNT(*)::int AS total,
+              COALESCE(SUM(paid_amount),0)::numeric AS paid_amount,
+              COUNT(*) FILTER (WHERE end_date < CURRENT_DATE AND status NOT IN ('terminé','termine','annulé','annule'))::int AS retards
+       FROM vehicle_rentals ${where}`,
+      values
+    );
+    const sales = await pool.query(
+      `SELECT COUNT(*)::int AS total,
+              COALESCE(SUM(amount_paid),0)::numeric AS paid_amount,
+              COALESCE(SUM(remaining_amount),0)::numeric AS remaining_amount
+       FROM vehicle_sales ${where}`,
+      values
+    );
+    return { vehicles: vehicles.rows[0], rentals: rentals.rows[0], sales: sales.rows[0] };
+  }
+
+  if (toolName === "get_real_estate_summary") {
+    const propertiesResult = await pool.query(
+      `SELECT COUNT(*)::int AS total,
+              COUNT(*) FILTER (WHERE status='disponible')::int AS disponibles,
+              COUNT(*) FILTER (WHERE status='loué' OR status='loue')::int AS loues,
+              COUNT(*) FILTER (WHERE status='vendu')::int AS vendus
+       FROM properties ${where}`,
+      values
+    );
+    const reservations = await pool.query(
+      `SELECT COUNT(*)::int AS total,
+              COUNT(*) FILTER (WHERE status='occupé' OR status='occupe')::int AS occupees,
+              COALESCE(SUM(paid_amount),0)::numeric AS paid_amount
+       FROM hotel_reservations ${where}`,
+      values
+    );
+    const sales = await pool.query(
+      `SELECT COUNT(*)::int AS total,
+              COALESCE(SUM(amount_paid),0)::numeric AS paid_amount,
+              COALESCE(SUM(remaining_amount),0)::numeric AS remaining_amount
+       FROM property_sales ${where}`,
+      values
+    );
+    return { properties: propertiesResult.rows[0], reservations: reservations.rows[0], sales: sales.rows[0] };
+  }
+
+  if (toolName === "get_restaurant_summary") {
+    const tables = await pool.query(
+      `SELECT COUNT(*)::int AS total,
+              COUNT(*) FILTER (WHERE status='libre')::int AS libres,
+              COUNT(*) FILTER (WHERE status='occupée' OR status='occupee')::int AS occupees
+       FROM restaurant_tables ${where}`,
+      values
+    );
+    const orders = await pool.query(
+      `SELECT COUNT(*)::int AS total,
+              COALESCE(SUM(total_amount),0)::numeric AS total_amount,
+              COUNT(*) FILTER (WHERE order_status='préparation' OR order_status='preparation')::int AS preparation
+       FROM restaurant_orders ${where}`,
+      values
+    );
+    const calls = await pool.query(
+      `SELECT COUNT(*)::int AS total
+       FROM restaurant_call_requests ${where}`,
+      values
+    );
+    return { tables: tables.rows[0], orders: orders.rows[0], calls: calls.rows[0] };
+  }
+
   return null;
 }
 
@@ -11903,6 +12956,18 @@ function buildLocalAssistantAnswer(message, toolResults) {
     } else if (item.tool === "get_marketplace_summary") {
       lines.push(
         `- Marketplace : ${item.data?.products?.published_products || 0} produit(s) publié(s), ${item.data?.orders?.total_orders || 0} commande(s), total ${Number(item.data?.orders?.total_amount || 0).toLocaleString("fr-FR", { maximumFractionDigits: 0 })} FCFA.`
+      );
+    } else if (item.tool === "get_automobile_summary") {
+      lines.push(
+        `- Automobile : ${item.data?.vehicles?.disponibles || 0} véhicule(s) disponible(s), ${item.data?.rentals?.retards || 0} location(s) en retard, encaissements ${Number(item.data?.rentals?.paid_amount || 0).toLocaleString("fr-FR", { maximumFractionDigits: 0 })} FCFA.`
+      );
+    } else if (item.tool === "get_real_estate_summary") {
+      lines.push(
+        `- Immobilier/Hôtel : ${item.data?.properties?.disponibles || 0} bien(s) disponible(s), ${item.data?.reservations?.occupees || 0} chambre(s) occupée(s), encaissements ${Number(item.data?.reservations?.paid_amount || 0).toLocaleString("fr-FR", { maximumFractionDigits: 0 })} FCFA.`
+      );
+    } else if (item.tool === "get_restaurant_summary") {
+      lines.push(
+        `- Restaurant : ${item.data?.orders?.preparation || 0} commande(s) en préparation, ventes ${Number(item.data?.orders?.total_amount || 0).toLocaleString("fr-FR", { maximumFractionDigits: 0 })} FCFA, tables occupées ${item.data?.tables?.occupees || 0}.`
       );
     }
   }
