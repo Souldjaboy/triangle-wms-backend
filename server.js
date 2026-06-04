@@ -8,6 +8,7 @@ const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
+const nodemailer = require("nodemailer");
 require("dotenv").config();
 
 const app = express();
@@ -4301,11 +4302,12 @@ async function finalizePaidPosSale(client, saleId, user = {}) {
     );
   }
 
-  await client.query(
+  const paymentResult = await client.query(
     `INSERT INTO payments
      (company_id, amount, currency, payment_method, payment_reference,
       status, notes, paid_at, sale_id, receipt_id, payment_status, caisse_id)
-     VALUES ($1,$2,'FCFA',$3,$4,'paid',$5,CURRENT_TIMESTAMP,$6,$7,'paid',$8)`,
+     VALUES ($1,$2,'FCFA',$3,$4,'paid',$5,CURRENT_TIMESTAMP,$6,$7,'paid',$8)
+     RETURNING *`,
     [
       sale.company_id,
       Number(sale.total_amount || 0),
@@ -4317,16 +4319,13 @@ async function finalizePaidPosSale(client, saleId, user = {}) {
       sale.caisse_id || sale.cash_register_id || null
     ]
   );
-
-  if (sale.caisse_id || sale.cash_register_id) {
-    await client.query(
-      `UPDATE caisses
-       SET solde_actuel = COALESCE(solde_actuel,0) + $1,
-           updated_at=CURRENT_TIMESTAMP
-       WHERE id=$2`,
-      [Number(sale.total_amount || 0), sale.caisse_id || sale.cash_register_id]
-    );
-  }
+  const payment = paymentResult.rows[0];
+  await recordPosPaymentAccounting(client, {
+    sale: updatedSale,
+    payment,
+    user,
+    amount: Number(sale.total_amount || 0)
+  });
 
   return {
     sale: updatedSale,
@@ -5106,11 +5105,12 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
         ]
       );
 
-      await client.query(
+      const paymentResult = await client.query(
         `INSERT INTO payments
          (company_id, amount, currency, payment_method, payment_reference,
           status, notes, paid_at, sale_id, receipt_id, payment_status, caisse_id)
-         VALUES ($1,$2,'FCFA',$3,$4,$5,$6,CURRENT_TIMESTAMP,$7,$8,$5,$9)`,
+         VALUES ($1,$2,'FCFA',$3,$4,$5,$6,CURRENT_TIMESTAMP,$7,$8,$5,$9)
+         RETURNING *`,
         [
           companyId,
           totalAmount,
@@ -5124,15 +5124,12 @@ app.post("/pos/sales", authenticateToken, async (req, res) => {
         ]
       );
 
-      if (caisse?.id) {
-        await client.query(
-          `UPDATE caisses
-           SET solde_actuel = COALESCE(solde_actuel,0) + $1,
-               updated_at=CURRENT_TIMESTAMP
-           WHERE id=$2`,
-          [confirmedPaidAmount || totalAmount, caisse.id]
-        );
-      }
+      await recordPosPaymentAccounting(client, {
+        sale: updatedSale.rows[0],
+        payment: paymentResult.rows[0],
+        user: req.user,
+        amount: confirmedPaidAmount || totalAmount
+      });
     }
 
     await client.query("COMMIT");
@@ -6022,6 +6019,192 @@ async function ensureTreasuryAccount(client, companyId, currency = "FCFA") {
   return result.rows[0];
 }
 
+function normalizePaymentMethodLabel(method = "") {
+  return String(method || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+}
+
+function paymentMethodBankKeywords(method = "") {
+  const normalized = normalizePaymentMethodLabel(method);
+  if (normalized.includes("orange")) return ["orange", "orange money"];
+  if (normalized.includes("moov")) return ["moov", "moov money"];
+  if (normalized.includes("wave")) return ["wave"];
+  if (normalized.includes("carte")) return ["carte", "card", "banque"];
+  if (normalized.includes("virement") || normalized.includes("banque")) {
+    return ["virement", "banque", "bank"];
+  }
+  return [];
+}
+
+async function findAccountingBankForPayment(client, companyId, method = "") {
+  const keywords = paymentMethodBankKeywords(method);
+  if (keywords.length === 0) return null;
+
+  const values = [companyId];
+  const filters = keywords.map((keyword) => {
+    values.push(`%${keyword}%`);
+    return `LOWER(bank_name) LIKE LOWER($${values.length})`;
+  });
+
+  const result = await client.query(
+    `SELECT *
+     FROM accounting_banks
+     WHERE company_id=$1
+       AND is_active=true
+       AND (${filters.join(" OR ")})
+     ORDER BY id ASC
+     LIMIT 1
+     FOR UPDATE`,
+    values
+  );
+
+  return result.rows[0] || null;
+}
+
+async function recordPosPaymentAccounting(client, { sale, payment, user = {}, amount = null }) {
+  const paymentId = payment?.id || null;
+  const saleId = sale?.id || payment?.sale_id || null;
+  const companyId = sale?.company_id || payment?.company_id || user?.company_id || null;
+  const amountValue = Number(amount ?? payment?.amount ?? sale?.total_amount ?? 0);
+  const method = payment?.payment_method || payment?.method || sale?.payment_method || "";
+  const normalizedMethod = normalizePaymentMethodLabel(method);
+
+  if (!paymentId || !saleId || !companyId || amountValue <= 0) return null;
+  if (normalizedMethod.includes("credit")) return null;
+
+  const existing = await client.query(
+    `SELECT id
+     FROM accounting_transactions
+     WHERE source_type='pos_payment'
+       AND source_id=$1
+       AND company_id=$2
+     LIMIT 1`,
+    [paymentId, companyId]
+  );
+  if (existing.rows[0]) return existing.rows[0];
+
+  await ensureTreasuryAccount(client, companyId, payment?.currency || "FCFA");
+
+  let bank = null;
+  const isCash = normalizedMethod.includes("espece") || normalizedMethod.includes("cash");
+  const caisseId = sale?.caisse_id || sale?.cash_register_id || payment?.caisse_id || null;
+  let destinationLabel = "Trésorerie interne";
+  let bankId = null;
+  let finalCaisseId = null;
+
+  if (isCash && caisseId) {
+    finalCaisseId = caisseId;
+    await client.query(
+      `UPDATE caisses
+       SET solde_actuel=COALESCE(solde_actuel,0)+$1,
+           updated_at=CURRENT_TIMESTAMP
+       WHERE id=$2
+         AND company_id=$3`,
+      [amountValue, finalCaisseId, companyId]
+    );
+    destinationLabel = sale?.nom_caisse || "Caisse POS";
+  } else if (!isCash) {
+    bank = await findAccountingBankForPayment(client, companyId, method);
+    if (bank) {
+      bankId = bank.id;
+      destinationLabel = bank.bank_name || method || "Banque";
+      await client.query(
+        `UPDATE accounting_banks
+         SET current_balance=COALESCE(current_balance,0)+$1,
+             updated_at=CURRENT_TIMESTAMP
+         WHERE id=$2`,
+        [amountValue, bank.id]
+      );
+    } else {
+      await client.query(
+        `UPDATE treasury_accounts
+         SET current_balance=COALESCE(current_balance,0)+$1,
+             updated_by=$2,
+             updated_at=CURRENT_TIMESTAMP
+         WHERE company_id=$3`,
+        [amountValue, user?.id || sale?.created_by || null, companyId]
+      );
+      destinationLabel = `Trésorerie interne (${method || "paiement POS"})`;
+    }
+  } else {
+    await client.query(
+      `UPDATE treasury_accounts
+       SET current_balance=COALESCE(current_balance,0)+$1,
+           updated_by=$2,
+           updated_at=CURRENT_TIMESTAMP
+       WHERE company_id=$3`,
+      [amountValue, user?.id || sale?.created_by || null, companyId]
+    );
+  }
+
+  const transactionNumber = await nextAccountingNumber(
+    client,
+    "accounting_transactions",
+    "transaction_number",
+    "POS",
+    companyId
+  );
+
+  const transaction = await client.query(
+    `INSERT INTO accounting_transactions
+     (company_id, transaction_number, transaction_type, source_type, source_id,
+      bank_id, caisse_id, amount, currency, direction, category, partner_name,
+      description, status, source_label, destination_label, created_by,
+      validated_by, validated_at)
+     VALUES ($1,$2,'encaissement_pos','pos_payment',$3,$4,$5,$6,$7,'entrée',
+             'Vente POS',$8,$9,'validé',$10,$11,$12,$12,CURRENT_TIMESTAMP)
+     RETURNING *`,
+    [
+      companyId,
+      transactionNumber,
+      paymentId,
+      bankId,
+      finalCaisseId,
+      amountValue,
+      payment?.currency || "FCFA",
+      sale?.customer_name || "",
+      `Encaissement POS ${sale?.sale_number || saleId} - ${method || "paiement"}`,
+      method || "POS",
+      destinationLabel,
+      user?.id || sale?.created_by || null
+    ]
+  );
+
+  await client.query(
+    `UPDATE payments
+     SET accounting_transaction_id=$1,
+         updated_at=CURRENT_TIMESTAMP
+     WHERE id=$2`,
+    [transaction.rows[0].id, paymentId]
+  );
+
+  await createAccountingEntry(client, {
+    companyId,
+    sourceType: "pos_payment",
+    sourceId: paymentId,
+    accountLabel: destinationLabel,
+    debit: amountValue,
+    credit: 0,
+    description: `Encaissement POS ${sale?.sale_number || saleId}`,
+    createdBy: user?.id || sale?.created_by || null
+  });
+
+  await createAccountingEntry(client, {
+    companyId,
+    sourceType: "pos_payment",
+    sourceId: paymentId,
+    accountLabel: "Ventes POS",
+    debit: 0,
+    credit: amountValue,
+    description: `Vente POS ${sale?.sale_number || saleId}`,
+    createdBy: user?.id || sale?.created_by || null
+  });
+
+  return transaction.rows[0];
+}
+
 async function createAccountingEntry(client, {
   companyId,
   sourceType,
@@ -6196,6 +6379,10 @@ function logAccountingError(route, error, req, extra = {}) {
     },
     payload
   });
+}
+
+function accountingErrorMessage(error, fallback) {
+  return error?.detail || error?.message || fallback;
 }
 
 app.get("/accounting/dashboard", authenticateToken, async (req, res) => {
@@ -6439,7 +6626,7 @@ app.post("/accounting/banks", authenticateToken, async (req, res) => {
     res.status(201).json(result.rows[0]);
   } catch (error) {
     logAccountingError("POST /accounting/banks", error, req);
-    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Erreur création banque" });
+    res.status(error.statusCode || 500).json({ error: accountingErrorMessage(error, "Erreur création banque") });
   }
 });
 
@@ -6473,7 +6660,7 @@ app.put("/accounting/banks/:id", authenticateToken, async (req, res) => {
     res.json(result.rows[0]);
   } catch (error) {
     logAccountingError("PUT /accounting/banks/:id", error, req, { bank_id: req.params.id });
-    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Erreur modification banque" });
+    res.status(error.statusCode || 500).json({ error: accountingErrorMessage(error, "Erreur modification banque") });
   }
 });
 
@@ -6499,7 +6686,7 @@ app.delete("/accounting/banks/:id", authenticateToken, async (req, res) => {
     res.json({ message: "Banque désactivée.", bank: result.rows[0] });
   } catch (error) {
     logAccountingError("DELETE /accounting/banks/:id", error, req, { bank_id: req.params.id });
-    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Erreur suppression banque" });
+    res.status(error.statusCode || 500).json({ error: accountingErrorMessage(error, "Erreur suppression banque") });
   }
 });
 
@@ -6768,7 +6955,7 @@ app.post("/accounting/transactions", authenticateToken, async (req, res) => {
   } catch (error) {
     await client.query("ROLLBACK");
     logAccountingError("POST /accounting/transactions", error, req);
-    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Erreur mouvement comptable" });
+    res.status(error.statusCode || 500).json({ error: accountingErrorMessage(error, "Erreur mouvement comptable") });
   } finally {
     client.release();
   }
@@ -6857,7 +7044,7 @@ app.post("/accounting/vouchers", authenticateToken, async (req, res) => {
     res.status(201).json(result.rows[0]);
   } catch (error) {
     logAccountingError("POST /accounting/vouchers", error, req);
-    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Erreur création bon" });
+    res.status(error.statusCode || 500).json({ error: accountingErrorMessage(error, "Erreur création bon") });
   }
 });
 
@@ -7031,7 +7218,7 @@ app.put("/accounting/vouchers/:id/validate", authenticateToken, async (req, res)
   } catch (error) {
     await client.query("ROLLBACK");
     logAccountingError("PUT /accounting/vouchers/:id/validate", error, req);
-    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Erreur validation bon" });
+    res.status(error.statusCode || 500).json({ error: accountingErrorMessage(error, "Erreur validation bon") });
   } finally {
     client.release();
   }
@@ -7072,7 +7259,7 @@ app.put("/accounting/vouchers/:id/reject", authenticateToken, async (req, res) =
     res.json(result.rows[0]);
   } catch (error) {
     logAccountingError("PUT /accounting/vouchers/:id/reject", error, req);
-    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Erreur refus bon" });
+    res.status(error.statusCode || 500).json({ error: accountingErrorMessage(error, "Erreur refus bon") });
   }
 });
 
@@ -7149,7 +7336,7 @@ app.post("/accounting/expense-requests", authenticateToken, async (req, res) => 
     res.status(201).json(result.rows[0]);
   } catch (error) {
     logAccountingError("POST /accounting/expense-requests", error, req);
-    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Erreur création demande" });
+    res.status(error.statusCode || 500).json({ error: accountingErrorMessage(error, "Erreur création demande") });
   }
 });
 
@@ -7227,7 +7414,7 @@ app.put("/accounting/expense-requests/:id/status", authenticateToken, async (req
   } catch (error) {
     await client.query("ROLLBACK");
     logAccountingError("PUT /accounting/expense-requests/:id/status", error, req);
-    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Erreur changement statut demande" });
+    res.status(error.statusCode || 500).json({ error: accountingErrorMessage(error, "Erreur changement statut demande") });
   } finally {
     client.release();
   }
@@ -7392,7 +7579,7 @@ app.get("/documents", authenticateToken, async (req, res) => {
       return res.status(403).json({ error: "Accès refusé : module réservé à la direction" });
     }
 
-    const companyId = req.user.company_id;
+    const companyId = getEffectiveCompanyId(req);
     const isSuperAdmin = req.user.is_super_admin === true;
 
     let query = `
@@ -7401,7 +7588,7 @@ app.get("/documents", authenticateToken, async (req, res) => {
 
     let values = [];
 
-    if (!isSuperAdmin) {
+    if (!isSuperAdmin || companyId) {
       query += ` WHERE company_id = $1 `;
       values.push(companyId);
     }
@@ -7425,13 +7612,13 @@ app.get("/documents/:id", authenticateToken, async (req, res) => {
       return res.status(403).json({ error: "Accès refusé : module réservé à la direction" });
     }
 
-    const companyId = req.user.company_id;
+    const companyId = getEffectiveCompanyId(req);
     const isSuperAdmin = req.user.is_super_admin === true;
 
     const documentResult = await pool.query(
       `SELECT * FROM documents
-       WHERE id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}`,
-      isSuperAdmin ? [req.params.id] : [req.params.id, companyId]
+       WHERE id=$1 ${isSuperAdmin && !companyId ? "" : "AND company_id=$2"}`,
+      isSuperAdmin && !companyId ? [req.params.id] : [req.params.id, companyId]
     );
 
     if (!documentResult.rows[0]) {
@@ -7450,6 +7637,163 @@ app.get("/documents/:id", authenticateToken, async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Erreur détail document" });
+  }
+});
+
+function escapeHtml(value = "") {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+function renderDocumentHtml(document, items = [], companySettings = {}) {
+  const isReceipt = String(document.document_type || "").toLowerCase().includes("reçu");
+  const rows = items.map((item) => `
+    <tr>
+      <td>${escapeHtml(item.product_reference || "")}</td>
+      <td>${escapeHtml(item.product_name || "")}</td>
+      <td class="right">${Number(item.quantity || 0).toLocaleString("fr-FR")}</td>
+      <td class="right">${Number(item.unit_price || 0).toLocaleString("fr-FR", { maximumFractionDigits: 0 })} FCFA</td>
+      <td class="right">${Number(item.total_price || 0).toLocaleString("fr-FR", { maximumFractionDigits: 0 })} FCFA</td>
+    </tr>
+  `).join("");
+
+  return `<!doctype html>
+  <html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body { font-family: Arial, sans-serif; color: #111; margin: 0; padding: ${isReceipt ? "10px" : "28px"}; }
+      .page { max-width: ${isReceipt ? "80mm" : "210mm"}; margin: 0 auto; }
+      .header { display: flex; justify-content: space-between; gap: 24px; border-bottom: 2px solid #111; padding-bottom: 16px; }
+      .logo { max-height: 70px; max-width: 140px; object-fit: contain; }
+      h1 { margin: 18px 0 6px; font-size: ${isReceipt ? "18px" : "28px"}; }
+      .muted { color: #555; font-size: 13px; }
+      table { width: 100%; border-collapse: collapse; margin-top: 20px; font-size: ${isReceipt ? "11px" : "13px"}; }
+      th, td { border-bottom: 1px solid #ddd; padding: 8px 6px; text-align: left; }
+      th { background: #f3f4f6; }
+      .right { text-align: right; }
+      .total { margin-top: 18px; text-align: right; font-size: ${isReceipt ? "15px" : "20px"}; font-weight: 700; }
+      .signature { display: flex; justify-content: space-between; margin-top: 60px; gap: 40px; }
+      .signature div { width: 45%; border-top: 1px solid #111; padding-top: 8px; text-align: center; }
+      @media print { button { display: none; } body { padding: 0; } }
+    </style>
+  </head>
+  <body>
+    <main class="page">
+      <section class="header">
+        <div>
+          ${companySettings.logo_url ? `<img class="logo" src="${escapeHtml(companySettings.logo_url)}" alt="Logo" />` : ""}
+          <h2>${escapeHtml(companySettings.name || companySettings.company_name || "Triangle WMS Pro")}</h2>
+          <p class="muted">${escapeHtml(companySettings.address || "")}</p>
+          <p class="muted">${escapeHtml(companySettings.phone || "")} ${companySettings.email ? `| ${escapeHtml(companySettings.email)}` : ""}</p>
+        </div>
+        <div class="right">
+          <h1>${escapeHtml(document.document_type || "Document")}</h1>
+          <p><strong>${escapeHtml(document.document_number || "")}</strong></p>
+          <p class="muted">${document.created_at ? new Date(document.created_at).toLocaleString("fr-FR") : ""}</p>
+        </div>
+      </section>
+      <section>
+        <p><strong>Client / Fournisseur :</strong> ${escapeHtml(document.client_name || "-")}</p>
+        ${document.client_phone ? `<p><strong>Téléphone :</strong> ${escapeHtml(document.client_phone)}</p>` : ""}
+        ${document.client_address ? `<p><strong>Adresse :</strong> ${escapeHtml(document.client_address)}</p>` : ""}
+      </section>
+      <table>
+        <thead>
+          <tr><th>Réf.</th><th>Produit</th><th class="right">Qté</th><th class="right">Prix</th><th class="right">Total</th></tr>
+        </thead>
+        <tbody>${rows || `<tr><td colspan="5">Aucune ligne détaillée.</td></tr>`}</tbody>
+      </table>
+      <div class="total">Total : ${Number(document.total_amount || 0).toLocaleString("fr-FR", { maximumFractionDigits: 0 })} FCFA</div>
+      ${document.observation ? `<p><strong>Observation :</strong> ${escapeHtml(document.observation)}</p>` : ""}
+      ${!isReceipt ? `<section class="signature"><div>Signature</div><div>Cachet</div></section>` : ""}
+    </main>
+  </body>
+  </html>`;
+}
+
+app.post("/documents/:id/email", authenticateToken, async (req, res) => {
+  try {
+    if (!canAccessDirectionModule(req.user)) {
+      return res.status(403).json({ error: "Accès refusé : module réservé à la direction" });
+    }
+
+    const { recipient_email, subject, message } = req.body || {};
+    if (!recipient_email || !String(recipient_email).includes("@")) {
+      return res.status(400).json({ error: "Email destinataire invalide." });
+    }
+
+    if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
+      return res.status(503).json({
+        error: "SMTP non configuré. Configurez SMTP dans Paramètres > Email."
+      });
+    }
+
+    const companyId = getEffectiveCompanyId(req);
+    const isSuperAdmin = req.user.is_super_admin === true;
+    const documentResult = await pool.query(
+      `SELECT * FROM documents
+       WHERE id=$1 ${isSuperAdmin && !companyId ? "" : "AND company_id=$2"}`,
+      isSuperAdmin && !companyId ? [req.params.id] : [req.params.id, companyId]
+    );
+    const document = documentResult.rows[0];
+    if (!document) return res.status(404).json({ error: "Document introuvable" });
+
+    const itemsResult = await pool.query(
+      "SELECT * FROM document_items WHERE document_id=$1 ORDER BY id ASC",
+      [req.params.id]
+    );
+    const companySettings = await getCompanySettingsForCompany(pool, document.company_id);
+    const html = renderDocumentHtml(document, itemsResult.rows, companySettings || {});
+
+    const transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: Number(process.env.SMTP_PORT || 587),
+      secure: Number(process.env.SMTP_PORT || 587) === 465,
+      auth: {
+        user: process.env.SMTP_USER,
+        pass: process.env.SMTP_PASS
+      }
+    });
+
+    const info = await transporter.sendMail({
+      from: process.env.SMTP_FROM || process.env.SMTP_USER,
+      to: recipient_email,
+      subject: subject || `${document.document_type} ${document.document_number}`,
+      text: message || `Veuillez trouver le document ${document.document_number}.`,
+      html: `<p>${escapeHtml(message || `Veuillez trouver le document ${document.document_number}.`)}</p>${html}`,
+      attachments: [
+        {
+          filename: `${document.document_number || "document"}.html`,
+          content: html,
+          contentType: "text/html"
+        }
+      ]
+    });
+
+    await pool.query(
+      `UPDATE documents
+       SET email_sent_to=$1,
+           email_sent_at=CURRENT_TIMESTAMP
+       WHERE id=$2`,
+      [recipient_email, document.id]
+    );
+
+    await logAudit(req, "email_document", "document", document.id, {
+      recipient_email,
+      message_id: info.messageId || ""
+    });
+
+    res.json({ message: "Document envoyé par email.", message_id: info.messageId || "" });
+  } catch (error) {
+    console.error("ERREUR EMAIL DOCUMENT :", error);
+    res.status(500).json({
+      error: error.message || "Erreur envoi email document"
+    });
   }
 });
 
@@ -7672,10 +8016,11 @@ app.post("/documents/from-movement/:id", authenticateToken, async (req, res) => 
         company_id,
         related_entity_type,
         related_entity_id,
+        stock_movement_id,
         warehouse_id,
         status
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
       RETURNING *`,
       [
         finalType,
@@ -7688,6 +8033,7 @@ app.post("/documents/from-movement/:id", authenticateToken, async (req, res) => 
         created_by || req.user.fullname || req.user.email || "Utilisateur",
         movement.company_id || companyId,
         "stock_movement",
+        movement.id,
         movement.id,
         movement.warehouse_id || null,
         "Validé"
