@@ -1749,13 +1749,17 @@ app.post("/login", async (req, res) => {
       SUPER_ADMIN_EMAILS.has(normalizedEmail) ||
       SUPER_ADMIN_EMAILS.has(String(user.email || "").trim().toLowerCase());
 
+    const isCustomerAccount = normalizeRole(user.role) === "customer";
+
     if (!isSuperAdmin) {
       const userVerified = user.email_verified === true || user.phone_verified === true;
       const companyVerified =
-        user.company_email_verified === true || user.company_phone_verified === true;
+        isCustomerAccount ||
+        user.company_email_verified === true ||
+        user.company_phone_verified === true;
       const accountPending =
         String(user.account_status || "").toLowerCase() === "pending_verification" ||
-        String(user.company_account_status || "").toLowerCase() === "pending_verification" ||
+        (!isCustomerAccount && String(user.company_account_status || "").toLowerCase() === "pending_verification") ||
         user.verification_required === true;
 
       if (!userVerified || !companyVerified || accountPending) {
@@ -1770,7 +1774,7 @@ app.post("/login", async (req, res) => {
         });
       }
 
-      if (user.company_status === "suspended") {
+      if (!isCustomerAccount && user.company_status === "suspended") {
         return res.status(403).json({
           error: "Entreprise suspendue. Veuillez contacter l’administration."
         });
@@ -1780,7 +1784,7 @@ app.post("/login", async (req, res) => {
         user.company_subscription_expires_at ||
         user.company_trial_end_date ||
         user.subscription_end_date;
-      if (subscriptionEnd && new Date(subscriptionEnd).getTime() < Date.now()) {
+      if (!isCustomerAccount && subscriptionEnd && new Date(subscriptionEnd).getTime() < Date.now()) {
         await pool.query(
           "UPDATE companies SET subscription_status='expired' WHERE id=$1",
           [user.company_id]
@@ -1793,9 +1797,12 @@ app.post("/login", async (req, res) => {
       }
 
       if (
-        user.subscription_status === "expired" ||
-        user.subscription_status === "suspended" ||
-        user.subscription_status === "cancelled"
+        !isCustomerAccount &&
+        (
+          user.subscription_status === "expired" ||
+          user.subscription_status === "suspended" ||
+          user.subscription_status === "cancelled"
+        )
       ) {
         return res.status(403).json({
           error: "Abonnement inactif. Veuillez renouveler votre abonnement."
@@ -4188,6 +4195,16 @@ async function finalizePaidPosSale(client, saleId, user = {}) {
   const inventoryAlreadyFinalized = Number(existingMovementResult.rows[0]?.count || 0) > 0;
 
   for (const item of itemsResult.rows) {
+    const publicationResult = await client.query(
+      `SELECT *
+       FROM marketplace_products
+       WHERE id=$1 AND company_id=$2
+       FOR UPDATE`,
+      [item.marketplace_product_id, order.vendor_company_id]
+    );
+    const publication = publicationResult.rows[0];
+    if (!publication) throw new Error("Publication marketplace introuvable.");
+
     const productResult = await client.query(
       `SELECT *
        FROM products
@@ -8207,10 +8224,11 @@ async function getOrCreateMarketplaceCart(clientOrPool, user) {
   if (existing.rows[0]) return existing.rows[0];
 
   const created = await clientOrPool.query(
-    `INSERT INTO marketplace_carts (user_id, company_id, customer_email, status)
-     VALUES ($1,$2,$3,'active')
+    `INSERT INTO marketplace_carts
+     (user_id, company_id, buyer_company_id, customer_email, cart_type, status)
+     VALUES ($1,$2,$2,$3,$4,'active')
      RETURNING *`,
-    [user.id, user.company_id || null, user.email || ""]
+    [user.id, user.company_id || null, user.email || "", user.company_id ? "B2B" : "B2C"]
   );
   return created.rows[0];
 }
@@ -8218,7 +8236,9 @@ async function getOrCreateMarketplaceCart(clientOrPool, user) {
 async function getMarketplaceCartPayload(user) {
   const cart = await getOrCreateMarketplaceCart(pool, user);
   const items = await pool.query(
-    `SELECT ci.*, mp.title, mp.image_url, mp.status AS marketplace_status,
+    `SELECT ci.*, COALESCE(NULLIF(mp.public_title,''), mp.title) AS title,
+            COALESCE(NULLIF(mp.public_price,0), mp.price, 0) AS price,
+            mp.image_url, mp.status AS marketplace_status,
             p.reference, p.name AS product_name, p.stock,
             c.name AS vendor_name
      FROM marketplace_cart_items ci
@@ -8263,7 +8283,8 @@ async function finalizeMarketplaceOrder(client, orderId, user = {}) {
     if (!product) throw new Error(`Produit marketplace introuvable : ${item.product_name || item.product_id}`);
 
     const quantity = Number(item.quantity || 0);
-    if (Number(product.stock || 0) < quantity) {
+    const publicationAvailable = Number(publication.available_quantity ?? publication.available_stock ?? product.stock ?? 0);
+    if (Number(product.stock || 0) < quantity || publicationAvailable < quantity) {
       throw new Error(`Stock insuffisant pour ${product.reference || product.name}.`);
     }
 
@@ -8273,6 +8294,16 @@ async function finalizeMarketplaceOrder(client, orderId, user = {}) {
            updated_at=CURRENT_TIMESTAMP
        WHERE id=$2`,
       [quantity, product.id]
+    );
+
+    await client.query(
+      `UPDATE marketplace_products
+       SET sold_quantity=COALESCE(sold_quantity,0)+$1,
+           available_quantity=GREATEST(COALESCE(available_quantity, available_stock, 0)-$1,0),
+           available_stock=GREATEST(COALESCE(available_stock, available_quantity, 0)-$1,0),
+           updated_at=CURRENT_TIMESTAMP
+       WHERE id=$2`,
+      [quantity, item.marketplace_product_id]
     );
 
     await client.query(
@@ -8304,6 +8335,8 @@ async function finalizeMarketplaceOrder(client, orderId, user = {}) {
     `UPDATE marketplace_orders
      SET payment_status='paid',
          status='paid',
+         buyer_user_id=COALESCE(buyer_user_id, customer_user_id),
+         seller_company_id=COALESCE(seller_company_id, vendor_company_id),
          updated_at=CURRENT_TIMESTAMP
      WHERE id=$1
      RETURNING *`,
@@ -8393,6 +8426,25 @@ async function finalizeMarketplaceOrder(client, orderId, user = {}) {
     );
   }
 
+  if (order.buyer_company_id && Number(order.buyer_company_id) !== Number(order.vendor_company_id)) {
+    const receptionNumber = `BR-MKP-${new Date().getFullYear()}-${String(order.id).padStart(6, "0")}`;
+    await client.query(
+      `INSERT INTO documents
+       (document_type, document_number, client_name, total_amount, observation,
+        created_by, company_id, related_entity_type, related_entity_id, status)
+       VALUES ('Bon de réception marketplace',$1,$2,$3,$4,$5,$6,'marketplace_order',$7,'En attente')`,
+      [
+        receptionNumber,
+        order.customer_name || order.customer_email || "",
+        Number(order.total_amount || 0),
+        `Bon de réception acheteur pour commande B2B ${order.order_number}`,
+        user.email || "Marketplace",
+        order.buyer_company_id,
+        order.id
+      ]
+    );
+  }
+
   await createNotification({
     user_id: order.customer_user_id,
     title: "Commande marketplace payée",
@@ -8409,13 +8461,13 @@ async function finalizeMarketplaceOrder(client, orderId, user = {}) {
 
 app.get("/marketplace/products", async (req, res) => {
   try {
-    const { q = "", vendor_company_id = "", category = "" } = req.query;
+    const { q = "", vendor_company_id = "", category = "", min_price = "", max_price = "" } = req.query;
     const values = [];
-    let where = "WHERE mp.status='published'";
+    let where = "WHERE (mp.status='published' OR mp.is_published=true)";
 
     if (q) {
       values.push(`%${q}%`);
-      where += ` AND (mp.title ILIKE $${values.length} OR p.reference ILIKE $${values.length} OR p.name ILIKE $${values.length})`;
+      where += ` AND (COALESCE(NULLIF(mp.public_title,''), mp.title) ILIKE $${values.length} OR p.reference ILIKE $${values.length} OR p.name ILIKE $${values.length})`;
     }
     if (vendor_company_id) {
       values.push(Number(vendor_company_id));
@@ -8425,10 +8477,21 @@ app.get("/marketplace/products", async (req, res) => {
       values.push(String(category));
       where += ` AND mp.category=$${values.length}`;
     }
+    if (min_price) {
+      values.push(Number(min_price));
+      where += ` AND COALESCE(NULLIF(mp.public_price,0), mp.price, 0) >= $${values.length}`;
+    }
+    if (max_price) {
+      values.push(Number(max_price));
+      where += ` AND COALESCE(NULLIF(mp.public_price,0), mp.price, 0) <= $${values.length}`;
+    }
 
     const result = await pool.query(
-      `SELECT mp.*, p.reference, p.name AS product_name, p.stock,
-              COALESCE(p.stock, mp.available_stock, 0) AS display_stock,
+      `SELECT mp.*, COALESCE(NULLIF(mp.public_title,''), mp.title) AS title,
+              COALESCE(NULLIF(mp.public_description,''), mp.description) AS description,
+              COALESCE(NULLIF(mp.public_price,0), mp.price, 0) AS price,
+              p.reference, p.name AS product_name, p.stock,
+              LEAST(COALESCE(p.stock,0), COALESCE(mp.available_quantity, mp.available_stock, 0)) AS display_stock,
               c.name AS vendor_name
        FROM marketplace_products mp
        LEFT JOIN products p ON p.id=mp.product_id
@@ -8448,13 +8511,17 @@ app.get("/marketplace/products", async (req, res) => {
 app.get("/marketplace/products/:id", async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT mp.*, p.reference, p.name AS product_name, p.stock, p.minimum_stock,
+      `SELECT mp.*, COALESCE(NULLIF(mp.public_title,''), mp.title) AS title,
+              COALESCE(NULLIF(mp.public_description,''), mp.description) AS description,
+              COALESCE(NULLIF(mp.public_price,0), mp.price, 0) AS price,
+              LEAST(COALESCE(p.stock,0), COALESCE(mp.available_quantity, mp.available_stock, 0)) AS display_stock,
+              p.reference, p.name AS product_name, p.stock, p.minimum_stock,
               p.location_code, p.warehouse, c.name AS vendor_name
        FROM marketplace_products mp
        LEFT JOIN products p ON p.id=mp.product_id
        LEFT JOIN companies c ON c.id=mp.company_id
        WHERE mp.id=$1
-         AND mp.status='published'
+         AND (mp.status='published' OR mp.is_published=true)
        LIMIT 1`,
       [req.params.id]
     );
@@ -8474,7 +8541,7 @@ app.get("/marketplace/vendors", async (req, res) => {
               mvs.store_description, mvs.logo_url,
               COUNT(mp.id)::int AS products_count
        FROM companies c
-       JOIN marketplace_products mp ON mp.company_id=c.id AND mp.status='published'
+       JOIN marketplace_products mp ON mp.company_id=c.id AND (mp.status='published' OR mp.is_published=true)
        LEFT JOIN marketplace_vendor_settings mvs ON mvs.company_id=c.id
        GROUP BY c.id, c.name, mvs.store_name, mvs.store_description, mvs.logo_url
        ORDER BY store_name ASC`
@@ -8486,6 +8553,40 @@ app.get("/marketplace/vendors", async (req, res) => {
   }
 });
 
+app.get("/marketplace/business", authenticateToken, async (req, res) => {
+  try {
+    const { q = "", category = "" } = req.query;
+    const values = [req.user.company_id || 0];
+    let where = "WHERE (mp.status='published' OR mp.is_published=true) AND mp.is_b2b=true AND mp.company_id<>$1";
+    if (q) {
+      values.push(`%${q}%`);
+      where += ` AND (COALESCE(NULLIF(mp.public_title,''), mp.title) ILIKE $${values.length} OR p.reference ILIKE $${values.length} OR p.name ILIKE $${values.length})`;
+    }
+    if (category) {
+      values.push(String(category));
+      where += ` AND mp.category=$${values.length}`;
+    }
+    const result = await pool.query(
+      `SELECT mp.*, COALESCE(NULLIF(mp.public_title,''), mp.title) AS title,
+              COALESCE(NULLIF(mp.public_description,''), mp.description) AS description,
+              COALESCE(NULLIF(mp.public_price,0), mp.price, 0) AS price,
+              LEAST(COALESCE(p.stock,0), COALESCE(mp.available_quantity, mp.available_stock, 0)) AS display_stock,
+              p.reference, p.name AS product_name, c.name AS vendor_name
+       FROM marketplace_products mp
+       LEFT JOIN products p ON p.id=mp.product_id
+       LEFT JOIN companies c ON c.id=mp.company_id
+       ${where}
+       ORDER BY mp.id DESC
+       LIMIT 100`,
+      values
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR MARKETPLACE BUSINESS :", error);
+    res.status(500).json({ error: "Erreur marketplace B2B" });
+  }
+});
+
 app.post("/marketplace/customers/register", async (req, res) => {
   try {
     const { fullname, email, phone, password } = req.body || {};
@@ -8494,6 +8595,7 @@ app.post("/marketplace/customers/register", async (req, res) => {
     if (!fullname || (!cleanEmail && !cleanPhone) || !password) {
       return res.status(400).json({ error: "Nom, contact et mot de passe obligatoires." });
     }
+    const storedEmail = cleanEmail || `customer-${Date.now()}-${Math.floor(Math.random() * 100000)}@pending.trianglewmspro.local`;
 
     const passwordHash = await bcrypt.hash(String(password), BCRYPT_ROUNDS);
     const userResult = await pool.query(
@@ -8502,7 +8604,7 @@ app.post("/marketplace/customers/register", async (req, res) => {
         verification_required, created_at)
        VALUES ($1,$2,$3,$4,'customer',true,'pending_verification',true,NOW())
        RETURNING id, fullname, email, phone, role`,
-      [fullname, cleanEmail, cleanPhone, passwordHash]
+      [fullname, storedEmail, cleanPhone, passwordHash]
     );
     const user = userResult.rows[0];
 
@@ -8558,17 +8660,22 @@ app.post("/marketplace/cart/items", authenticateToken, async (req, res) => {
     const { marketplace_product_id, quantity = 1 } = req.body || {};
     const qty = Math.max(Number(quantity || 1), 1);
     const productResult = await pool.query(
-      `SELECT mp.*, p.stock, p.id AS base_product_id
+      `SELECT mp.*, p.stock, p.id AS base_product_id,
+              COALESCE(NULLIF(mp.public_price,0), mp.price, 0) AS effective_price,
+              LEAST(COALESCE(p.stock,0), COALESCE(mp.available_quantity, mp.available_stock, 0)) AS effective_available
        FROM marketplace_products mp
        LEFT JOIN products p ON p.id=mp.product_id
        WHERE mp.id=$1
-         AND mp.status='published'
+         AND (mp.status='published' OR mp.is_published=true)
        LIMIT 1`,
       [marketplace_product_id]
     );
     const product = productResult.rows[0];
     if (!product) return res.status(404).json({ error: "Produit marketplace introuvable" });
-    const availableStock = Number(product.stock ?? product.available_stock ?? 0);
+    if (req.user.company_id && Number(req.user.company_id) === Number(product.company_id)) {
+      return res.status(400).json({ error: "Une entreprise ne peut pas acheter ses propres produits marketplace." });
+    }
+    const availableStock = Number(product.effective_available || 0);
     if (availableStock < qty) {
       return res.status(400).json({ error: "Stock insuffisant pour ce produit." });
     }
@@ -8592,7 +8699,7 @@ app.post("/marketplace/cart/items", authenticateToken, async (req, res) => {
              total_price=$1*$2,
              updated_at=CURRENT_TIMESTAMP
          WHERE id=$3`,
-        [nextQty, Number(product.price || 0), existing.rows[0].id]
+        [nextQty, Number(product.effective_price || 0), existing.rows[0].id]
       );
     } else {
       await pool.query(
@@ -8600,7 +8707,7 @@ app.post("/marketplace/cart/items", authenticateToken, async (req, res) => {
          (cart_id, marketplace_product_id, vendor_company_id, product_id,
           quantity, unit_price, total_price)
          VALUES ($1,$2,$3,$4,$5,$6,$5*$6)`,
-        [cart.id, product.id, product.company_id, product.product_id, qty, Number(product.price || 0)]
+        [cart.id, product.id, product.company_id, product.product_id, qty, Number(product.effective_price || 0)]
       );
     }
 
@@ -8663,11 +8770,12 @@ app.post("/marketplace/orders", authenticateToken, async (req, res) => {
       );
       const orderResult = await client.query(
         `INSERT INTO marketplace_orders
-         (order_number, customer_user_id, buyer_company_id, vendor_company_id,
+         (order_number, customer_user_id, buyer_user_id, buyer_company_id,
+          vendor_company_id, seller_company_id,
           customer_name, customer_email, customer_phone, delivery_address,
           order_type, status, payment_status, payment_method, subtotal,
           delivery_fee, total_amount, notes)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending_payment','pending',$10,$11,0,$11,$12)
+         VALUES ($1,$2,$2,$3,$4,$4,$5,$6,$7,$8,$9,'pending','pending',$10,$11,0,$11,$12)
          RETURNING *`,
         [
           orderNumber,
@@ -8678,7 +8786,7 @@ app.post("/marketplace/orders", authenticateToken, async (req, res) => {
           customer_email,
           customer_phone,
           delivery_address,
-          req.user.company_id ? "b2b" : "b2c",
+          req.user.company_id ? "B2B" : "B2C",
           payment_method,
           subtotal,
           notes
@@ -8728,7 +8836,7 @@ app.get("/marketplace/orders/my", authenticateToken, async (req, res) => {
     const result = await pool.query(
       `SELECT o.*, c.name AS vendor_name
        FROM marketplace_orders o
-       LEFT JOIN companies c ON c.id=o.vendor_company_id
+       LEFT JOIN companies c ON c.id=COALESCE(o.seller_company_id, o.vendor_company_id)
        WHERE o.customer_user_id=$1
           OR ($2::int IS NOT NULL AND o.buyer_company_id=$2)
        ORDER BY o.id DESC`,
@@ -8737,6 +8845,25 @@ app.get("/marketplace/orders/my", authenticateToken, async (req, res) => {
     res.json(result.rows);
   } catch (error) {
     console.error("ERREUR MARKETPLACE MY ORDERS :", error);
+    res.status(500).json({ error: "Erreur commandes marketplace" });
+  }
+});
+
+app.get("/marketplace/orders", authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT o.*, c.name AS vendor_name
+       FROM marketplace_orders o
+       LEFT JOIN companies c ON c.id=COALESCE(o.seller_company_id, o.vendor_company_id)
+       WHERE o.customer_user_id=$1
+          OR o.buyer_user_id=$1
+          OR ($2::int IS NOT NULL AND o.buyer_company_id=$2)
+       ORDER BY o.id DESC`,
+      [req.user.id, req.user.company_id || null]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR MARKETPLACE ORDERS :", error);
     res.status(500).json({ error: "Erreur commandes marketplace" });
   }
 });
@@ -8750,7 +8877,8 @@ app.get("/marketplace/orders/:id", authenticateToken, async (req, res) => {
        WHERE o.id=$1
          AND (
            o.customer_user_id=$2
-           OR o.vendor_company_id=$3
+           OR o.buyer_user_id=$2
+           OR COALESCE(o.seller_company_id, o.vendor_company_id)=$3
            OR o.buyer_company_id=$3
            OR $4::boolean=true
          )
@@ -8773,7 +8901,12 @@ app.get("/marketplace/vendor/products", authenticateToken, async (req, res) => {
     if (!canManageMarketplaceVendor(req.user)) return res.status(403).json({ error: "Accès vendeur marketplace refusé." });
     const companyId = getEffectiveCompanyId(req);
     const result = await pool.query(
-      `SELECT mp.*, p.reference, p.name AS product_name, p.stock
+      `SELECT mp.*, COALESCE(NULLIF(mp.public_title,''), mp.title) AS title,
+              COALESCE(NULLIF(mp.public_description,''), mp.description) AS description,
+              COALESCE(NULLIF(mp.public_price,0), mp.price, 0) AS price,
+              COALESCE(mp.published_quantity, mp.available_stock, 0) AS published_quantity,
+              COALESCE(mp.available_quantity, mp.available_stock, 0) AS available_quantity,
+              p.reference, p.name AS product_name, p.stock
        FROM marketplace_products mp
        LEFT JOIN products p ON p.id=mp.product_id
        WHERE mp.company_id=$1
@@ -8791,24 +8924,54 @@ app.post("/marketplace/vendor/products", authenticateToken, async (req, res) => 
   try {
     if (!canManageMarketplaceVendor(req.user)) return res.status(403).json({ error: "Accès vendeur marketplace refusé." });
     const companyId = getEffectiveCompanyId(req);
-    const { product_id, title, description = "", category = "", price = 0, image_url = "", is_b2b = true, is_b2c = true } = req.body || {};
+    const {
+      product_id,
+      title,
+      public_title,
+      description = "",
+      public_description = "",
+      category = "",
+      price = 0,
+      public_price = 0,
+      published_quantity,
+      available_stock,
+      image_url = "",
+      images = [],
+      status = "published",
+      is_b2b = true,
+      is_b2c = true
+    } = req.body || {};
     const product = await pool.query("SELECT * FROM products WHERE id=$1 AND company_id=$2", [product_id, companyId]);
     if (!product.rows[0]) return res.status(404).json({ error: "Produit source introuvable dans cette entreprise." });
+    const sourceStock = Number(product.rows[0].stock || 0);
+    const quantityToPublish = Number(published_quantity ?? available_stock ?? sourceStock);
+    if (quantityToPublish <= 0 || quantityToPublish > sourceStock) {
+      return res.status(400).json({ error: "La quantité publiée doit être supérieure à 0 et inférieure ou égale au stock disponible." });
+    }
+    const finalPrice = Number(public_price || price || product.rows[0].sale_price || product.rows[0].price || 0);
+    const finalTitle = public_title || title || product.rows[0].name;
+    const finalDescription = public_description || description || "";
+    const finalStatus = status === "draft" || status === "brouillon" ? "draft" : "published";
     const result = await pool.query(
       `INSERT INTO marketplace_products
-       (company_id, product_id, title, description, category, price, image_url,
-        available_stock, is_b2b, is_b2c, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+       (company_id, product_id, title, public_title, description, public_description,
+        category, price, public_price, image_url, images, available_stock,
+        published_quantity, available_quantity, sold_quantity, status,
+        is_published, is_b2b, is_b2c, created_by)
+       VALUES ($1,$2,$3,$3,$4,$4,$5,$6,$6,$7,$8::jsonb,$9,$9,$9,0,$10,$11,$12,$13,$14)
        RETURNING *`,
       [
         companyId,
         product_id,
-        title || product.rows[0].name,
-        description,
+        finalTitle,
+        finalDescription,
         category || product.rows[0].category || "",
-        Number(price || product.rows[0].sale_price || product.rows[0].price || 0),
+        finalPrice,
         image_url || product.rows[0].image_url || "",
-        Number(product.rows[0].stock || 0),
+        JSON.stringify(Array.isArray(images) ? images : []),
+        quantityToPublish,
+        finalStatus,
+        finalStatus === "published",
         is_b2b !== false,
         is_b2c !== false,
         req.user.id
@@ -8825,14 +8988,59 @@ app.put("/marketplace/vendor/products/:id", authenticateToken, async (req, res) 
   try {
     if (!canManageMarketplaceVendor(req.user)) return res.status(403).json({ error: "Accès vendeur marketplace refusé." });
     const companyId = getEffectiveCompanyId(req);
-    const { title, description = "", category = "", price = 0, image_url = "", status = "published", is_b2b = true, is_b2c = true } = req.body || {};
+    const {
+      title,
+      public_title,
+      description = "",
+      public_description = "",
+      category = "",
+      price = 0,
+      public_price = 0,
+      published_quantity,
+      available_stock,
+      image_url = "",
+      status = "published",
+      is_b2b = true,
+      is_b2c = true
+    } = req.body || {};
+    const existing = await pool.query(
+      `SELECT mp.*, p.stock
+       FROM marketplace_products mp
+       LEFT JOIN products p ON p.id=mp.product_id
+       WHERE mp.id=$1 AND mp.company_id=$2`,
+      [req.params.id, companyId]
+    );
+    if (!existing.rows[0]) return res.status(404).json({ error: "Produit marketplace introuvable" });
+    const nextPublishedQuantity = Number(published_quantity ?? available_stock ?? existing.rows[0].published_quantity ?? existing.rows[0].available_stock ?? 0);
+    if (nextPublishedQuantity > Number(existing.rows[0].stock || 0)) {
+      return res.status(400).json({ error: "La quantité publiée dépasse le stock disponible." });
+    }
+    const nextAvailable = Math.max(nextPublishedQuantity - Number(existing.rows[0].sold_quantity || 0), 0);
+    const finalStatus = status === "draft" || status === "brouillon" ? "draft" : "published";
     const result = await pool.query(
       `UPDATE marketplace_products
-       SET title=$1, description=$2, category=$3, price=$4, image_url=$5,
-           status=$6, is_b2b=$7, is_b2c=$8, updated_at=CURRENT_TIMESTAMP
-       WHERE id=$9 AND company_id=$10
+       SET title=$1, public_title=$1, description=$2, public_description=$2,
+           category=$3, price=$4, public_price=$4, image_url=$5,
+           published_quantity=$6, available_quantity=$7, available_stock=$7,
+           status=$8, is_published=$9, is_b2b=$10, is_b2c=$11,
+           updated_at=CURRENT_TIMESTAMP
+       WHERE id=$12 AND company_id=$13
        RETURNING *`,
-      [title, description, category, Number(price || 0), image_url, status, is_b2b !== false, is_b2c !== false, req.params.id, companyId]
+      [
+        public_title || title || existing.rows[0].title,
+        public_description || description,
+        category,
+        Number(public_price || price || 0),
+        image_url,
+        nextPublishedQuantity,
+        nextAvailable,
+        finalStatus,
+        finalStatus === "published",
+        is_b2b !== false,
+        is_b2c !== false,
+        req.params.id,
+        companyId
+      ]
     );
     if (!result.rows[0]) return res.status(404).json({ error: "Produit marketplace introuvable" });
     res.json(result.rows[0]);
@@ -8848,7 +9056,7 @@ app.delete("/marketplace/vendor/products/:id", authenticateToken, async (req, re
     const companyId = getEffectiveCompanyId(req);
     const result = await pool.query(
       `UPDATE marketplace_products
-       SET status='inactive', updated_at=CURRENT_TIMESTAMP
+       SET status='inactive', is_published=false, updated_at=CURRENT_TIMESTAMP
        WHERE id=$1 AND company_id=$2
        RETURNING *`,
       [req.params.id, companyId]
@@ -8915,6 +9123,80 @@ app.put("/marketplace/vendor/orders/:id/status", authenticateToken, async (req, 
     await client.query("ROLLBACK");
     console.error("ERREUR VENDOR ORDER STATUS :", error);
     res.status(500).json({ error: error.detail || error.message || "Erreur statut commande marketplace" });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/marketplace/orders/:id/receive", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const companyId = req.user.company_id;
+    if (!companyId) return res.status(403).json({ error: "Réception réservée aux comptes entreprise." });
+    await client.query("BEGIN");
+    const orderResult = await client.query(
+      `SELECT *
+       FROM marketplace_orders
+       WHERE id=$1 AND buyer_company_id=$2 AND UPPER(order_type)='B2B'
+       FOR UPDATE`,
+      [req.params.id, companyId]
+    );
+    const order = orderResult.rows[0];
+    if (!order) throw new Error("Commande B2B introuvable pour cette entreprise.");
+    if (order.stock_entry_created === true) throw new Error("Entrée stock déjà créée pour cette commande.");
+    const items = await client.query("SELECT * FROM marketplace_order_items WHERE order_id=$1", [order.id]);
+    for (const item of items.rows) {
+      const productRef = item.product_reference || `MKP-${item.product_id}`;
+      const productName = item.product_name || "Produit marketplace";
+      let product = await client.query(
+        "SELECT * FROM products WHERE company_id=$1 AND reference=$2 LIMIT 1",
+        [companyId, productRef]
+      );
+      if (!product.rows[0]) {
+        product = await client.query(
+          `INSERT INTO products
+           (company_id, reference, name, category, stock, status, unit, sale_price, is_active)
+           VALUES ($1,$2,$3,'Achat marketplace',0,'Disponible','pièce',$4,true)
+           RETURNING *`,
+          [companyId, productRef, productName, Number(item.unit_price || 0)]
+        );
+      }
+      await client.query(
+        "UPDATE products SET stock=COALESCE(stock,0)+$1, updated_at=CURRENT_TIMESTAMP WHERE id=$2",
+        [Number(item.quantity || 0), product.rows[0].id]
+      );
+      await client.query(
+        `INSERT INTO stock_movements
+         (type, product_reference, product_name, quantity, source_warehouse,
+          destination_warehouse, reason, status, company_id, created_by,
+          created_by_name, created_by_role, product_id, approval_status,
+          original_quantity, final_quantity)
+         VALUES ('Entrée',$1,$2,$3,$4,$5,$6,'Validé',$7,$8,$9,$10,$11,'Validé',$3,$3)`,
+        [
+          productRef,
+          productName,
+          Number(item.quantity || 0),
+          "Marketplace",
+          req.body?.destination_warehouse || "Stock acheteur",
+          `Réception commande marketplace ${order.order_number}`,
+          companyId,
+          req.user.id,
+          req.user.email || req.user.fullname || "Acheteur marketplace",
+          req.user.role || "admin",
+          product.rows[0].id
+        ]
+      );
+    }
+    await client.query(
+      "UPDATE marketplace_orders SET stock_entry_created=true, status='received', updated_at=CURRENT_TIMESTAMP WHERE id=$1",
+      [order.id]
+    );
+    await client.query("COMMIT");
+    res.json({ success: true, message: "Entrée stock créée côté acheteur." });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("ERREUR MARKETPLACE RECEIVE :", error);
+    res.status(500).json({ error: error.message || "Erreur réception marketplace" });
   } finally {
     client.release();
   }
@@ -12808,7 +13090,10 @@ async function runAssistantTool(toolName, user) {
     const orders = await pool.query(
       `SELECT COUNT(*)::int AS total_orders,
               COALESCE(SUM(total_amount),0)::numeric AS total_amount,
-              COUNT(*) FILTER (WHERE payment_status='paid')::int AS paid_orders
+              COUNT(*) FILTER (WHERE payment_status='paid')::int AS paid_orders,
+              COUNT(*) FILTER (WHERE UPPER(order_type)='B2B')::int AS b2b_orders,
+              COUNT(*) FILTER (WHERE UPPER(order_type)='B2C')::int AS b2c_orders,
+              COUNT(*) FILTER (WHERE status IN ('pending','pending_payment') OR payment_status='pending')::int AS pending_orders
        FROM marketplace_orders o ${orderWhere}`,
       scopeValues
     );
@@ -12955,7 +13240,7 @@ function buildLocalAssistantAnswer(message, toolResults) {
       lines.push(`- Emplacements : ${Array.isArray(item.data) ? item.data.length : 0} affiché(s).`);
     } else if (item.tool === "get_marketplace_summary") {
       lines.push(
-        `- Marketplace : ${item.data?.products?.published_products || 0} produit(s) publié(s), ${item.data?.orders?.total_orders || 0} commande(s), total ${Number(item.data?.orders?.total_amount || 0).toLocaleString("fr-FR", { maximumFractionDigits: 0 })} FCFA.`
+        `- Marketplace : ${item.data?.products?.published_products || 0} produit(s) publié(s), ${item.data?.orders?.total_orders || 0} commande(s) dont ${item.data?.orders?.b2b_orders || 0} B2B et ${item.data?.orders?.b2c_orders || 0} B2C, ${item.data?.orders?.pending_orders || 0} en attente, total ${Number(item.data?.orders?.total_amount || 0).toLocaleString("fr-FR", { maximumFractionDigits: 0 })} FCFA.`
       );
     } else if (item.tool === "get_automobile_summary") {
       lines.push(
