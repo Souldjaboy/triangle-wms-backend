@@ -9182,14 +9182,212 @@ function assistantScope(user, values) {
   return `company_id=$${values.length}`;
 }
 
+const DEFAULT_AI_MODULE_KNOWLEDGE = [
+  {
+    module_key: "dashboard",
+    module_name: "Tableau de bord",
+    description:
+      "Vue centrale de pilotage avec les indicateurs produits, stocks, mouvements, ventes, alertes et activité récente.",
+    role_explanation:
+      "Le tableau de bord sert à comprendre rapidement l'état global de l'entreprise et à détecter les priorités.",
+    available_actions: ["consulter indicateurs", "voir alertes", "voir mouvements récents", "actualiser données"],
+    pages: ["/dashboard"],
+    permissions: ["super_admin", "admin", "direction", "responsable_entrepot", "magasinier", "client"],
+    data_sources: ["products", "warehouses", "locations", "stock_movements", "inventory_history", "sales", "user_activities"],
+    examples: ["Combien de produits ai-je ?", "Quel est le stock total ?", "Quelles sont les alertes importantes ?"]
+  },
+  {
+    module_key: "stock",
+    module_name: "Stocks & mouvements",
+    description:
+      "Module de suivi des quantités, entrées, sorties, transferts, inventaires et validations de mouvements.",
+    role_explanation:
+      "Il permet de contrôler les flux physiques de marchandises et de garder une traçabilité complète.",
+    available_actions: ["entrée stock", "sortie stock", "transfert", "inventaire", "validation", "refus"],
+    pages: ["/stocks", "/inventaires", "/scanner"],
+    permissions: ["super_admin", "admin", "responsable_entrepot", "magasinier"],
+    data_sources: ["products", "stock_movements", "inventory_history", "locations", "warehouses"],
+    examples: ["Quel est le dernier mouvement ?", "Quels produits sont en rupture ?", "Explique-moi un transfert stock"]
+  },
+  {
+    module_key: "products",
+    module_name: "Produits",
+    description:
+      "Gestion des fiches produits, références, prix, images, QR codes, codes-barres, lots et stock minimum.",
+    role_explanation:
+      "Ce module centralise l'identité des articles utilisés par le WMS, le POS et les rapports.",
+    available_actions: ["créer produit", "modifier produit", "consulter produit", "générer QR", "imprimer étiquette"],
+    pages: ["/produits", "/pos/produits", "/scan/product/[code]"],
+    permissions: ["super_admin", "admin", "responsable_entrepot", "magasinier", "direction", "client"],
+    data_sources: ["products", "product_batches", "product_price_history", "locations"],
+    examples: ["Montre-moi les produits", "Quel produit a le stock faible ?", "Explique-moi les lots"]
+  },
+  {
+    module_key: "pos",
+    module_name: "POS / Caisse",
+    description:
+      "Point de vente pour scanner les produits, créer des ventes, encaisser, imprimer les reçus et déduire le stock.",
+    role_explanation:
+      "Le POS transforme les produits en ventes payées, crée les paiements, reçus et mouvements de stock associés.",
+    available_actions: ["vendre", "scanner produit", "encaisser", "imprimer reçu", "annuler vente", "consulter historique"],
+    pages: ["/pos", "/pos/historique", "/pos/ventes", "/pos/paiements", "/pos/recus", "/pos/caisses"],
+    permissions: ["super_admin", "admin", "caissier", "direction"],
+    data_sources: ["sales", "sale_items", "payments", "receipts", "caisses", "products"],
+    examples: ["Montre-moi les ventes d'aujourd'hui", "Explique-moi les paiements POS", "Quel est le total vendu ?"]
+  },
+  {
+    module_key: "accounting",
+    module_name: "Comptabilité & Trésorerie",
+    description:
+      "Module permettant de gérer les banques, caisses, mouvements financiers, bons, demandes de décaissement, salaires, états financiers et rapports comptables.",
+    role_explanation:
+      "Ce module sert à suivre les entrées et sorties d'argent, contrôler la trésorerie, gérer les dépenses, suivre les paiements et produire des états financiers.",
+    available_actions: ["afficher banques", "afficher caisses", "afficher mouvements", "créer bon", "valider demande", "consulter états", "générer rapport comptable"],
+    pages: ["/comptabilite", "/comptabilite/banques", "/comptabilite/tresorerie", "/comptabilite/demandes", "/comptabilite/etats"],
+    permissions: ["super_admin", "admin", "direction", "comptable"],
+    data_sources: ["accounting_banks", "caisses", "accounting_transactions", "cash_vouchers", "expense_requests", "treasury_accounts", "journal_entries", "journal_entry_lines"],
+    examples: ["C'est quoi la comptabilité ?", "Combien j'ai dans les banques ?", "Quels sont les mouvements comptables ?"]
+  },
+  {
+    module_key: "attendance",
+    module_name: "Pointage QR & RH",
+    description:
+      "Module de pointage par badge QR avec horaires, pauses, historique, règles GPS, sites de pointage et calculs RH.",
+    role_explanation:
+      "Il sert à contrôler la présence, les retards, les pauses et les affectations horaires des employés.",
+    available_actions: ["scanner badge", "début travail", "début pause", "fin pause", "fin travail", "consulter historique"],
+    pages: ["/attendance-scan", "/pointage", "/parametres-pointage"],
+    permissions: ["super_admin", "admin", "responsable_entrepot", "employe", "magasinier"],
+    data_sources: ["attendance_records", "attendance_settings", "attendance_sites", "users"],
+    examples: ["Explique-moi le pointage GPS", "Quels employés sont présents ?", "C'est quoi un site de pointage ?"]
+  },
+  {
+    module_key: "documents_reports",
+    module_name: "Documents & Rapports",
+    description:
+      "Centralise les documents, reçus, bons, rapports de stock, ventes, inventaires, pointage et comptabilité.",
+    role_explanation:
+      "Il sert à imprimer, télécharger, consulter et tracer les pièces importantes de l'entreprise.",
+    available_actions: ["voir document", "imprimer", "exporter PDF", "filtrer rapport", "envoyer par email si configuré"],
+    pages: ["/documents", "/rapports", "/pos/recus"],
+    permissions: ["super_admin", "admin", "direction"],
+    data_sources: ["documents", "receipts", "sales", "stock_movements", "inventory_history", "accounting_transactions"],
+    examples: ["Quels documents récents ?", "Explique-moi les rapports", "Où voir les reçus ?"]
+  },
+  {
+    module_key: "partners",
+    module_name: "Partenaires, clients & fournisseurs",
+    description:
+      "Gestion des partenaires avec ventes, achats, paiements, documents liés, solde client et dette fournisseur.",
+    role_explanation:
+      "Ce module relie les clients et fournisseurs aux opérations commerciales, documents et soldes.",
+    available_actions: ["consulter fiche", "voir historique ventes", "voir paiements", "désactiver partenaire"],
+    pages: ["/partenaires"],
+    permissions: ["super_admin", "admin", "direction", "commercial"],
+    data_sources: ["partners", "sales", "documents", "receipts", "accounting_transactions"],
+    examples: ["Explique-moi les partenaires", "Quel est le solde client ?", "Quels documents sont liés ?"]
+  },
+  {
+    module_key: "users_permissions",
+    module_name: "Utilisateurs, rôles & permissions",
+    description:
+      "Gestion des comptes, rôles, permissions, modules activés et restrictions par entreprise.",
+    role_explanation:
+      "Ce module protège l'accès au logiciel et adapte les menus/actions au rôle de chaque utilisateur.",
+    available_actions: ["créer utilisateur", "modifier rôle", "désactiver utilisateur", "contrôler permissions"],
+    pages: ["/utilisateurs", "/super-admin", "/parametres"],
+    permissions: ["super_admin", "admin"],
+    data_sources: ["users", "companies", "module_settings", "audit_logs"],
+    examples: ["Explique-moi les rôles", "Qui peut voir les rapports ?", "Quels modules sont activés ?"]
+  }
+];
+
+function normalizeAssistantText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+}
+
+function matchDefaultModuleKnowledge(message) {
+  const text = normalizeAssistantText(message);
+  const matches = [];
+
+  for (const module of DEFAULT_AI_MODULE_KNOWLEDGE) {
+    const haystack = normalizeAssistantText(
+      [
+        module.module_key,
+        module.module_name,
+        module.description,
+        module.role_explanation,
+        ...(module.available_actions || []),
+        ...(module.pages || []),
+        ...(module.data_sources || []),
+        ...(module.examples || [])
+      ].join(" ")
+    );
+
+    if (
+      text.includes(normalizeAssistantText(module.module_name)) ||
+      text.includes(normalizeAssistantText(module.module_key)) ||
+      haystack
+        .split(/\s+/)
+        .filter((word) => word.length >= 5)
+        .some((word) => text.includes(word))
+    ) {
+      matches.push(module);
+    }
+  }
+
+  if (matches.length > 0) return matches.slice(0, 5);
+
+  if (/module|expli|c.est quoi|sert a quoi|comment/.test(text)) {
+    return DEFAULT_AI_MODULE_KNOWLEDGE.slice(0, 5);
+  }
+
+  return [];
+}
+
+async function getAssistantModuleKnowledge(message) {
+  const fallback = matchDefaultModuleKnowledge(message);
+  const search = `%${String(message || "").trim()}%`;
+
+  try {
+    const result = await pool.query(
+      `SELECT module_key, module_name, description, role_explanation,
+              available_actions, pages, permissions, data_sources, examples
+       FROM ai_module_knowledge
+       WHERE active=true
+         AND (
+           module_key ILIKE $1 OR module_name ILIKE $1
+           OR description ILIKE $1 OR role_explanation ILIKE $1
+         )
+       ORDER BY module_name ASC
+       LIMIT 8`,
+      [search]
+    );
+
+    if (result.rows.length > 0) return result.rows;
+  } catch (error) {
+    return fallback;
+  }
+
+  return fallback;
+}
+
 function chooseAssistantTools(message) {
   const text = String(message || "").toLowerCase();
   const tools = new Set();
+
+  tools.add("get_module_knowledge");
 
   if (/produit|products?/.test(text)) tools.add("get_products");
   if (/stock|reste|rupture|faible/.test(text)) tools.add("get_stock");
   if (/mouvement|entrée|sortie|transfert|dernier/.test(text)) tools.add("get_last_movement");
   if (/vente|caisse|pos|vendu|aujourd/.test(text)) tools.add("get_sales_today");
+  if (/compta|comptabilit|banque|trésorerie|tresorerie|décaissement|decaissement|encaissement|bilan|grand livre|journal|état financier|etat financier/.test(text)) {
+    tools.add("get_accounting_summary");
+  }
   if (/alerte|rupture|faible/.test(text)) tools.add("get_alerts");
   if (/utilisateur|employé|user|personnel/.test(text)) tools.add("get_users");
   if (/inventaire/.test(text)) tools.add("get_inventory");
@@ -9215,6 +9413,10 @@ async function runAssistantTool(toolName, user) {
   const scope = assistantScope(user, values);
   const where = scope ? `WHERE ${scope}` : "";
   const andScope = scope ? `AND ${scope}` : "";
+
+  if (toolName === "get_module_knowledge") {
+    return [];
+  }
 
   if (toolName === "get_products") {
     const summary = await pool.query(
@@ -9278,6 +9480,58 @@ async function runAssistantTool(toolName, user) {
       values
     );
     return { summary: total.rows[0], rows: result.rows };
+  }
+
+  if (toolName === "get_accounting_summary") {
+    const banks = await pool.query(
+      `SELECT id, bank_name, account_number, currency, current_balance, active
+       FROM accounting_banks ${where}
+       ORDER BY id DESC
+       LIMIT 30`,
+      values
+    );
+    const treasury = await pool.query(
+      `SELECT COALESCE(SUM(current_balance),0)::numeric AS total_treasury
+       FROM treasury_accounts ${where}`,
+      values
+    );
+    const caisses = await pool.query(
+      `SELECT id, nom_caisse, code_caisse, statut, solde_actuel
+       FROM caisses ${where}
+       ORDER BY id DESC
+       LIMIT 30`,
+      values
+    );
+    const movements = await pool.query(
+      `SELECT id, transaction_number, transaction_type, amount, source_label,
+              destination_label, status, created_at
+       FROM accounting_transactions ${where}
+       ORDER BY created_at DESC NULLS LAST, id DESC
+       LIMIT 10`,
+      values
+    );
+
+    const totalBanks = banks.rows.reduce(
+      (sum, bank) => sum + Number(bank.current_balance || 0),
+      0
+    );
+    const totalCaisses = caisses.rows.reduce(
+      (sum, caisse) => sum + Number(caisse.solde_actuel || 0),
+      0
+    );
+
+    return {
+      summary: {
+        banks_count: banks.rows.length,
+        total_banks: totalBanks,
+        total_treasury: Number(treasury.rows[0]?.total_treasury || 0),
+        cash_registers_count: caisses.rows.length,
+        total_cash_registers: totalCaisses
+      },
+      banks: banks.rows,
+      cash_registers: caisses.rows,
+      recent_movements: movements.rows
+    };
   }
 
   if (toolName === "get_alerts") {
@@ -9364,7 +9618,17 @@ function buildLocalAssistantAnswer(message, toolResults) {
   const lines = ["Voici les informations WMS trouvées :"];
 
   for (const item of toolResults) {
-    if (item.tool === "get_products") {
+    if (item.tool === "get_module_knowledge") {
+      const modules = Array.isArray(item.data) ? item.data : [];
+      if (modules.length > 0) {
+        lines.push("- Connaissance des modules :");
+        modules.slice(0, 3).forEach((module) => {
+          lines.push(
+            `  • ${module.module_name} : ${module.role_explanation || module.description || "Module Triangle WMS Pro."}`
+          );
+        });
+      }
+    } else if (item.tool === "get_products") {
       lines.push(`- Produits : ${item.data?.summary?.total || 0} produit(s).`);
     } else if (item.tool === "get_stock") {
       lines.push(
@@ -9380,6 +9644,10 @@ function buildLocalAssistantAnswer(message, toolResults) {
     } else if (item.tool === "get_sales_today") {
       lines.push(
         `- Ventes aujourd’hui : ${item.data?.summary?.sales_count || 0} vente(s), total ${Number(item.data?.summary?.total_amount || 0).toLocaleString("fr-FR", { maximumFractionDigits: 0 })} FCFA.`
+      );
+    } else if (item.tool === "get_accounting_summary") {
+      lines.push(
+        `- Comptabilité : banques ${Number(item.data?.summary?.total_banks || 0).toLocaleString("fr-FR", { maximumFractionDigits: 0 })} FCFA, trésorerie ${Number(item.data?.summary?.total_treasury || 0).toLocaleString("fr-FR", { maximumFractionDigits: 0 })} FCFA, caisses ${Number(item.data?.summary?.total_cash_registers || 0).toLocaleString("fr-FR", { maximumFractionDigits: 0 })} FCFA.`
       );
     } else if (item.tool === "get_alerts") {
       lines.push(`- Alertes stock : ${Array.isArray(item.data) ? item.data.length : 0} élément(s).`);
@@ -9413,7 +9681,10 @@ app.post("/assistant/query", authenticateToken, async (req, res) => {
     const toolResults = [];
 
     for (const tool of selectedTools) {
-      const data = await runAssistantTool(tool, req.user);
+      const data =
+        tool === "get_module_knowledge"
+          ? await getAssistantModuleKnowledge(message)
+          : await runAssistantTool(tool, req.user);
       toolResults.push({ tool, data });
     }
 
@@ -9441,7 +9712,7 @@ app.post("/assistant/query", authenticateToken, async (req, res) => {
             {
               role: "system",
               content:
-                "Tu es l'assistant IA connecté au WMS Triangle WMS Pro. Réponds en français simple et professionnel. Utilise uniquement les données fournies par les outils internes. Si une liste est longue, résume les éléments importants. Ne dis jamais que tu n'as pas accès aux données quand des résultats d'outils sont fournis."
+                "Tu es l'assistant IA connecté au WMS Triangle WMS Pro. Réponds en français simple et professionnel. Tu connais les modules grâce à l'outil get_module_knowledge et tu utilises les données fournies par les outils internes. Même si aucune donnée métier n'existe, explique clairement le rôle du module avec la connaissance fournie. Si une liste est longue, résume les éléments importants. Ne dis jamais que tu n'as pas accès aux données quand des résultats d'outils sont fournis."
             },
             {
               role: "user",
