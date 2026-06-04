@@ -883,29 +883,49 @@ async function createVerificationCode({ companyId, userId, targetType, targetVal
 }
 
 async function sendVerificationMessage({ targetType, targetValue, code, verifyUrl }) {
-  const isProduction = process.env.NODE_ENV === "production";
-
   if (targetType === "email") {
-    if (!process.env.SMTP_HOST) {
+    if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
       return {
         sent: false,
-        provider: "sandbox",
-        message: "SMTP non configuré. Code créé en base.",
-        sandbox_code: isProduction ? undefined : code,
-        verify_url: isProduction ? undefined : verifyUrl
+        provider: "smtp",
+        message: "SMTP non configuré. Configurez SMTP pour envoyer le code OTP réel."
       };
     }
 
-    console.log("EMAIL OTP prêt à envoyer :", { targetValue, verifyUrl });
-    return { sent: false, provider: process.env.EMAIL_PROVIDER || "smtp", message: "Provider email préparé." };
+    const transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: Number(process.env.SMTP_PORT || 587),
+      secure: Number(process.env.SMTP_PORT || 587) === 465,
+      auth: {
+        user: process.env.SMTP_USER,
+        pass: process.env.SMTP_PASS
+      }
+    });
+
+    await transporter.sendMail({
+      from: process.env.SMTP_FROM || process.env.SMTP_USER,
+      to: targetValue,
+      subject: "Code de vérification Triangle WMS Pro",
+      text: `Votre code de vérification Triangle WMS Pro est : ${code}. Il expire dans 10 minutes.\n\nLien sécurisé : ${verifyUrl}`,
+      html: `
+        <div style="font-family:Arial,sans-serif;color:#111">
+          <h2>Vérification Triangle WMS Pro</h2>
+          <p>Votre code de vérification est :</p>
+          <p style="font-size:28px;font-weight:700;letter-spacing:4px">${code}</p>
+          <p>Ce code expire dans 10 minutes.</p>
+          <p><a href="${escapeHtml(verifyUrl)}">Valider directement mon compte</a></p>
+        </div>
+      `
+    });
+
+    return { sent: true, provider: process.env.EMAIL_PROVIDER || "smtp", message: "Code OTP envoyé par email." };
   }
 
   if ((process.env.SMS_PROVIDER || "sandbox") === "sandbox" || !process.env.SMS_API_KEY) {
     return {
       sent: false,
-      provider: "sandbox",
-      message: "SMS sandbox. Code créé en base.",
-      sandbox_code: isProduction ? undefined : code
+      provider: process.env.SMS_PROVIDER || "sms",
+      message: "Provider SMS non configuré. Configurez Twilio, Africa's Talking, Orange API ou MTN API."
     };
   }
 
@@ -5993,6 +6013,20 @@ app.get("/pos/reports/payments", authenticateToken, async (req, res) => {
 
 async function nextAccountingNumber(client, tableName, columnName, prefix, companyId) {
   const year = new Date().getFullYear();
+  const safeCompanyId = Number(companyId || 0);
+  const counterKey = `${tableName}.${columnName}.${prefix}.${year}`;
+  const counterResult = await client.query(
+    `INSERT INTO number_counters (company_id, counter_key, last_value)
+     VALUES ($1,$2,1)
+     ON CONFLICT (company_id, counter_key)
+     DO UPDATE SET
+       last_value=number_counters.last_value + 1,
+       updated_at=CURRENT_TIMESTAMP
+     RETURNING last_value`,
+    [safeCompanyId, counterKey]
+  );
+  const counterSequence = Number(counterResult.rows[0]?.last_value || 1);
+
   const result = await client.query(
     `SELECT ${columnName} AS number
      FROM ${tableName}
@@ -6004,7 +6038,20 @@ async function nextAccountingNumber(client, tableName, columnName, prefix, compa
   );
   const lastNumber = String(result.rows[0]?.number || "");
   const lastSequence = Number(lastNumber.split("-").pop() || 0);
-  return `${prefix}-${year}-${String(lastSequence + 1).padStart(6, "0")}`;
+  const nextSequence = Math.max(counterSequence, lastSequence + 1);
+
+  if (nextSequence !== counterSequence) {
+    await client.query(
+      `UPDATE number_counters
+       SET last_value=$1,
+           updated_at=CURRENT_TIMESTAMP
+       WHERE company_id=$2
+         AND counter_key=$3`,
+      [nextSequence, safeCompanyId, counterKey]
+    );
+  }
+
+  return `${prefix}-${year}-${String(nextSequence).padStart(6, "0")}`;
 }
 
 async function ensureTreasuryAccount(client, companyId, currency = "FCFA") {
