@@ -2774,15 +2774,17 @@ app.put(
 app.post(
   "/users/:id/reset-password",
   authenticateToken,
-  authorizeRoles("super_admin"),
+  authorizeRoles("admin", "super_admin"),
   async (req, res) => {
     try {
-      if (req.user.is_super_admin !== true && normalizeRole(req.user.role) !== "super_admin") {
-        return res.status(403).json({ error: "Accès Super Admin requis." });
+      if (!canAccessAdminSettings(req.user)) {
+        return res.status(403).json({ error: "Accès administrateur requis." });
       }
 
       const tempPassword = `Triangle-${crypto.randomBytes(4).toString("hex")}-2026`;
       const hashedPassword = await hashPassword(tempPassword);
+      const companyId = getEffectiveCompanyId(req, req.user.company_id);
+      const isSuperAdmin = isSuperAdminUser(req.user);
 
       const result = await pool.query(
         `UPDATE users
@@ -2790,8 +2792,9 @@ app.post(
              force_password_change=true,
              updated_at=CURRENT_TIMESTAMP
          WHERE id=$2
+         ${isSuperAdmin ? "" : "AND company_id=$3"}
          RETURNING id, fullname, email, role, company_id`,
-        [hashedPassword, req.params.id]
+        isSuperAdmin ? [hashedPassword, req.params.id] : [hashedPassword, req.params.id, companyId]
       );
 
       if (result.rows.length === 0) {
@@ -2806,10 +2809,45 @@ app.post(
         { target_email: result.rows[0].email }
       );
 
+      let email_sent = false;
+      let email_message = "SMTP non configuré : communiquez le mot de passe temporaire manuellement.";
+
+      if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS && result.rows[0].email) {
+        try {
+          const transporter = nodemailer.createTransport({
+            host: process.env.SMTP_HOST,
+            port: Number(process.env.SMTP_PORT || 587),
+            secure: Number(process.env.SMTP_PORT || 587) === 465,
+            auth: {
+              user: process.env.SMTP_USER,
+              pass: process.env.SMTP_PASS
+            }
+          });
+
+          await transporter.sendMail({
+            from: process.env.SMTP_FROM || process.env.SMTP_USER,
+            to: result.rows[0].email,
+            subject: "Réinitialisation mot de passe Triangle WMS Pro",
+            html: `
+              <p>Bonjour ${result.rows[0].fullname || ""},</p>
+              <p>Votre mot de passe temporaire Triangle WMS Pro est :</p>
+              <p style="font-size:18px;font-weight:bold">${tempPassword}</p>
+              <p>Connectez-vous puis modifiez votre mot de passe.</p>
+            `
+          });
+          email_sent = true;
+          email_message = "Email de réinitialisation envoyé.";
+        } catch (mailError) {
+          console.error("ERREUR EMAIL RESET PASSWORD :", mailError);
+          email_message = "SMTP configuré mais l’envoi email a échoué.";
+        }
+      }
+
       res.json({
-        message: "Mot de passe temporaire généré.",
+        message: email_message,
         user: result.rows[0],
-        temporary_password: tempPassword
+        temporary_password: tempPassword,
+        email_sent
       });
     } catch (error) {
       console.error("ERREUR RESET PASSWORD :", error);
@@ -2916,8 +2954,12 @@ app.post("/products", authenticateToken, async (req, res) => {
       return res.status(403).json({ error: "Accès lecture seule." });
     }
 
-    const companyId = req.user.company_id;
+    const companyId = getEffectiveCompanyId(req, req.user.company_id);
     const isSuperAdmin = req.user.is_super_admin === true;
+
+    if (!companyId) {
+      return res.status(400).json({ error: "Sélectionnez une entreprise active avant de créer un produit." });
+    }
 
     if (!isSuperAdmin) {
       const limits = await getCompanyPlanLimits(companyId);
@@ -3057,8 +3099,12 @@ app.put(
     }
 
     const { id } = req.params;
-    const companyId = req.user.company_id;
+    const companyId = getEffectiveCompanyId(req, req.user.company_id);
     const isSuperAdmin = req.user.is_super_admin === true;
+
+    if (!companyId) {
+      return res.status(400).json({ error: "Sélectionnez une entreprise active avant de modifier un produit." });
+    }
 
     const {
       reference,
@@ -3239,8 +3285,11 @@ app.post("/stock-movements", authenticateToken, async (req, res) => {
       return res.status(403).json({ error: "Accès lecture seule." });
     }
 
-    const companyId = req.user.company_id;
+    const companyId = getEffectiveCompanyId(req, req.user.company_id);
     const isSuperAdmin = req.user.is_super_admin === true;
+    if (!companyId) {
+      return res.status(400).json({ error: "Sélectionnez une entreprise active avant de créer un mouvement stock." });
+    }
 
     const {
       type,
@@ -3266,9 +3315,9 @@ app.post("/stock-movements", authenticateToken, async (req, res) => {
       `SELECT *
        FROM products
        WHERE reference=$1
-       ${isSuperAdmin ? "" : "AND company_id=$2"}
+       AND company_id=$2
        LIMIT 1`,
-      isSuperAdmin ? [product_reference] : [product_reference, companyId]
+      [product_reference, companyId]
     );
 
     if (productCheck.rows.length === 0) {
@@ -3409,14 +3458,17 @@ app.put(
       }
 
       const { id } = req.params;
-      const companyId = req.user.company_id;
+      const companyId = getEffectiveCompanyId(req, req.user.company_id);
       const isSuperAdmin = req.user.is_super_admin === true;
+      if (!companyId) {
+        return res.status(400).json({ error: "Sélectionnez une entreprise active avant de valider un mouvement stock." });
+      }
       const { final_quantity, correction_note } = req.body || {};
 
       const movementResult = await pool.query(
         `SELECT * FROM stock_movements
-       WHERE id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}`,
-        isSuperAdmin ? [id] : [id, companyId]
+       WHERE id=$1 AND company_id=$2`,
+        [id, companyId]
       );
 
       const movement = movementResult.rows[0];
@@ -3424,7 +3476,7 @@ app.put(
       if (!movement)
         return res.status(404).json({ error: "Mouvement introuvable" });
 
-      if (Number(movement.created_by) === Number(req.user.id)) {
+      if (!isSuperAdmin && Number(movement.created_by) === Number(req.user.id)) {
         return res.status(403).json({
           error: "Vous ne pouvez pas valider votre propre demande."
         });
@@ -3442,54 +3494,40 @@ app.put(
       if (movement.type === "Entrée") {
         await pool.query(
           `UPDATE products SET stock = stock + $1
-         WHERE reference = $2 ${isSuperAdmin ? "" : "AND company_id=$3"}`,
-          isSuperAdmin
-            ? [approvedQuantity, movement.product_reference]
-            : [approvedQuantity, movement.product_reference, companyId]
+         WHERE reference = $2 AND company_id=$3`,
+          [approvedQuantity, movement.product_reference, companyId]
         );
       }
 
       if (movement.type === "Sortie") {
         await pool.query(
           `UPDATE products SET stock = GREATEST(stock - $1, 0)
-         WHERE reference = $2 ${isSuperAdmin ? "" : "AND company_id=$3"}`,
-          isSuperAdmin
-            ? [approvedQuantity, movement.product_reference]
-            : [approvedQuantity, movement.product_reference, companyId]
+         WHERE reference = $2 AND company_id=$3`,
+          [approvedQuantity, movement.product_reference, companyId]
         );
       }
 
       if (movement.type === "Transfert") {
         await pool.query(
           `UPDATE products SET warehouse = $1
-         WHERE reference = $2 ${isSuperAdmin ? "" : "AND company_id=$3"}`,
-          isSuperAdmin
-            ? [movement.destination_warehouse || "", movement.product_reference]
-            : [
-                movement.destination_warehouse || "",
-                movement.product_reference,
-                companyId
-              ]
+         WHERE reference = $2 AND company_id=$3`,
+          [movement.destination_warehouse || "", movement.product_reference, companyId]
         );
       }
 
       if (movement.type === "Inventaire") {
         await pool.query(
           `UPDATE products SET stock = $1
-         WHERE reference = $2 ${isSuperAdmin ? "" : "AND company_id=$3"}`,
-          isSuperAdmin
-            ? [approvedQuantity, movement.product_reference]
-            : [approvedQuantity, movement.product_reference, companyId]
+         WHERE reference = $2 AND company_id=$3`,
+          [approvedQuantity, movement.product_reference, companyId]
         );
 
         await pool.query(
           `UPDATE inventory_history
          SET status='Validé'
          WHERE product_reference=$1 AND status='En attente'
-         ${isSuperAdmin ? "" : "AND company_id=$2"}`,
-          isSuperAdmin
-            ? [movement.product_reference]
-            : [movement.product_reference, companyId]
+         AND company_id=$2`,
+          [movement.product_reference, companyId]
         );
       }
 
@@ -3503,24 +3541,16 @@ app.put(
            modified_by=CASE WHEN $3::boolean THEN $2 ELSE modified_by END,
            modified_at=CASE WHEN $3::boolean THEN CURRENT_TIMESTAMP ELSE modified_at END,
            correction_note=$4
-       WHERE id=$5 ${isSuperAdmin ? "" : "AND company_id=$6"}
+       WHERE id=$5 AND company_id=$6
        RETURNING *`,
-        isSuperAdmin
-          ? [
-              approvedQuantity,
-              req.user.id,
-              approvedQuantity !== Number(movement.quantity),
-              correction_note || "",
-              id
-            ]
-          : [
-              approvedQuantity,
-              req.user.id,
-              approvedQuantity !== Number(movement.quantity),
-              correction_note || "",
-              id,
-              companyId
-            ]
+        [
+          approvedQuantity,
+          req.user.id,
+          approvedQuantity !== Number(movement.quantity),
+          correction_note || "",
+          id,
+          companyId
+        ]
       );
 
       await logActivity(
@@ -3564,14 +3594,17 @@ app.put("/stock-movements/:id/reject", authenticateToken, async (req, res) => {
       });
     }
 
-    const companyId = req.user.company_id;
+    const companyId = getEffectiveCompanyId(req, req.user.company_id);
     const isSuperAdmin = req.user.is_super_admin === true;
+    if (!companyId) {
+      return res.status(400).json({ error: "Sélectionnez une entreprise active avant de refuser un mouvement stock." });
+    }
     const { rejection_reason } = req.body || {};
 
     const movementResult = await pool.query(
       `SELECT * FROM stock_movements
-       WHERE id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}`,
-      isSuperAdmin ? [req.params.id] : [req.params.id, companyId]
+       WHERE id=$1 AND company_id=$2`,
+      [req.params.id, companyId]
     );
 
     const movement = movementResult.rows[0];
@@ -3579,7 +3612,7 @@ app.put("/stock-movements/:id/reject", authenticateToken, async (req, res) => {
     if (!movement)
       return res.status(404).json({ error: "Mouvement introuvable" });
 
-    if (Number(movement.created_by) === Number(req.user.id)) {
+    if (!isSuperAdmin && Number(movement.created_by) === Number(req.user.id)) {
       return res.status(403).json({
         error: "Vous ne pouvez pas refuser votre propre demande."
       });
@@ -3592,11 +3625,9 @@ app.put("/stock-movements/:id/reject", authenticateToken, async (req, res) => {
            rejection_reason=$1,
            validated_by=$2,
            validated_at=CURRENT_TIMESTAMP
-       WHERE id=$3 ${isSuperAdmin ? "" : "AND company_id=$4"}
+       WHERE id=$3 AND company_id=$4
        RETURNING *`,
-      isSuperAdmin
-        ? [rejection_reason || "", req.user.id, req.params.id]
-        : [rejection_reason || "", req.user.id, req.params.id, companyId]
+      [rejection_reason || "", req.user.id, req.params.id, companyId]
     );
 
     if (movement?.type === "Inventaire") {
@@ -3604,10 +3635,8 @@ app.put("/stock-movements/:id/reject", authenticateToken, async (req, res) => {
         `UPDATE inventory_history
          SET status='Refusé'
          WHERE product_reference=$1 AND status='En attente'
-         ${isSuperAdmin ? "" : "AND company_id=$2"}`,
-        isSuperAdmin
-          ? [movement.product_reference]
-          : [movement.product_reference, companyId]
+         AND company_id=$2`,
+        [movement.product_reference, companyId]
       );
     }
 
@@ -14374,7 +14403,7 @@ app.post("/subscriptions/renew", authenticateToken, async (req, res) => {
        SET
          status = 'active',
          end_date = COALESCE(end_date, CURRENT_DATE)
-         + ($1 || ' month')::INTERVAL
+         + ($1::text || ' month')::INTERVAL
        WHERE id = $2`,
       [Number(months || 1), subscription_id]
     );
@@ -14538,7 +14567,7 @@ app.put("/super-admin/subscriptions/:companyId/free", async (req, res) => {
   }
 });
 
-app.get("/super-admin/plans", async (req, res) => {
+app.get("/super-admin/plans", authenticateToken, authorizeRoles("super_admin"), async (req, res) => {
   try {
     const result = await pool.query(
       "SELECT * FROM subscription_plans ORDER BY id ASC"
@@ -14917,6 +14946,13 @@ app.get("/public/plans", async (req, res) => {
         END AS max_movements_monthly,
         trial_days,
         modules,
+        COALESCE(currency, 'FCFA') AS currency,
+        COALESCE(duration_days, 30) AS duration_days,
+        COALESCE(max_cash_registers, 0) AS max_cash_registers,
+        COALESCE(max_sales_per_month, 0) AS max_sales_per_month,
+        COALESCE(max_stock_movements_per_month, max_movements_monthly, 0) AS max_stock_movements_per_month,
+        COALESCE(billing_cycle, 'monthly') AS billing_cycle,
+        COALESCE(is_active, true) AS is_active,
         can_use_reports,
         can_use_qr,
         can_use_advanced_inventory,
@@ -14925,6 +14961,7 @@ app.get("/public/plans", async (req, res) => {
         can_use_ai
       FROM subscription_plans
       WHERE name IN ('Essentiel', 'Starter', 'Standard', 'Premium')
+        AND COALESCE(is_active, true)=true
       ORDER BY price_monthly ASC
     `);
 
@@ -14980,63 +15017,108 @@ app.post(
   }
 );
 
-/* GESTION PLANS SAAS */
-app.put("/super-admin/plans/:id", async (req, res) => {
-  try {
-    const {
-      name,
-      price_monthly,
-      max_users,
-      max_warehouses,
-      max_products,
-      max_movements_monthly,
-      trial_days,
-      modules,
-      can_use_reports,
-      can_use_qr,
-      can_use_advanced_inventory,
-      can_use_documents,
-      can_use_chat,
-      can_use_ai
-    } = req.body;
+function normalizePlanPayload(body = {}) {
+  const modulesValue = Array.isArray(body.modules)
+    ? body.modules.join(", ")
+    : typeof body.modules === "object" && body.modules !== null
+      ? Object.entries(body.modules)
+          .filter(([, enabled]) => enabled === true)
+          .map(([key]) => key)
+          .join(", ")
+      : body.modules || "";
 
-    const result = await pool.query(
-      `UPDATE subscription_plans
-       SET
-        name=$1,
-        price_monthly=$2,
-        max_users=$3,
-        max_warehouses=$4,
-        max_products=$5,
-        max_movements_monthly=$6,
-        trial_days=$7,
-        modules=$8,
-        can_use_reports=$9,
-        can_use_qr=$10,
-        can_use_advanced_inventory=$11,
-        can_use_documents=$12,
-        can_use_chat=$13,
-        can_use_ai=$14
-       WHERE id=$15
-       RETURNING *`,
-      [
-        name,
-        Number(price_monthly || 0),
-        Number(max_users || 0),
-        Number(max_warehouses || 0),
-        Number(max_products || 0),
-        Number(max_movements_monthly || 0),
-        Number(trial_days || 15),
-        modules || "",
-        can_use_reports === true,
-        can_use_qr === true,
-        can_use_advanced_inventory === true,
-        can_use_documents === true,
-        can_use_chat === true,
-        can_use_ai === true,
-        req.params.id
-      ]
-    );
+  return {
+    name: body.name || "",
+    price_monthly: Number(body.price_monthly ?? body.monthly_price ?? 0),
+    monthly_price: Number(body.monthly_price ?? body.price_monthly ?? 0),
+    yearly_price: Number(body.yearly_price || 0),
+    currency: body.currency || "FCFA",
+    duration_days: Number(body.duration_days || 30),
+    billing_cycle: body.billing_cycle || "monthly",
+    max_users: Number(body.max_users || 0),
+    max_warehouses: Number(body.max_warehouses || 0),
+    max_products: Number(body.max_products || 0),
+    max_cash_registers: Number(body.max_cash_registers || 0),
+    max_sales_per_month: Number(body.max_sales_per_month || 0),
+    max_movements_monthly: Number(body.max_movements_monthly ?? body.max_stock_movements_per_month ?? 0),
+    max_stock_movements_per_month: Number(body.max_stock_movements_per_month ?? body.max_movements_monthly ?? 0),
+    trial_days: Number(body.trial_days || 15),
+    modules: modulesValue,
+    features_json: body.features_json && typeof body.features_json === "object" ? body.features_json : {},
+    is_active: body.is_active !== false,
+    can_use_reports: body.can_use_reports !== false,
+    can_use_qr: body.can_use_qr !== false,
+    can_use_advanced_inventory: body.can_use_advanced_inventory !== false,
+    can_use_documents: body.can_use_documents !== false,
+    can_use_chat: body.can_use_chat !== false,
+    can_use_ai: body.can_use_ai !== false
+  };
+}
+
+async function updateSubscriptionPlan(planId, payload) {
+  return pool.query(
+    `UPDATE subscription_plans
+     SET
+      name=$1,
+      price_monthly=$2,
+      monthly_price=$3,
+      yearly_price=$4,
+      currency=$5,
+      duration_days=$6,
+      billing_cycle=$7,
+      max_users=$8,
+      max_warehouses=$9,
+      max_products=$10,
+      max_cash_registers=$11,
+      max_sales_per_month=$12,
+      max_movements_monthly=$13,
+      max_stock_movements_per_month=$14,
+      trial_days=$15,
+      modules=$16,
+      features_json=$17::jsonb,
+      is_active=$18,
+      can_use_reports=$19,
+      can_use_qr=$20,
+      can_use_advanced_inventory=$21,
+      can_use_documents=$22,
+      can_use_chat=$23,
+      can_use_ai=$24
+     WHERE id=$25
+     RETURNING *`,
+    [
+      payload.name,
+      payload.price_monthly,
+      payload.monthly_price,
+      payload.yearly_price,
+      payload.currency,
+      payload.duration_days,
+      payload.billing_cycle,
+      payload.max_users,
+      payload.max_warehouses,
+      payload.max_products,
+      payload.max_cash_registers,
+      payload.max_sales_per_month,
+      payload.max_movements_monthly,
+      payload.max_stock_movements_per_month,
+      payload.trial_days,
+      payload.modules,
+      JSON.stringify(payload.features_json || {}),
+      payload.is_active,
+      payload.can_use_reports,
+      payload.can_use_qr,
+      payload.can_use_advanced_inventory,
+      payload.can_use_documents,
+      payload.can_use_chat,
+      payload.can_use_ai,
+      planId
+    ]
+  );
+}
+
+/* GESTION PLANS SAAS */
+app.put("/super-admin/plans/:id", authenticateToken, authorizeRoles("super_admin"), async (req, res) => {
+  try {
+    const result = await updateSubscriptionPlan(req.params.id, normalizePlanPayload(req.body));
 
     res.json(result.rows[0]);
   } catch (error) {
@@ -15497,16 +15579,9 @@ app.get("/super-admin/plans", authenticateToken, authorizeRoles("super_admin"), 
 });
 
 /* SUPER ADMIN - CREATE PLAN */
-app.post("/super-admin/plans", async (req, res) => {
+app.post("/super-admin/plans", authenticateToken, authorizeRoles("super_admin"), async (req, res) => {
   try {
-    const {
-      name,
-      price_monthly,
-      max_users,
-      max_warehouses,
-      max_products,
-      trial_days
-    } = req.body;
+    const payload = normalizePlanPayload(req.body);
 
     const result = await pool.query(
       `
@@ -15514,15 +15589,58 @@ app.post("/super-admin/plans", async (req, res) => {
       (
         name,
         price_monthly,
+        monthly_price,
+        yearly_price,
+        currency,
+        duration_days,
+        billing_cycle,
         max_users,
         max_warehouses,
         max_products,
-        trial_days
+        max_cash_registers,
+        max_sales_per_month,
+        max_movements_monthly,
+        max_stock_movements_per_month,
+        trial_days,
+        modules,
+        features_json,
+        is_active,
+        can_use_reports,
+        can_use_qr,
+        can_use_advanced_inventory,
+        can_use_documents,
+        can_use_chat,
+        can_use_ai
       )
-      VALUES ($1,$2,$3,$4,$5,$6)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::jsonb,$18,$19,$20,$21,$22,$23,$24)
       RETURNING *
       `,
-      [name, price_monthly, max_users, max_warehouses, max_products, trial_days]
+      [
+        payload.name,
+        payload.price_monthly,
+        payload.monthly_price,
+        payload.yearly_price,
+        payload.currency,
+        payload.duration_days,
+        payload.billing_cycle,
+        payload.max_users,
+        payload.max_warehouses,
+        payload.max_products,
+        payload.max_cash_registers,
+        payload.max_sales_per_month,
+        payload.max_movements_monthly,
+        payload.max_stock_movements_per_month,
+        payload.trial_days,
+        payload.modules,
+        JSON.stringify(payload.features_json || {}),
+        payload.is_active,
+        payload.can_use_reports,
+        payload.can_use_qr,
+        payload.can_use_advanced_inventory,
+        payload.can_use_documents,
+        payload.can_use_chat,
+        payload.can_use_ai
+      ]
     );
 
     res.status(201).json(result.rows[0]);
@@ -15536,64 +15654,9 @@ app.post("/super-admin/plans", async (req, res) => {
 });
 
 /* SUPER ADMIN - UPDATE PLAN */
-app.put("/super-admin/plans/:id", async (req, res) => {
+app.put("/super-admin/plans/:id", authenticateToken, authorizeRoles("super_admin"), async (req, res) => {
   try {
-    const {
-      name,
-      price_monthly,
-      max_users,
-      max_warehouses,
-      max_products,
-      max_movements_monthly,
-      trial_days,
-      modules,
-      can_use_reports,
-      can_use_qr,
-      can_use_advanced_inventory,
-      can_use_documents,
-      can_use_chat,
-      can_use_ai
-    } = req.body;
-
-    const result = await pool.query(
-      `
-      UPDATE subscription_plans
-      SET
-        name = $1,
-        price_monthly = $2,
-        max_users = $3,
-        max_warehouses = $4,
-        max_products = $5,
-        max_movements_monthly = $6,
-        trial_days = $7,
-        modules = $8,
-        can_use_reports = $9,
-        can_use_qr = $10,
-        can_use_advanced_inventory = $11,
-        can_use_documents = $12,
-        can_use_chat = $13,
-        can_use_ai = $14
-      WHERE id = $15
-      RETURNING *
-      `,
-      [
-        name,
-        Number(price_monthly || 0),
-        Number(max_users || 0),
-        Number(max_warehouses || 0),
-        Number(max_products || 0),
-        Number(max_movements_monthly || 0),
-        Number(trial_days || 15),
-        modules || "",
-        can_use_reports === true,
-        can_use_qr === true,
-        can_use_advanced_inventory === true,
-        can_use_documents === true,
-        can_use_chat === true,
-        can_use_ai === true,
-        req.params.id
-      ]
-    );
+    const result = await updateSubscriptionPlan(req.params.id, normalizePlanPayload(req.body));
 
     res.json(result.rows[0]);
   } catch (error) {
@@ -15676,7 +15739,7 @@ app.put("/super-admin/subscriptions/:companyId/renew", async (req, res) => {
             COALESCE(
               trial_ends_at,
               NOW()
-            ) + ($1 || ' month')::interval
+            ) + ($1::text || ' month')::interval
         WHERE id = $2
         `,
       [months, companyId]
