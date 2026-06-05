@@ -8253,6 +8253,49 @@ async function getMarketplaceCartPayload(user) {
   return { cart, items: items.rows, total };
 }
 
+async function createMarketplaceDocument(client, { order, items, companyId, documentType, prefix, status = "Validé", createdBy = "Marketplace", observation = "" }) {
+  const documentNumber = `${prefix}-${new Date().getFullYear()}-${String(order.id).padStart(6, "0")}`;
+  const documentResult = await client.query(
+    `INSERT INTO documents
+     (document_type, document_number, client_name, client_phone, client_address,
+      total_amount, observation, created_by, company_id, related_entity_type,
+      related_entity_id, status)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'marketplace_order',$10,$11)
+     RETURNING *`,
+    [
+      documentType,
+      documentNumber,
+      order.customer_name || order.customer_email || "",
+      order.customer_phone || "",
+      order.delivery_address || "",
+      Number(order.total_amount || 0),
+      observation || `${documentType} généré depuis la commande marketplace ${order.order_number}`,
+      createdBy,
+      companyId,
+      order.id,
+      status
+    ]
+  );
+
+  for (const item of items) {
+    await client.query(
+      `INSERT INTO document_items
+       (document_id, product_reference, product_name, quantity, unit_price, total_price)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [
+        documentResult.rows[0].id,
+        item.product_reference || "",
+        item.product_name || "",
+        Number(item.quantity || 0),
+        Number(item.unit_price || 0),
+        Number(item.total_price || 0)
+      ]
+    );
+  }
+
+  return documentResult.rows[0];
+}
+
 async function finalizeMarketplaceOrder(client, orderId, user = {}) {
   const orderResult = await client.query(
     "SELECT * FROM marketplace_orders WHERE id=$1 FOR UPDATE",
@@ -8271,6 +8314,17 @@ async function finalizeMarketplaceOrder(client, orderId, user = {}) {
   );
 
   for (const item of itemsResult.rows) {
+    const publicationResult = await client.query(
+      `SELECT *
+       FROM marketplace_products
+       WHERE id=$1
+         AND company_id=$2
+       FOR UPDATE`,
+      [item.marketplace_product_id, order.vendor_company_id]
+    );
+    const publication = publicationResult.rows[0];
+    if (!publication) throw new Error(`Publication marketplace introuvable : ${item.marketplace_product_id}`);
+
     const productResult = await client.query(
       `SELECT *
        FROM products
@@ -8344,20 +8398,41 @@ async function finalizeMarketplaceOrder(client, orderId, user = {}) {
   );
 
   const paymentResult = await client.query(
-    `INSERT INTO marketplace_payments
-     (order_id, company_id, amount, currency, method, status, provider_reference,
-      paid_at, created_by)
-     VALUES ($1,$2,$3,'FCFA',$4,'paid',$5,CURRENT_TIMESTAMP,$6)
+    `UPDATE marketplace_payments
+     SET amount=$1,
+         method=$2,
+         status='paid',
+         provider_reference=COALESCE(NULLIF(provider_reference,''), $3),
+         paid_at=CURRENT_TIMESTAMP,
+         updated_at=CURRENT_TIMESTAMP
+     WHERE order_id=$4
      RETURNING *`,
     [
-      order.id,
-      order.vendor_company_id,
       Number(order.total_amount || 0),
       order.payment_method || "Espèces",
       order.order_number,
-      user.id || order.customer_user_id || null
+      order.id
     ]
   );
+  let marketplacePayment = paymentResult.rows[0];
+  if (!marketplacePayment) {
+    const createdPayment = await client.query(
+      `INSERT INTO marketplace_payments
+       (order_id, company_id, amount, currency, method, status, provider_reference,
+        paid_at, created_by)
+       VALUES ($1,$2,$3,'FCFA',$4,'paid',$5,CURRENT_TIMESTAMP,$6)
+       RETURNING *`,
+      [
+        order.id,
+        order.vendor_company_id,
+        Number(order.total_amount || 0),
+        order.payment_method || "Espèces",
+        order.order_number,
+        user.id || order.customer_user_id || null
+      ]
+    );
+    marketplacePayment = createdPayment.rows[0];
+  }
 
   const accountingPayment = await client.query(
     `INSERT INTO payments
@@ -8389,60 +8464,72 @@ async function finalizeMarketplaceOrder(client, orderId, user = {}) {
     amount: Number(order.total_amount || 0)
   });
 
-  const documentNumber = `FAC-MKP-${new Date().getFullYear()}-${String(order.id).padStart(6, "0")}`;
-  const documentResult = await client.query(
-    `INSERT INTO documents
-     (document_type, document_number, client_name, client_phone, client_address,
-      total_amount, observation, created_by, company_id, related_entity_type,
-      related_entity_id, status)
-     VALUES ('Facture marketplace',$1,$2,$3,$4,$5,$6,$7,$8,'marketplace_order',$9,'Validé')
-     RETURNING *`,
-    [
-      documentNumber,
-      order.customer_name || order.customer_email || "",
-      order.customer_phone || "",
-      order.delivery_address || "",
-      Number(order.total_amount || 0),
-      `Facture générée depuis commande marketplace ${order.order_number}`,
-      user.email || "Marketplace",
-      order.vendor_company_id,
-      order.id
-    ]
-  );
-
-  for (const item of itemsResult.rows) {
-    await client.query(
-      `INSERT INTO document_items
-       (document_id, product_reference, product_name, quantity, unit_price, total_price)
-       VALUES ($1,$2,$3,$4,$5,$6)`,
-      [
-        documentResult.rows[0].id,
-        item.product_reference || "",
-        item.product_name || "",
-        Number(item.quantity || 0),
-        Number(item.unit_price || 0),
-        Number(item.total_price || 0)
-      ]
-    );
-  }
+  await createMarketplaceDocument(client, {
+    order,
+    items: itemsResult.rows,
+    companyId: order.vendor_company_id,
+    documentType: "Facture marketplace",
+    prefix: "FAC-MKP",
+    createdBy: user.email || "Marketplace"
+  });
+  await createMarketplaceDocument(client, {
+    order,
+    items: itemsResult.rows,
+    companyId: order.vendor_company_id,
+    documentType: "Reçu marketplace",
+    prefix: "REC-MKP",
+    createdBy: user.email || "Marketplace",
+    observation: `Reçu de paiement marketplace ${order.order_number}`
+  });
+  await createMarketplaceDocument(client, {
+    order,
+    items: itemsResult.rows,
+    companyId: order.vendor_company_id,
+    documentType: "Bon de livraison marketplace",
+    prefix: "BL-MKP",
+    createdBy: user.email || "Marketplace",
+    observation: `Bon de livraison vendeur pour commande marketplace ${order.order_number}`
+  });
 
   if (order.buyer_company_id && Number(order.buyer_company_id) !== Number(order.vendor_company_id)) {
-    const receptionNumber = `BR-MKP-${new Date().getFullYear()}-${String(order.id).padStart(6, "0")}`;
-    await client.query(
-      `INSERT INTO documents
-       (document_type, document_number, client_name, total_amount, observation,
-        created_by, company_id, related_entity_type, related_entity_id, status)
-       VALUES ('Bon de réception marketplace',$1,$2,$3,$4,$5,$6,'marketplace_order',$7,'En attente')`,
-      [
-        receptionNumber,
-        order.customer_name || order.customer_email || "",
-        Number(order.total_amount || 0),
-        `Bon de réception acheteur pour commande B2B ${order.order_number}`,
-        user.email || "Marketplace",
-        order.buyer_company_id,
-        order.id
-      ]
-    );
+    await createMarketplaceDocument(client, {
+      order,
+      items: itemsResult.rows,
+      companyId: order.buyer_company_id,
+      documentType: "Bon de réception marketplace",
+      prefix: "BR-MKP",
+      status: "En attente",
+      createdBy: user.email || "Marketplace",
+      observation: `Bon de réception acheteur pour commande B2B ${order.order_number}`
+    });
+
+    if (!order.purchase_created && await tableExists("purchases")) {
+      const vendor = await client.query("SELECT name FROM companies WHERE id=$1", [order.vendor_company_id]);
+      const purchaseNumber = `ACH-MKP-${new Date().getFullYear()}-${String(order.id).padStart(6, "0")}`;
+      await client.query(
+        `INSERT INTO purchases
+         (company_id, supplier_company_id, supplier_name, marketplace_order_id,
+          purchase_number, total_amount, amount_paid, amount_due, status,
+          created_by, created_at, updated_at)
+         SELECT $1,$2,$3,$4,$5,$6,$6,0,'paid',$7,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
+         WHERE NOT EXISTS (
+           SELECT 1 FROM purchases WHERE purchase_number=$5
+         )`,
+        [
+          order.buyer_company_id,
+          order.vendor_company_id,
+          vendor.rows[0]?.name || "Vendeur marketplace",
+          order.id,
+          purchaseNumber,
+          Number(order.total_amount || 0),
+          user.id || order.customer_user_id || null
+        ]
+      );
+      await client.query(
+        "UPDATE marketplace_orders SET purchase_created=true, updated_at=CURRENT_TIMESTAMP WHERE id=$1",
+        [order.id]
+      );
+    }
   }
 
   await createNotification({
@@ -8456,7 +8543,7 @@ async function finalizeMarketplaceOrder(client, orderId, user = {}) {
     action_url: `/client/orders/${order.id}`
   });
 
-  return { ...paidOrder.rows[0], payment: paymentResult.rows[0] };
+  return { ...paidOrder.rows[0], payment: marketplacePayment };
 }
 
 app.get("/marketplace/products", async (req, res) => {
@@ -8793,6 +8880,20 @@ app.post("/marketplace/orders", authenticateToken, async (req, res) => {
         ]
       );
       const order = orderResult.rows[0];
+      await client.query(
+        `INSERT INTO marketplace_payments
+         (order_id, company_id, amount, currency, method, status,
+          provider_reference, created_by)
+         VALUES ($1,$2,$3,'FCFA',$4,'pending',$5,$6)`,
+        [
+          order.id,
+          Number(vendorCompanyId || 0),
+          subtotal,
+          payment_method,
+          orderNumber,
+          req.user.id
+        ]
+      );
       for (const item of rows) {
         const product = await client.query(
           "SELECT reference, name FROM products WHERE id=$1 LIMIT 1",
@@ -9105,6 +9206,17 @@ app.put("/marketplace/vendor/orders/:id/status", authenticateToken, async (req, 
     let result;
     if (["paid", "payé", "confirmée", "confirmed"].includes(String(payment_status || status || "").toLowerCase())) {
       result = await finalizeMarketplaceOrder(client, req.params.id, req.user);
+      if (status && !["paid", "payé", "confirmée", "confirmed"].includes(String(status).toLowerCase())) {
+        const statusUpdate = await client.query(
+          `UPDATE marketplace_orders
+           SET status=$1,
+               updated_at=CURRENT_TIMESTAMP
+           WHERE id=$2
+           RETURNING *`,
+          [status, req.params.id]
+        );
+        result = { ...result, ...statusUpdate.rows[0] };
+      }
     } else {
       const update = await client.query(
         `UPDATE marketplace_orders

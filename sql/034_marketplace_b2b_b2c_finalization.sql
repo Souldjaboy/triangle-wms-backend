@@ -47,9 +47,44 @@ CREATE INDEX IF NOT EXISTS idx_marketplace_orders_seller_company ON marketplace_
 CREATE INDEX IF NOT EXISTS idx_marketplace_orders_buyer_user ON marketplace_orders(buyer_user_id);
 CREATE INDEX IF NOT EXISTS idx_marketplace_orders_type ON marketplace_orders(order_type);
 
+CREATE TABLE IF NOT EXISTS purchases (
+  id SERIAL PRIMARY KEY,
+  company_id INTEGER,
+  supplier_company_id INTEGER,
+  supplier_name TEXT DEFAULT '',
+  marketplace_order_id INTEGER,
+  purchase_number TEXT UNIQUE,
+  total_amount NUMERIC(14,2) DEFAULT 0,
+  amount_paid NUMERIC(14,2) DEFAULT 0,
+  amount_due NUMERIC(14,2) DEFAULT 0,
+  status VARCHAR(60) DEFAULT 'pending',
+  created_by INTEGER,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+ALTER TABLE purchases ADD COLUMN IF NOT EXISTS company_id INTEGER;
+ALTER TABLE purchases ADD COLUMN IF NOT EXISTS supplier_company_id INTEGER;
+ALTER TABLE purchases ADD COLUMN IF NOT EXISTS supplier_name TEXT DEFAULT '';
+ALTER TABLE purchases ADD COLUMN IF NOT EXISTS marketplace_order_id INTEGER;
+ALTER TABLE purchases ADD COLUMN IF NOT EXISTS purchase_number TEXT;
+ALTER TABLE purchases ADD COLUMN IF NOT EXISTS total_amount NUMERIC(14,2) DEFAULT 0;
+ALTER TABLE purchases ADD COLUMN IF NOT EXISTS amount_paid NUMERIC(14,2) DEFAULT 0;
+ALTER TABLE purchases ADD COLUMN IF NOT EXISTS amount_due NUMERIC(14,2) DEFAULT 0;
+ALTER TABLE purchases ADD COLUMN IF NOT EXISTS status VARCHAR(60) DEFAULT 'pending';
+ALTER TABLE purchases ADD COLUMN IF NOT EXISTS created_by INTEGER;
+ALTER TABLE purchases ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+ALTER TABLE purchases ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_purchases_purchase_number_unique
+  ON purchases(purchase_number)
+  WHERE purchase_number IS NOT NULL AND purchase_number <> '';
+CREATE INDEX IF NOT EXISTS idx_purchases_company_id ON purchases(company_id);
+CREATE INDEX IF NOT EXISTS idx_purchases_marketplace_order_id ON purchases(marketplace_order_id);
+
 UPDATE ai_module_knowledge SET
   description='Marketplace B2B/B2C pour clients particuliers, entreprises vendeuses et entreprises acheteuses.',
-  data_sources='["marketplace_products","marketplace_orders","marketplace_order_items","marketplace_payments","marketplace_carts","marketplace_profiles","products","stock_movements","documents","payments"]'::jsonb,
+  data_sources='["marketplace_products","marketplace_orders","marketplace_order_items","marketplace_payments","marketplace_carts","marketplace_profiles","products","stock_movements","documents","payments","purchases"]'::jsonb,
   examples='["Combien de produits marketplace sont publies ?","Quelles commandes B2B sont en attente ?","Quelles commandes B2C aujourd hui ?","Quel vendeur vend le plus ?","Quel client a commande ?"]'::jsonb,
   updated_at=CURRENT_TIMESTAMP
 WHERE module_key='marketplace';
