@@ -37,6 +37,10 @@ WHERE true;
 ALTER TABLE marketplace_carts ADD COLUMN IF NOT EXISTS buyer_company_id INTEGER;
 ALTER TABLE marketplace_carts ADD COLUMN IF NOT EXISTS cart_type VARCHAR(20) DEFAULT 'B2C';
 
+ALTER TABLE marketplace_profiles ADD COLUMN IF NOT EXISTS country TEXT DEFAULT '';
+ALTER TABLE marketplace_profiles ADD COLUMN IF NOT EXISTS city TEXT DEFAULT '';
+ALTER TABLE marketplace_profiles ADD COLUMN IF NOT EXISTS address TEXT DEFAULT '';
+
 UPDATE marketplace_carts SET
   buyer_company_id=COALESCE(buyer_company_id, company_id),
   cart_type=CASE WHEN company_id IS NULL THEN 'B2C' ELSE 'B2B' END
@@ -46,6 +50,9 @@ CREATE INDEX IF NOT EXISTS idx_marketplace_products_published ON marketplace_pro
 CREATE INDEX IF NOT EXISTS idx_marketplace_orders_seller_company ON marketplace_orders(seller_company_id);
 CREATE INDEX IF NOT EXISTS idx_marketplace_orders_buyer_user ON marketplace_orders(buyer_user_id);
 CREATE INDEX IF NOT EXISTS idx_marketplace_orders_type ON marketplace_orders(order_type);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_marketplace_profiles_user_type_unique
+  ON marketplace_profiles(user_id, profile_type)
+  WHERE user_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS purchases (
   id SERIAL PRIMARY KEY,

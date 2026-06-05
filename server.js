@@ -198,10 +198,10 @@ function isSuperAdminUser(user) {
 
 function getRequestedActiveCompanyId(req) {
   const raw =
-    req.headers["x-active-company-id"] ||
-    req.headers["x-company-id"] ||
-    req.body?.active_company_id ||
-    req.query?.active_company_id;
+    req?.headers?.["x-active-company-id"] ||
+    req?.headers?.["x-company-id"] ||
+    req?.body?.active_company_id ||
+    req?.query?.active_company_id;
   const numeric = Number(raw);
   return Number.isInteger(numeric) && numeric > 0 ? numeric : null;
 }
@@ -816,7 +816,6 @@ async function logActivity(user_name, user_role, action, module, details) {
 
 async function logAudit(req, action, entityType = "", entityId = null, details = {}) {
   try {
-    const headers = req?.headers || {};
     const user = req?.user || {};
     await pool.query(
       `INSERT INTO audit_logs
@@ -830,8 +829,8 @@ async function logAudit(req, action, entityType = "", entityId = null, details =
         action,
         entityType,
         entityId,
-        req?.ip || headers["x-forwarded-for"] || "",
-        typeof req?.get === "function" ? req.get("user-agent") || "" : "",
+        req?.ip || req?.headers?.["x-forwarded-for"] || "",
+        typeof req?.get === "function" ? req.get("user-agent") || "" : req?.headers?.["user-agent"] || "",
         JSON.stringify(details || {})
       ]
     );
@@ -8676,7 +8675,7 @@ app.get("/marketplace/business", authenticateToken, async (req, res) => {
 
 app.post("/marketplace/customers/register", async (req, res) => {
   try {
-    const { fullname, email, phone, password } = req.body || {};
+    const { fullname, email, phone, password, country = "", city = "", address = "" } = req.body || {};
     const cleanEmail = String(email || "").trim().toLowerCase();
     const cleanPhone = String(phone || "").trim();
     if (!fullname || (!cleanEmail && !cleanPhone) || !password) {
@@ -8697,9 +8696,9 @@ app.post("/marketplace/customers/register", async (req, res) => {
 
     await pool.query(
       `INSERT INTO marketplace_profiles
-       (user_id, profile_type, full_name, email, phone, status)
-       VALUES ($1,'customer',$2,$3,$4,'active')`,
-      [user.id, fullname, cleanEmail, cleanPhone]
+       (user_id, profile_type, full_name, email, phone, country, city, address, status)
+       VALUES ($1,'customer',$2,$3,$4,$5,$6,$7,'active')`,
+      [user.id, fullname, cleanEmail, cleanPhone, country, city, address]
     );
 
     const targetType = cleanEmail ? "email" : "phone";
@@ -8730,6 +8729,76 @@ app.post("/marketplace/customers/register", async (req, res) => {
   } catch (error) {
     console.error("ERREUR MARKETPLACE CUSTOMER REGISTER :", error);
     res.status(500).json({ error: error.detail || error.message || "Erreur inscription client marketplace" });
+  }
+});
+
+app.get("/marketplace/customers/profile", authenticateToken, async (req, res) => {
+  try {
+    if (normalizeRole(req.user?.role) !== "customer") {
+      return res.status(403).json({ error: "Accès réservé aux clients Marketplace." });
+    }
+    const profile = await pool.query(
+      `SELECT mp.*, u.fullname, u.email AS user_email, u.phone AS user_phone
+       FROM marketplace_profiles mp
+       LEFT JOIN users u ON u.id=mp.user_id
+       WHERE mp.user_id=$1 AND mp.profile_type='customer'
+       LIMIT 1`,
+      [req.user.id]
+    );
+    res.json(profile.rows[0] || {
+      user_id: req.user.id,
+      full_name: req.user.fullname || "",
+      email: req.user.email || "",
+      phone: req.user.phone || "",
+      country: "",
+      city: "",
+      address: ""
+    });
+  } catch (error) {
+    console.error("ERREUR CUSTOMER PROFILE :", error);
+    res.status(500).json({ error: "Erreur profil client marketplace" });
+  }
+});
+
+app.put("/marketplace/customers/profile", authenticateToken, async (req, res) => {
+  try {
+    if (normalizeRole(req.user?.role) !== "customer") {
+      return res.status(403).json({ error: "Accès réservé aux clients Marketplace." });
+    }
+    const { full_name = "", phone = "", email = "", country = "", city = "", address = "" } = req.body || {};
+    let result = await pool.query(
+      `UPDATE marketplace_profiles
+       SET full_name=$2,
+           email=$3,
+           phone=$4,
+           country=$5,
+           city=$6,
+           address=$7,
+           updated_at=CURRENT_TIMESTAMP
+       WHERE user_id=$1 AND profile_type='customer'
+       RETURNING *`,
+      [req.user.id, full_name, email, phone, country, city, address]
+    );
+    if (!result.rows[0]) {
+      result = await pool.query(
+        `INSERT INTO marketplace_profiles
+         (user_id, profile_type, full_name, email, phone, country, city, address, status)
+         VALUES ($1,'customer',$2,$3,$4,$5,$6,$7,'active')
+         RETURNING *`,
+        [req.user.id, full_name, email, phone, country, city, address]
+      );
+    }
+    await pool.query(
+      `UPDATE users
+       SET fullname=COALESCE(NULLIF($1,''), fullname),
+           phone=COALESCE(NULLIF($2,''), phone)
+       WHERE id=$3`,
+      [full_name, phone, req.user.id]
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("ERREUR UPDATE CUSTOMER PROFILE :", error);
+    res.status(500).json({ error: error.detail || error.message || "Erreur modification profil client marketplace" });
   }
 });
 
