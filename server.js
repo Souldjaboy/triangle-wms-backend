@@ -1030,33 +1030,55 @@ async function createNotification({
 }
 
 const COMPANY_MODULE_KEYS = [
+  "dashboard",
+  "recherche",
+  "assistant_ia",
+  "super_admin",
+  "chat",
+  "notifications",
   "produits",
+  "partenaires",
   "stock",
   "mouvements",
   "entrepots",
   "emplacements",
+  "scanner",
   "pos",
+  "marketplace",
+  "commandes_recues",
   "ventes",
   "paiements",
   "recus",
   "achats",
   "fournisseurs",
   "clients",
-  "partenaires",
   "pointage",
+  "pointage_qr",
+  "parametres_pointage",
   "inventaire",
   "ia",
   "reunions",
   "comptabilite",
   "documents",
   "rapports",
+  "alertes",
+  "activites",
+  "utilisateurs",
+  "badges",
+  "parametres",
   "transport",
   "crm",
-  "marketplace",
   "automobile",
   "immobilier",
   "hotel",
-  "restaurant"
+  "restaurant",
+  "laboratoire",
+  "electronique",
+  "telephones",
+  "informatique",
+  "beaute",
+  "maison_meubles",
+  "services"
 ];
 
 async function getCompanyModules(companyId) {
@@ -1216,6 +1238,12 @@ async function ensureDefaultSubscriptionPlans() {
         WHEN LOWER(name)='standard' AND COALESCE(max_movements_monthly,0) <= 0 THEN 3000
         WHEN LOWER(name) IN ('essentiel','starter') AND COALESCE(max_movements_monthly,0) <= 0 THEN 500
         ELSE max_movements_monthly
+      END,
+      max_modules_allowed = CASE
+        WHEN LOWER(name)='premium' AND COALESCE(max_modules_allowed,0) <= 0 THEN 999
+        WHEN LOWER(name)='standard' AND COALESCE(max_modules_allowed,0) <= 0 THEN 12
+        WHEN LOWER(name) IN ('essentiel','starter') AND COALESCE(max_modules_allowed,0) <= 0 THEN 5
+        ELSE max_modules_allowed
       END
     WHERE LOWER(name) IN ('essentiel','starter','standard','premium')
   `);
@@ -1508,6 +1536,23 @@ app.post("/register-saas", async (req, res) => {
     }
 
     const plan = planResult.rows[0];
+    const requestedModules =
+      Array.isArray(selected_modules)
+        ? selected_modules.reduce((acc, key) => {
+            acc[key] = true;
+            return acc;
+          }, {})
+        : selected_modules && typeof selected_modules === "object"
+          ? selected_modules
+          : {};
+    const enabledModuleCount = Object.values(requestedModules).filter((value) => value === true).length;
+    const maxModulesAllowed = Number(plan.max_modules_allowed || 0);
+
+    if (maxModulesAllowed > 0 && maxModulesAllowed < 999 && enabledModuleCount > maxModulesAllowed) {
+      return res.status(400).json({
+        error: `Le plan ${plan.name} autorise ${maxModulesAllowed} modules maximum.`
+      });
+    }
 
     const existingUser = await pool.query(
       `
@@ -1649,16 +1694,6 @@ app.post("/register-saas", async (req, res) => {
       code: verification.code,
       verifyUrl: verification.verify_url
     });
-
-    const requestedModules =
-      Array.isArray(selected_modules)
-        ? selected_modules.reduce((acc, key) => {
-            acc[key] = true;
-            return acc;
-          }, {})
-        : selected_modules && typeof selected_modules === "object"
-          ? selected_modules
-          : {};
 
     for (const moduleKey of COMPANY_MODULE_KEYS) {
       const requestedKey =
@@ -6152,15 +6187,16 @@ async function nextAccountingNumber(client, tableName, columnName, prefix, compa
     [safeCompanyId, counterKey]
   );
   const counterSequence = Number(counterResult.rows[0]?.last_value || 1);
+  const hasCompanyId = await columnExists(tableName, "company_id");
 
   const result = await client.query(
     `SELECT ${columnName} AS number
      FROM ${tableName}
-     WHERE company_id=$1
-       AND ${columnName} LIKE $2
+     WHERE ${hasCompanyId ? "company_id=$1 AND" : ""}
+       ${columnName} LIKE $${hasCompanyId ? "2" : "1"}
      ORDER BY id DESC
      LIMIT 1`,
-    [companyId, `${prefix}-${year}-%`]
+    hasCompanyId ? [companyId, `${prefix}-${year}-%`] : [`${prefix}-${year}-%`]
   );
   const lastNumber = String(result.rows[0]?.number || "");
   const lastSequence = Number(lastNumber.split("-").pop() || 0);
@@ -9578,7 +9614,7 @@ app.post("/marketplace/cart/items", authenticateToken, async (req, res) => {
         `UPDATE marketplace_cart_items
          SET quantity=$1,
              unit_price=$2,
-             total_price=$1*$2,
+             total_price=$1::numeric*$2::numeric,
              updated_at=CURRENT_TIMESTAMP
          WHERE id=$3`,
         [nextQty, Number(product.effective_price || 0), existing.rows[0].id]
@@ -9588,7 +9624,7 @@ app.post("/marketplace/cart/items", authenticateToken, async (req, res) => {
         `INSERT INTO marketplace_cart_items
          (cart_id, marketplace_product_id, vendor_company_id, product_id,
           quantity, unit_price, total_price)
-         VALUES ($1,$2,$3,$4,$5,$6,$5*$6)`,
+         VALUES ($1,$2,$3,$4,$5,$6,$5::numeric*$6::numeric)`,
         [cart.id, product.id, product.company_id, product.product_id, qty, Number(product.effective_price || 0)]
       );
     }
@@ -9622,6 +9658,12 @@ app.post("/marketplace/orders", authenticateToken, async (req, res) => {
       customer_email = req.user.email || "",
       customer_phone = req.user.phone || "",
       delivery_address = "",
+      delivery_method = "Retrait sur place",
+      delivery_fee = 0,
+      delivery_city = "",
+      delivery_neighborhood = "",
+      delivery_phone = "",
+      delivery_note = "",
       payment_method = "Espèces",
       notes = ""
     } = req.body || {};
@@ -9643,6 +9685,8 @@ app.post("/marketplace/orders", authenticateToken, async (req, res) => {
 
     for (const [vendorCompanyId, rows] of Object.entries(groups)) {
       const subtotal = rows.reduce((sum, item) => sum + Number(item.total_price || 0), 0);
+      const deliveryFee = Math.max(Number(delivery_fee || 0), 0);
+      const totalAmount = subtotal + deliveryFee;
       const orderNumber = await nextAccountingNumber(
         client,
         "marketplace_orders",
@@ -9655,9 +9699,11 @@ app.post("/marketplace/orders", authenticateToken, async (req, res) => {
          (order_number, customer_user_id, buyer_user_id, buyer_company_id,
           vendor_company_id, seller_company_id,
           customer_name, customer_email, customer_phone, delivery_address,
+          delivery_method, delivery_city, delivery_neighborhood, delivery_phone,
+          delivery_note,
           order_type, status, payment_status, payment_method, subtotal,
           delivery_fee, total_amount, notes)
-         VALUES ($1,$2,$2,$3,$4,$4,$5,$6,$7,$8,$9,'pending','pending',$10,$11,0,$11,$12)
+         VALUES ($1,$2,$2,$3,$4,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'pending','pending',$15,$16,$17,$18,$19)
          RETURNING *`,
         [
           orderNumber,
@@ -9668,9 +9714,16 @@ app.post("/marketplace/orders", authenticateToken, async (req, res) => {
           customer_email,
           customer_phone,
           delivery_address,
+          delivery_method,
+          delivery_city,
+          delivery_neighborhood,
+          delivery_phone || customer_phone,
+          delivery_note,
           req.user.company_id ? "B2B" : "B2C",
           payment_method,
           subtotal,
+          deliveryFee,
+          totalAmount,
           notes
         ]
       );
@@ -9683,7 +9736,7 @@ app.post("/marketplace/orders", authenticateToken, async (req, res) => {
         [
           order.id,
           Number(vendorCompanyId || 0),
-          subtotal,
+          totalAmount,
           payment_method,
           orderNumber,
           req.user.id
@@ -9712,6 +9765,39 @@ app.post("/marketplace/orders", authenticateToken, async (req, res) => {
           ]
         );
       }
+      const vendorUsers = await client.query(
+        `SELECT id
+         FROM users
+         WHERE company_id=$1
+           AND LOWER(COALESCE(role,'')) IN ('admin','super_admin','marketplace_vendor','marketplace_admin','responsable_entrepot')
+         LIMIT 20`,
+        [Number(vendorCompanyId || 0)]
+      );
+      for (const vendorUser of vendorUsers.rows) {
+        await createNotification({
+          user_id: vendorUser.id,
+          title: "Nouvelle commande marketplace",
+          message: `Commande ${order.order_number} à traiter.`,
+          type: "marketplace_order_pending",
+          company_id: Number(vendorCompanyId || 0),
+          priority: "high",
+          related_entity_type: "marketplace_order",
+          related_entity_id: order.id,
+          action_url: "/vendor/orders",
+          created_by: req.user.id
+        });
+      }
+      await createNotification({
+        user_id: req.user.id,
+        title: "Commande marketplace créée",
+        message: `Votre commande ${order.order_number} a été envoyée au vendeur.`,
+        type: "marketplace_order_created",
+        company_id: req.user.company_id || Number(vendorCompanyId || 0),
+        related_entity_type: "marketplace_order",
+        related_entity_id: order.id,
+        action_url: `/client/orders/${order.id}`,
+        created_by: req.user.id
+      });
       orders.push(order);
     }
 
@@ -10017,13 +10103,25 @@ app.put("/marketplace/vendor/orders/:id/status", authenticateToken, async (req, 
         `UPDATE marketplace_orders
          SET status=COALESCE(NULLIF($1,''), status),
              payment_status=COALESCE(NULLIF($2,''), payment_status),
+             vendor_message=COALESCE(NULLIF($3,''), vendor_message),
              updated_at=CURRENT_TIMESTAMP
-         WHERE id=$3
+         WHERE id=$4
          RETURNING *`,
-        [status || "", payment_status || "", req.params.id]
+        [status || "", payment_status || "", req.body?.vendor_message || "", req.params.id]
       );
       result = update.rows[0];
     }
+    await createNotification({
+      user_id: result.customer_user_id,
+      title: "Statut commande marketplace",
+      message: `La commande ${result.order_number} est maintenant ${result.status}.`,
+      type: "marketplace_order_status",
+      company_id: result.buyer_company_id || result.vendor_company_id,
+      related_entity_type: "marketplace_order",
+      related_entity_id: result.id,
+      action_url: `/client/orders/${result.id}`,
+      created_by: req.user.id
+    });
     await client.query("COMMIT");
     res.json(result);
   } catch (error) {
@@ -14951,6 +15049,7 @@ app.get("/public/plans", async (req, res) => {
         COALESCE(max_cash_registers, 0) AS max_cash_registers,
         COALESCE(max_sales_per_month, 0) AS max_sales_per_month,
         COALESCE(max_stock_movements_per_month, max_movements_monthly, 0) AS max_stock_movements_per_month,
+        COALESCE(max_modules_allowed, 0) AS max_modules_allowed,
         COALESCE(billing_cycle, 'monthly') AS billing_cycle,
         COALESCE(is_active, true) AS is_active,
         can_use_reports,
@@ -15042,6 +15141,7 @@ function normalizePlanPayload(body = {}) {
     max_sales_per_month: Number(body.max_sales_per_month || 0),
     max_movements_monthly: Number(body.max_movements_monthly ?? body.max_stock_movements_per_month ?? 0),
     max_stock_movements_per_month: Number(body.max_stock_movements_per_month ?? body.max_movements_monthly ?? 0),
+    max_modules_allowed: Number(body.max_modules_allowed ?? body.nombre_modules_autorises ?? 0),
     trial_days: Number(body.trial_days || 15),
     modules: modulesValue,
     features_json: body.features_json && typeof body.features_json === "object" ? body.features_json : {},
@@ -15073,17 +15173,18 @@ async function updateSubscriptionPlan(planId, payload) {
       max_sales_per_month=$12,
       max_movements_monthly=$13,
       max_stock_movements_per_month=$14,
-      trial_days=$15,
-      modules=$16,
-      features_json=$17::jsonb,
-      is_active=$18,
-      can_use_reports=$19,
-      can_use_qr=$20,
-      can_use_advanced_inventory=$21,
-      can_use_documents=$22,
-      can_use_chat=$23,
-      can_use_ai=$24
-     WHERE id=$25
+      max_modules_allowed=$15,
+      trial_days=$16,
+      modules=$17,
+      features_json=$18::jsonb,
+      is_active=$19,
+      can_use_reports=$20,
+      can_use_qr=$21,
+      can_use_advanced_inventory=$22,
+      can_use_documents=$23,
+      can_use_chat=$24,
+      can_use_ai=$25
+     WHERE id=$26
      RETURNING *`,
     [
       payload.name,
@@ -15100,6 +15201,7 @@ async function updateSubscriptionPlan(planId, payload) {
       payload.max_sales_per_month,
       payload.max_movements_monthly,
       payload.max_stock_movements_per_month,
+      payload.max_modules_allowed,
       payload.trial_days,
       payload.modules,
       JSON.stringify(payload.features_json || {}),
@@ -15601,6 +15703,7 @@ app.post("/super-admin/plans", authenticateToken, authorizeRoles("super_admin"),
         max_sales_per_month,
         max_movements_monthly,
         max_stock_movements_per_month,
+        max_modules_allowed,
         trial_days,
         modules,
         features_json,
@@ -15612,7 +15715,7 @@ app.post("/super-admin/plans", authenticateToken, authorizeRoles("super_admin"),
         can_use_chat,
         can_use_ai
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::jsonb,$18,$19,$20,$21,$22,$23,$24)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18::jsonb,$19,$20,$21,$22,$23,$24,$25)
       RETURNING *
       `,
       [
@@ -15630,6 +15733,7 @@ app.post("/super-admin/plans", authenticateToken, authorizeRoles("super_admin"),
         payload.max_sales_per_month,
         payload.max_movements_monthly,
         payload.max_stock_movements_per_month,
+        payload.max_modules_allowed,
         payload.trial_days,
         payload.modules,
         JSON.stringify(payload.features_json || {}),
