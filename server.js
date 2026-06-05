@@ -232,6 +232,7 @@ function getRequestedActiveCompanyId(req) {
   const raw =
     req?.headers?.["x-active-company-id"] ||
     req?.headers?.["x-company-id"] ||
+    req?.body?.company_id ||
     req?.body?.active_company_id ||
     req?.query?.active_company_id;
   const numeric = Number(raw);
@@ -2433,6 +2434,11 @@ app.put("/me/password", authenticateToken, async (req, res) => {
 /* UTILISATEURS */
 app.get("/users", authenticateToken, async (req, res) => {
   try {
+    const role = normalizeRole(req.user?.role);
+    if (role === "customer" || role === "client") {
+      return res.status(403).json({ error: "Accès refusé aux utilisateurs internes." });
+    }
+
     const companyId = req.user.company_id;
     const isSuperAdmin = req.user.is_super_admin === true;
 
@@ -2953,19 +2959,20 @@ app.delete(
 /* PRODUITS SAAS */
 app.get("/products", authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.company_id;
     const isSuperAdmin = req.user.is_super_admin === true;
+    const companyId = isSuperAdmin ? getEffectiveCompanyId(req) : req.user.company_id;
 
     let query = `
-      SELECT products.*, locations.emplacement_code
+      SELECT products.*, locations.emplacement_code, c.name AS company_name
       FROM products
       LEFT JOIN locations 
       ON products.location_id = locations.id
+      LEFT JOIN companies c ON c.id=products.company_id
     `;
 
     let values = [];
 
-    if (!isSuperAdmin) {
+    if (!isSuperAdmin || companyId) {
       query += ` WHERE products.company_id = $1 `;
       values.push(companyId);
     }
@@ -3039,6 +3046,7 @@ app.post("/products", authenticateToken, async (req, res) => {
       monthly_price,
       is_sellable,
       is_rentable,
+      is_durable,
       product_type,
       user_name,
       user_role
@@ -3070,13 +3078,14 @@ app.post("/products", authenticateToken, async (req, res) => {
     monthly_price,
     is_sellable,
     is_rentable,
+    is_durable,
     product_type,
     company_id
   )
   VALUES (
     $1,$2,$3,$4,$5,$6,$7,$8,
     $9,$10,$11,$12,$13,$14,$15,$16,
-    $17,$18,$19,$20,$21,$22,$23,$24,$25
+    $17,$18,$19,$20,$21,$22,$23,$24,$25,$26
   )
   RETURNING *`,
       [
@@ -3103,6 +3112,7 @@ app.post("/products", authenticateToken, async (req, res) => {
         Number(monthly_price || 0),
         is_sellable !== false,
         is_rentable === true,
+        is_durable === true,
         product_type || "stock_normal",
         companyId
       ]
@@ -3165,6 +3175,7 @@ app.put(
       monthly_price,
       is_sellable,
       is_rentable,
+      is_durable,
       product_type,
       user_name,
       user_role
@@ -3194,6 +3205,7 @@ app.put(
       Number(monthly_price || 0),
       is_sellable !== false,
       is_rentable === true,
+      is_durable === true,
       product_type || "stock_normal",
       id
     ];
@@ -3206,8 +3218,8 @@ app.put(
           minimum_stock=$15, image_url=$16, purchase_price=$17,
           sale_price=$18, rental_price=$19, daily_price=$20,
           monthly_price=$21, is_sellable=$22, is_rentable=$23,
-          product_type=$24
-      WHERE id=$25
+          is_durable=$24, product_type=$25
+      WHERE id=$26
     `;
 
     if (!isSuperAdmin) {
@@ -8684,7 +8696,7 @@ app.get("/marketplace/products", async (req, res) => {
   try {
     const { q = "", vendor_company_id = "", category = "", min_price = "", max_price = "" } = req.query;
     const values = [];
-    let where = "WHERE (mp.status='published' OR mp.is_published=true)";
+    let where = "WHERE (mp.status='published' OR mp.is_published=true) AND p.is_sellable IS NOT FALSE AND p.is_active IS NOT FALSE";
 
     if (q) {
       values.push(`%${q}%`);
@@ -8778,7 +8790,7 @@ app.get("/marketplace/business", authenticateToken, async (req, res) => {
   try {
     const { q = "", category = "" } = req.query;
     const values = [req.user.company_id || 0];
-    let where = "WHERE (mp.status='published' OR mp.is_published=true) AND mp.is_b2b=true AND mp.company_id<>$1";
+    let where = "WHERE (mp.status='published' OR mp.is_published=true) AND mp.is_b2b=true AND mp.company_id<>$1 AND p.is_sellable IS NOT FALSE AND p.is_active IS NOT FALSE";
     if (q) {
       values.push(`%${q}%`);
       where += ` AND (COALESCE(NULLIF(mp.public_title,''), mp.title) ILIKE $${values.length} OR p.reference ILIKE $${values.length} OR p.name ILIKE $${values.length})`;
@@ -9925,6 +9937,9 @@ app.post("/marketplace/vendor/products", authenticateToken, async (req, res) => 
     } = req.body || {};
     const product = await pool.query("SELECT * FROM products WHERE id=$1 AND company_id=$2", [product_id, companyId]);
     if (!product.rows[0]) return res.status(404).json({ error: "Produit source introuvable dans cette entreprise." });
+    if (product.rows[0].is_sellable === false) {
+      return res.status(400).json({ error: "Ce produit n’est pas marqué comme vendable." });
+    }
     const sourceStock = Number(product.rows[0].stock || 0);
     const quantityToPublish = Number(published_quantity ?? available_stock ?? sourceStock);
     if (quantityToPublish <= 0 || quantityToPublish > sourceStock) {
