@@ -56,9 +56,14 @@ if (!fs.existsSync("uploads")) {
 }
 
 const productUploadDir = path.join(__dirname, "uploads", "products");
+const laboratoryUploadDir = path.join(__dirname, "uploads", "laboratory");
 
 if (!fs.existsSync(productUploadDir)) {
   fs.mkdirSync(productUploadDir, { recursive: true });
+}
+
+if (!fs.existsSync(laboratoryUploadDir)) {
+  fs.mkdirSync(laboratoryUploadDir, { recursive: true });
 }
 
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
@@ -148,6 +153,33 @@ const uploadProductImage = multer({
     const allowed = new Set(["image/jpeg", "image/jpg", "image/png", "image/webp"]);
     if (!allowed.has(file.mimetype)) {
       return cb(new Error("Format image non autorisé. Utilisez jpg, jpeg, png ou webp."));
+    }
+
+    cb(null, true);
+  }
+});
+
+const laboratoryResultStorage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    cb(null, laboratoryUploadDir);
+  },
+  filename: function (req, file, cb) {
+    const ext = path.extname(file.originalname || "").toLowerCase();
+    const baseName = path
+      .basename(file.originalname || "resultat-laboratoire", ext)
+      .replace(/\s+/g, "-")
+      .replace(/[^a-zA-Z0-9-_]/g, "");
+    cb(null, `${Date.now()}-${crypto.randomBytes(6).toString("hex")}-${baseName || "resultat"}${ext}`);
+  }
+});
+
+const uploadLaboratoryResult = multer({
+  storage: laboratoryResultStorage,
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: function (req, file, cb) {
+    const allowed = new Set(["application/pdf", "image/jpeg", "image/jpg", "image/png", "image/webp"]);
+    if (!allowed.has(file.mimetype)) {
+      return cb(new Error("Format résultat non autorisé. Utilisez PDF, JPG, PNG ou WEBP."));
     }
 
     cb(null, true);
@@ -7909,6 +7941,41 @@ app.post("/documents/:id/email", authenticateToken, async (req, res) => {
   }
 });
 
+app.post("/reports/email", authenticateToken, async (req, res) => {
+  try {
+    if (!canAccessDirectionModule(req.user)) {
+      return res.status(403).json({ error: "Accès refusé : module réservé à la direction" });
+    }
+    const { recipient_email = "", subject = "Rapport Triangle WMS Pro", html = "", message = "" } = req.body || {};
+    if (!recipient_email || !String(recipient_email).includes("@")) {
+      return res.status(400).json({ error: "Email destinataire invalide." });
+    }
+    if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
+      return res.status(503).json({ error: "SMTP non configuré. Configurez SMTP dans .env." });
+    }
+    const transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: Number(process.env.SMTP_PORT || 587),
+      secure: Number(process.env.SMTP_PORT || 587) === 465,
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+    });
+    const finalHtml = html || `<p>${escapeHtml(message || "Rapport Triangle WMS Pro")}</p>`;
+    const info = await transporter.sendMail({
+      from: process.env.SMTP_FROM || process.env.SMTP_USER,
+      to: recipient_email,
+      subject,
+      text: message || "Rapport Triangle WMS Pro",
+      html: finalHtml,
+      attachments: [{ filename: "rapport-triangle-wms.html", content: finalHtml, contentType: "text/html" }]
+    });
+    await logAudit(req, "email_report", "report", null, { recipient_email, message_id: info.messageId || "" });
+    res.json({ message: "Rapport envoyé par email.", message_id: info.messageId || "" });
+  } catch (error) {
+    console.error("ERREUR EMAIL REPORT :", error);
+    res.status(500).json({ error: error.message || "Erreur envoi email rapport" });
+  }
+});
+
 app.post("/documents", authenticateToken, async (req, res) => {
   try {
     if (!canAccessDirectionModule(req.user)) {
@@ -9105,6 +9172,85 @@ app.put("/laboratory/cases/:id/result", authenticateToken, async (req, res) => {
   } catch (error) {
     console.error("ERREUR UPDATE LAB RESULT :", error);
     res.status(500).json({ error: "Erreur résultat laboratoire" });
+  }
+});
+
+app.post("/laboratory/cases/:id/upload-result", authenticateToken, uploadLaboratoryResult.single("result"), async (req, res) => {
+  try {
+    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "Accès laboratoire refusé." });
+    if (!req.file) return res.status(400).json({ error: "Fichier résultat obligatoire." });
+    const companyId = getEffectiveCompanyId(req);
+    const fileUrl = publicUploadUrl(req, `laboratory/${req.file.filename}`);
+    const result = await pool.query(
+      `UPDATE laboratory_cases
+       SET result_file_url=$1,
+           status=CASE WHEN status='en_attente' THEN 'résultat_prêt' ELSE status END,
+           updated_at=CURRENT_TIMESTAMP
+       WHERE id=$2 AND company_id=$3
+       RETURNING *`,
+      [fileUrl, req.params.id, companyId]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: "Dossier introuvable." });
+    res.json({ file_url: fileUrl, case: result.rows[0] });
+  } catch (error) {
+    console.error("ERREUR UPLOAD LAB RESULT :", error);
+    res.status(500).json({ error: error.message || "Erreur upload résultat laboratoire" });
+  }
+});
+
+app.post("/laboratory/cases/:id/email-result", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "Accès laboratoire refusé." });
+    const { recipient_email = "", message = "" } = req.body || {};
+    if (!recipient_email || !String(recipient_email).includes("@")) {
+      return res.status(400).json({ error: "Email destinataire invalide." });
+    }
+    if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
+      return res.status(503).json({ error: "SMTP non configuré. Configurez SMTP dans .env." });
+    }
+    const companyId = getEffectiveCompanyId(req);
+    const result = await pool.query(
+      `SELECT c.*, p.full_name AS patient_name, p.phone AS patient_phone,
+              ls.lab_name, ls.email AS lab_email
+       FROM laboratory_cases c
+       LEFT JOIN laboratory_patients p ON p.id=c.patient_id
+       LEFT JOIN laboratory_settings ls ON ls.company_id=c.company_id
+       WHERE c.id=$1 AND c.company_id=$2`,
+      [req.params.id, companyId]
+    );
+    const labCase = result.rows[0];
+    if (!labCase) return res.status(404).json({ error: "Dossier introuvable." });
+    const transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: Number(process.env.SMTP_PORT || 587),
+      secure: Number(process.env.SMTP_PORT || 587) === 465,
+      auth: {
+        user: process.env.SMTP_USER,
+        pass: process.env.SMTP_PASS
+      }
+    });
+    const html = `
+      <p>${escapeHtml(message || "Votre résultat laboratoire est disponible.")}</p>
+      <p><strong>Laboratoire :</strong> ${escapeHtml(labCase.lab_name || "")}</p>
+      <p><strong>Patient :</strong> ${escapeHtml(labCase.patient_name || "")}</p>
+      <p><strong>Code résultat :</strong> ${escapeHtml(labCase.result_code || "")}</p>
+      ${labCase.result_file_url ? `<p><a href="${escapeHtml(labCase.result_file_url)}">Télécharger le résultat</a></p>` : ""}
+    `;
+    const info = await transporter.sendMail({
+      from: process.env.SMTP_FROM || process.env.SMTP_USER,
+      to: recipient_email,
+      subject: `Résultat laboratoire ${labCase.case_number || ""}`,
+      text: message || `Votre résultat laboratoire est disponible. Code : ${labCase.result_code}`,
+      html
+    });
+    await logAudit(req, "email_laboratory_result", "laboratory_case", labCase.id, {
+      recipient_email,
+      message_id: info.messageId || ""
+    });
+    res.json({ message: "Résultat envoyé par email.", message_id: info.messageId || "" });
+  } catch (error) {
+    console.error("ERREUR EMAIL LAB RESULT :", error);
+    res.status(500).json({ error: error.message || "Erreur envoi email résultat laboratoire" });
   }
 });
 
