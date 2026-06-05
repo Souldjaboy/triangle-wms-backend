@@ -8802,6 +8802,506 @@ app.put("/marketplace/customers/profile", authenticateToken, async (req, res) =>
   }
 });
 
+function canManageLaboratory(user) {
+  const role = normalizeRole(user?.role);
+  return isSuperAdminUser(user) || ["admin", "directeur", "direction", "laboratoire", "employe_laboratoire", "comptable"].includes(role);
+}
+
+function generateLaboratoryResultCode() {
+  return `LAB-${new Date().getFullYear()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
+}
+
+app.get("/laboratory/settings", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "Accès laboratoire refusé." });
+    const companyId = getEffectiveCompanyId(req);
+    const result = await pool.query("SELECT * FROM laboratory_settings WHERE company_id=$1 ORDER BY id DESC LIMIT 1", [companyId]);
+    res.json(result.rows[0] || { company_id: companyId, lab_name: "", is_published: false, public_category: "Santé / Laboratoire" });
+  } catch (error) {
+    console.error("ERREUR LAB SETTINGS :", error);
+    res.status(500).json({ error: "Erreur paramètres laboratoire" });
+  }
+});
+
+app.put("/laboratory/settings", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "Accès laboratoire refusé." });
+    const companyId = getEffectiveCompanyId(req);
+    const {
+      lab_name = "", logo_url = "", phone = "", whatsapp = "", email = "",
+      address = "", city = "", opening_hours = "", description = "",
+      home_sampling_enabled = false, appointments_enabled = true,
+      online_payment_enabled = false, is_published = false,
+      public_image_url = "", public_description = ""
+    } = req.body || {};
+    let result = await pool.query(
+      `UPDATE laboratory_settings
+       SET lab_name=$2, logo_url=$3, phone=$4, whatsapp=$5, email=$6,
+           address=$7, city=$8, opening_hours=$9, description=$10,
+           home_sampling_enabled=$11, appointments_enabled=$12,
+           online_payment_enabled=$13, is_published=$14,
+           public_category='Santé / Laboratoire',
+           public_image_url=$15, public_description=$16,
+           updated_at=CURRENT_TIMESTAMP
+       WHERE company_id=$1
+       RETURNING *`,
+      [
+        companyId, lab_name, logo_url, phone, whatsapp, email, address, city,
+        opening_hours, description, home_sampling_enabled, appointments_enabled,
+        online_payment_enabled, is_published, public_image_url, public_description
+      ]
+    );
+    if (!result.rows[0]) {
+      result = await pool.query(
+        `INSERT INTO laboratory_settings
+         (company_id, lab_name, logo_url, phone, whatsapp, email, address, city,
+          opening_hours, description, home_sampling_enabled, appointments_enabled,
+          online_payment_enabled, is_published, public_category, public_image_url,
+          public_description)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'Santé / Laboratoire',$15,$16)
+         RETURNING *`,
+        [
+          companyId, lab_name, logo_url, phone, whatsapp, email, address, city,
+          opening_hours, description, home_sampling_enabled, appointments_enabled,
+          online_payment_enabled, is_published, public_image_url, public_description
+        ]
+      );
+    }
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("ERREUR UPDATE LAB SETTINGS :", error);
+    res.status(500).json({ error: error.detail || error.message || "Erreur sauvegarde laboratoire" });
+  }
+});
+
+app.get("/laboratory/analyses", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "Accès laboratoire refusé." });
+    const companyId = getEffectiveCompanyId(req);
+    const result = await pool.query(
+      `SELECT *
+       FROM laboratory_analyses
+       WHERE company_id=$1 OR company_id IS NULL
+       ORDER BY is_standard DESC, name ASC`,
+      [companyId]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR LAB ANALYSES :", error);
+    res.status(500).json({ error: "Erreur analyses laboratoire" });
+  }
+});
+
+app.post("/laboratory/analyses", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "Accès laboratoire refusé." });
+    const companyId = getEffectiveCompanyId(req);
+    const { name, description = "", price = 0, result_delay = "", is_available = true, home_sampling_available = false, patient_instructions = "" } = req.body || {};
+    if (!name) return res.status(400).json({ error: "Nom analyse obligatoire." });
+    const result = await pool.query(
+      `INSERT INTO laboratory_analyses
+       (company_id, name, description, price, result_delay, is_available,
+        home_sampling_available, patient_instructions)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       RETURNING *`,
+      [companyId, name, description, Number(price || 0), result_delay, is_available, home_sampling_available, patient_instructions]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error("ERREUR CREATE LAB ANALYSIS :", error);
+    res.status(500).json({ error: "Erreur création analyse" });
+  }
+});
+
+app.put("/laboratory/analyses/:id", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "Accès laboratoire refusé." });
+    const companyId = getEffectiveCompanyId(req);
+    const { name = "", description = "", price = 0, result_delay = "", is_available = true, home_sampling_available = false, patient_instructions = "" } = req.body || {};
+    const result = await pool.query(
+      `UPDATE laboratory_analyses
+       SET name=COALESCE(NULLIF($1,''), name), description=$2, price=$3,
+           result_delay=$4, is_available=$5, home_sampling_available=$6,
+           patient_instructions=$7, company_id=COALESCE(company_id,$8),
+           updated_at=CURRENT_TIMESTAMP
+       WHERE id=$9 AND (company_id=$8 OR company_id IS NULL)
+       RETURNING *`,
+      [name, description, Number(price || 0), result_delay, is_available, home_sampling_available, patient_instructions, companyId, req.params.id]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: "Analyse introuvable." });
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("ERREUR UPDATE LAB ANALYSIS :", error);
+    res.status(500).json({ error: "Erreur modification analyse" });
+  }
+});
+
+app.get("/laboratory/patients", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "Accès laboratoire refusé." });
+    const result = await pool.query("SELECT * FROM laboratory_patients WHERE company_id=$1 ORDER BY id DESC LIMIT 300", [getEffectiveCompanyId(req)]);
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR LAB PATIENTS :", error);
+    res.status(500).json({ error: "Erreur patients laboratoire" });
+  }
+});
+
+app.post("/laboratory/patients", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "Accès laboratoire refusé." });
+    const companyId = getEffectiveCompanyId(req);
+    const { full_name, phone = "", email = "", gender = "", birth_date = null, age = null, address = "", notes = "" } = req.body || {};
+    if (!full_name) return res.status(400).json({ error: "Nom patient obligatoire." });
+    const result = await pool.query(
+      `INSERT INTO laboratory_patients
+       (company_id, full_name, phone, email, gender, birth_date, age, address, notes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       RETURNING *`,
+      [companyId, full_name, phone, email, gender, birth_date || null, age || null, address, notes]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error("ERREUR CREATE LAB PATIENT :", error);
+    res.status(500).json({ error: "Erreur création patient" });
+  }
+});
+
+app.get("/laboratory/appointments", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "Accès laboratoire refusé." });
+    const result = await pool.query("SELECT * FROM laboratory_appointments WHERE company_id=$1 ORDER BY id DESC LIMIT 300", [getEffectiveCompanyId(req)]);
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR LAB APPOINTMENTS :", error);
+    res.status(500).json({ error: "Erreur rendez-vous laboratoire" });
+  }
+});
+
+app.post("/laboratory/appointments", authenticateToken, async (req, res) => {
+  try {
+    const companyId = Number(req.body?.company_id || getEffectiveCompanyId(req));
+    const {
+      patient_name = req.user?.fullname || "", patient_phone = req.user?.phone || "",
+      patient_email = req.user?.email || "", analysis_id = null, analysis_name = "",
+      requested_date = null, requested_time = "", home_sampling = false,
+      home_address = "", message = ""
+    } = req.body || {};
+    const result = await pool.query(
+      `INSERT INTO laboratory_appointments
+       (company_id, client_user_id, patient_name, patient_phone, patient_email,
+        analysis_id, analysis_name, requested_date, requested_time,
+        home_sampling, home_address, message, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'pending')
+       RETURNING *`,
+      [companyId, req.user?.id || null, patient_name, patient_phone, patient_email, analysis_id, analysis_name, requested_date || null, requested_time, home_sampling, home_address, message]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error("ERREUR CREATE LAB APPOINTMENT :", error);
+    res.status(500).json({ error: "Erreur demande rendez-vous laboratoire" });
+  }
+});
+
+app.put("/laboratory/appointments/:id/status", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "Accès laboratoire refusé." });
+    const companyId = getEffectiveCompanyId(req);
+    const { status = "accepted", proposed_date = null, proposed_time = "", lab_response = "" } = req.body || {};
+    const result = await pool.query(
+      `UPDATE laboratory_appointments
+       SET status=$1, proposed_date=$2, proposed_time=$3, lab_response=$4,
+           updated_at=CURRENT_TIMESTAMP
+       WHERE id=$5 AND company_id=$6
+       RETURNING *`,
+      [status, proposed_date || null, proposed_time, lab_response, req.params.id, companyId]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: "Rendez-vous introuvable." });
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("ERREUR UPDATE LAB APPOINTMENT :", error);
+    res.status(500).json({ error: "Erreur statut rendez-vous" });
+  }
+});
+
+app.get("/laboratory/cases", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "Accès laboratoire refusé." });
+    const result = await pool.query(
+      `SELECT c.*, p.full_name AS patient_name, p.phone AS patient_phone
+       FROM laboratory_cases c
+       LEFT JOIN laboratory_patients p ON p.id=c.patient_id
+       WHERE c.company_id=$1
+       ORDER BY c.id DESC LIMIT 300`,
+      [getEffectiveCompanyId(req)]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR LAB CASES :", error);
+    res.status(500).json({ error: "Erreur dossiers laboratoire" });
+  }
+});
+
+app.post("/laboratory/cases", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "Accès laboratoire refusé." });
+    const companyId = getEffectiveCompanyId(req);
+    const { patient_id, appointment_id = null, analysis_ids = [] } = req.body || {};
+    if (!patient_id) return res.status(400).json({ error: "Patient obligatoire." });
+    await client.query("BEGIN");
+    const selectedAnalyses = await client.query(
+      `SELECT * FROM laboratory_analyses
+       WHERE id = ANY($1::int[]) AND (company_id=$2 OR company_id IS NULL)`,
+      [Array.isArray(analysis_ids) ? analysis_ids.map(Number) : [], companyId]
+    );
+    const total = selectedAnalyses.rows.reduce((sum, item) => sum + Number(item.price || 0), 0);
+    const caseNumber = await nextAccountingNumber(client, "laboratory_cases", "case_number", "LABD", companyId);
+    const resultCode = generateLaboratoryResultCode();
+    const caseResult = await client.query(
+      `INSERT INTO laboratory_cases
+       (company_id, patient_id, appointment_id, case_number, result_code,
+        status, total_amount, payment_status, created_by)
+       VALUES ($1,$2,$3,$4,$5,'en_attente',$6,'pending',$7)
+       RETURNING *`,
+      [companyId, patient_id, appointment_id || null, caseNumber, resultCode, total, req.user.id]
+    );
+    for (const analysis of selectedAnalyses.rows) {
+      await client.query(
+        `INSERT INTO laboratory_case_analyses
+         (case_id, analysis_id, analysis_name, price)
+         VALUES ($1,$2,$3,$4)`,
+        [caseResult.rows[0].id, analysis.id, analysis.name, Number(analysis.price || 0)]
+      );
+    }
+    await client.query("COMMIT");
+    res.status(201).json(caseResult.rows[0]);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("ERREUR CREATE LAB CASE :", error);
+    res.status(500).json({ error: error.detail || error.message || "Erreur création dossier analyse" });
+  } finally {
+    client.release();
+  }
+});
+
+app.put("/laboratory/cases/:id/result", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "Accès laboratoire refusé." });
+    const companyId = getEffectiveCompanyId(req);
+    const { status = "résultat_prêt", result_summary = "", result_file_url = "", result_published = false } = req.body || {};
+    const result = await pool.query(
+      `UPDATE laboratory_cases
+       SET status=$1, result_summary=$2, result_file_url=$3,
+           result_published=$4,
+           published_at=CASE WHEN $4=true THEN CURRENT_TIMESTAMP ELSE published_at END,
+           updated_at=CURRENT_TIMESTAMP
+       WHERE id=$5 AND company_id=$6
+       RETURNING *`,
+      [status, result_summary, result_file_url, result_published, req.params.id, companyId]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: "Dossier introuvable." });
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("ERREUR UPDATE LAB RESULT :", error);
+    res.status(500).json({ error: "Erreur résultat laboratoire" });
+  }
+});
+
+app.get("/laboratory/payments", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "Accès laboratoire refusé." });
+    const result = await pool.query(
+      `SELECT lp.*, lc.case_number, lc.result_code, p.full_name AS patient_name
+       FROM laboratory_payments lp
+       LEFT JOIN laboratory_cases lc ON lc.id=lp.case_id
+       LEFT JOIN laboratory_patients p ON p.id=lc.patient_id
+       WHERE lp.company_id=$1
+       ORDER BY lp.id DESC LIMIT 300`,
+      [getEffectiveCompanyId(req)]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR LAB PAYMENTS :", error);
+    res.status(500).json({ error: "Erreur paiements laboratoire" });
+  }
+});
+
+app.post("/laboratory/cases/:id/payments/confirm", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "Accès laboratoire refusé." });
+    const companyId = getEffectiveCompanyId(req);
+    const { method = "Espèces", amount = null, payment_reference = "" } = req.body || {};
+    await client.query("BEGIN");
+    const labCase = await client.query("SELECT * FROM laboratory_cases WHERE id=$1 AND company_id=$2 FOR UPDATE", [req.params.id, companyId]);
+    if (!labCase.rows[0]) throw new Error("Dossier laboratoire introuvable.");
+    const paidAmount = Number(amount ?? labCase.rows[0].total_amount ?? 0);
+    const payment = await client.query(
+      `INSERT INTO laboratory_payments
+       (company_id, case_id, amount, method, status, payment_reference,
+        paid_at, created_by)
+       VALUES ($1,$2,$3,$4,'paid',$5,CURRENT_TIMESTAMP,$6)
+       RETURNING *`,
+      [companyId, labCase.rows[0].id, paidAmount, method, payment_reference || labCase.rows[0].case_number, req.user.id]
+    );
+    await client.query("UPDATE laboratory_cases SET payment_status='paid', updated_at=CURRENT_TIMESTAMP WHERE id=$1", [labCase.rows[0].id]);
+    const documentNumber = await nextAccountingNumber(client, "documents", "document_number", "REC-LAB", companyId);
+    await client.query(
+      `INSERT INTO documents
+       (document_type, document_number, client_name, total_amount, observation,
+        created_by, company_id, related_entity_type, related_entity_id, status)
+       SELECT 'Reçu laboratoire',$1,p.full_name,$2,$3,$4,$5,'laboratory_case',$6,'Validé'
+       FROM laboratory_patients p WHERE p.id=$7`,
+      [
+        documentNumber,
+        paidAmount,
+        `Paiement laboratoire ${labCase.rows[0].case_number}`,
+        req.user.email || "Laboratoire",
+        companyId,
+        labCase.rows[0].id,
+        labCase.rows[0].patient_id
+      ]
+    );
+    await client.query("COMMIT");
+    res.json({ payment: payment.rows[0], status: "paid" });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("ERREUR CONFIRM LAB PAYMENT :", error);
+    res.status(500).json({ error: error.detail || error.message || "Erreur paiement laboratoire" });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/laboratory/documents", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "Accès laboratoire refusé." });
+    const result = await pool.query(
+      `SELECT *
+       FROM documents
+       WHERE company_id=$1
+         AND (related_entity_type='laboratory_case' OR document_type ILIKE '%laboratoire%')
+       ORDER BY id DESC LIMIT 300`,
+      [getEffectiveCompanyId(req)]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR LAB DOCUMENTS :", error);
+    res.status(500).json({ error: "Erreur documents laboratoire" });
+  }
+});
+
+app.get("/client/laboratory/appointments", authenticateToken, async (req, res) => {
+  try {
+    if (normalizeRole(req.user?.role) !== "customer") {
+      return res.status(403).json({ error: "Accès réservé aux clients Marketplace." });
+    }
+    const result = await pool.query(
+      `SELECT la.*, ls.lab_name, ls.city
+       FROM laboratory_appointments la
+       LEFT JOIN laboratory_settings ls ON ls.company_id=la.company_id
+       WHERE la.client_user_id=$1
+       ORDER BY la.id DESC LIMIT 200`,
+      [req.user.id]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR CLIENT LAB APPOINTMENTS :", error);
+    res.status(500).json({ error: "Erreur rendez-vous client laboratoire" });
+  }
+});
+
+app.get("/laboratories/public", async (req, res) => {
+  try {
+    const { city = "", q = "" } = req.query;
+    const values = [];
+    let where = "WHERE ls.is_published=true AND ls.is_active=true";
+    if (city) {
+      values.push(`%${city}%`);
+      where += ` AND ls.city ILIKE $${values.length}`;
+    }
+    if (q) {
+      values.push(`%${q}%`);
+      where += ` AND (ls.lab_name ILIKE $${values.length} OR ls.description ILIKE $${values.length} OR ls.public_description ILIKE $${values.length})`;
+    }
+    const result = await pool.query(
+      `SELECT ls.*, c.name AS company_name
+       FROM laboratory_settings ls
+       LEFT JOIN companies c ON c.id=ls.company_id
+       ${where}
+       ORDER BY ls.updated_at DESC
+       LIMIT 100`,
+      values
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("ERREUR PUBLIC LABS :", error);
+    res.status(500).json({ error: "Erreur laboratoires publics" });
+  }
+});
+
+app.get("/laboratories/public/:id", async (req, res) => {
+  try {
+    const lab = await pool.query("SELECT * FROM laboratory_settings WHERE id=$1 AND is_published=true AND is_active=true", [req.params.id]);
+    if (!lab.rows[0]) return res.status(404).json({ error: "Laboratoire introuvable." });
+    const analyses = await pool.query(
+      `SELECT *
+       FROM laboratory_analyses
+       WHERE company_id=$1 AND is_available=true
+       ORDER BY name ASC`,
+      [lab.rows[0].company_id]
+    );
+    res.json({ laboratory: lab.rows[0], analyses: analyses.rows });
+  } catch (error) {
+    console.error("ERREUR PUBLIC LAB DETAIL :", error);
+    res.status(500).json({ error: "Erreur détail laboratoire" });
+  }
+});
+
+app.post("/laboratory/public/results/verify", async (req, res) => {
+  try {
+    const { result_code = "", verifier = "" } = req.body || {};
+    const result = await pool.query(
+      `SELECT c.*, p.full_name AS patient_name, p.phone AS patient_phone,
+              p.birth_date, ls.lab_name, ls.phone AS lab_phone, ls.email AS lab_email,
+              ls.address AS lab_address
+       FROM laboratory_cases c
+       LEFT JOIN laboratory_patients p ON p.id=c.patient_id
+       LEFT JOIN laboratory_settings ls ON ls.company_id=c.company_id
+       WHERE c.result_code=$1 AND c.result_published=true
+       LIMIT 1`,
+      [String(result_code).trim()]
+    );
+    const row = result.rows[0];
+    const verifierText = String(verifier || "").trim().toLowerCase();
+    const accepted =
+      row &&
+      (String(row.patient_phone || "").trim().toLowerCase() === verifierText ||
+        String(row.birth_date || "").slice(0, 10).toLowerCase() === verifierText);
+    await pool.query(
+      `INSERT INTO laboratory_result_access_logs
+       (company_id, case_id, result_code, verifier, success, ip_address, user_agent)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [
+        row?.company_id || null,
+        row?.id || null,
+        result_code,
+        verifier,
+        Boolean(accepted),
+        req?.headers?.["x-forwarded-for"] || req?.ip || "",
+        req?.headers?.["user-agent"] || ""
+      ]
+    );
+    if (!accepted) return res.status(403).json({ error: "Code résultat ou vérification incorrect." });
+    const analyses = await pool.query("SELECT * FROM laboratory_case_analyses WHERE case_id=$1 ORDER BY id ASC", [row.id]);
+    res.json({ result: row, analyses: analyses.rows });
+  } catch (error) {
+    console.error("ERREUR VERIFY LAB RESULT :", error);
+    res.status(500).json({ error: "Erreur consultation résultat laboratoire" });
+  }
+});
+
 app.get("/marketplace/cart", authenticateToken, async (req, res) => {
   try {
     res.json(await getMarketplaceCartPayload(req.user));
