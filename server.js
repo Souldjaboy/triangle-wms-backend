@@ -8278,6 +8278,9 @@ function canAdminMarketplace(user) {
 }
 
 async function getOrCreateMarketplaceCart(clientOrPool, user) {
+  const role = normalizeRole(user?.role);
+  const isCustomer = role === "customer";
+  const buyerCompanyId = isCustomer ? null : user.company_id || null;
   const existing = await clientOrPool.query(
     `SELECT *
      FROM marketplace_carts
@@ -8294,7 +8297,7 @@ async function getOrCreateMarketplaceCart(clientOrPool, user) {
      (user_id, company_id, buyer_company_id, customer_email, cart_type, status)
      VALUES ($1,$2,$2,$3,$4,'active')
      RETURNING *`,
-    [user.id, user.company_id || null, user.email || "", user.company_id ? "B2B" : "B2C"]
+    [user.id, buyerCompanyId, user.email || "", buyerCompanyId ? "B2B" : "B2C"]
   );
   return created.rows[0];
 }
@@ -9003,6 +9006,53 @@ app.put("/laboratory/analyses/:id", authenticateToken, async (req, res) => {
   }
 });
 
+app.delete("/laboratory/analyses/:id", authenticateToken, async (req, res) => {
+  try {
+    if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "Accès laboratoire refusé." });
+    const companyId = getEffectiveCompanyId(req);
+    const id = Number(req.params.id);
+
+    const used = await pool.query(
+      "SELECT 1 FROM laboratory_case_analyses WHERE analysis_id=$1 LIMIT 1",
+      [id]
+    );
+
+    if (used.rows[0]) {
+      const disabled = await pool.query(
+        `UPDATE laboratory_analyses
+         SET is_available=false, updated_at=CURRENT_TIMESTAMP
+         WHERE id=$1 AND (company_id=$2 OR company_id IS NULL)
+         RETURNING *`,
+        [id, companyId]
+      );
+      if (!disabled.rows[0]) return res.status(404).json({ error: "Analyse introuvable." });
+      return res.json({ message: "Analyse utilisée dans l’historique : elle a été désactivée.", analysis: disabled.rows[0] });
+    }
+
+    const deleted = await pool.query(
+      "DELETE FROM laboratory_analyses WHERE id=$1 AND company_id=$2 RETURNING *",
+      [id, companyId]
+    );
+
+    if (!deleted.rows[0]) {
+      const disabled = await pool.query(
+        `UPDATE laboratory_analyses
+         SET is_available=false, updated_at=CURRENT_TIMESTAMP
+         WHERE id=$1 AND company_id IS NULL
+         RETURNING *`,
+        [id]
+      );
+      if (!disabled.rows[0]) return res.status(404).json({ error: "Analyse introuvable." });
+      return res.json({ message: "Analyse standard désactivée pour éviter de casser les références.", analysis: disabled.rows[0] });
+    }
+
+    res.json({ message: "Analyse supprimée.", analysis: deleted.rows[0] });
+  } catch (error) {
+    console.error("ERREUR DELETE LAB ANALYSIS :", error);
+    res.status(500).json({ error: "Erreur suppression analyse" });
+  }
+});
+
 app.get("/laboratory/patients", authenticateToken, async (req, res) => {
   try {
     if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "Accès laboratoire refusé." });
@@ -9474,7 +9524,8 @@ app.post("/marketplace/cart/items", authenticateToken, async (req, res) => {
     );
     const product = productResult.rows[0];
     if (!product) return res.status(404).json({ error: "Produit marketplace introuvable" });
-    if (req.user.company_id && Number(req.user.company_id) === Number(product.company_id)) {
+    const buyerRole = normalizeRole(req.user?.role);
+    if (buyerRole !== "customer" && req.user.company_id && Number(req.user.company_id) === Number(product.company_id)) {
       return res.status(400).json({ error: "Une entreprise ne peut pas acheter ses propres produits marketplace." });
     }
     const availableStock = Number(product.effective_available || 0);
@@ -9516,7 +9567,7 @@ app.post("/marketplace/cart/items", authenticateToken, async (req, res) => {
     res.status(201).json(await getMarketplaceCartPayload(req.user));
   } catch (error) {
     console.error("ERREUR MARKETPLACE CART ADD :", error);
-    res.status(500).json({ error: "Erreur ajout panier marketplace" });
+    res.status(500).json({ error: error.detail || error.message || "Erreur ajout panier marketplace" });
   }
 });
 
