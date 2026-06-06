@@ -654,6 +654,14 @@ function isExternalPaymentMethod(method) {
   return ["Carte bancaire", "Orange Money", "Moov Money", "Wave", "Virement"].includes(String(method || ""));
 }
 
+function toBooleanFlag(value, defaultValue = false) {
+  if (value === true || value === false) return value;
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (["oui", "true", "1", "yes", "actif", "active"].includes(normalized)) return true;
+  if (["non", "false", "0", "no", "inactif", "inactive"].includes(normalized)) return false;
+  return defaultValue;
+}
+
 function providerKeyFromMethod(method) {
   const normalized = String(method || "").toLowerCase();
   if (normalized.includes("carte")) return "card";
@@ -901,6 +909,16 @@ async function createVerificationCode({ companyId, userId, targetType, targetVal
   const tokenHash = hashVerificationSecret(token);
 
   await pool.query(
+    `UPDATE verification_codes
+     SET used_at=NOW()
+     WHERE used_at IS NULL
+       AND ($1::int IS NULL OR user_id=$1)
+       AND target_type=$2
+       AND LOWER(target_value)=LOWER($3)`,
+    [userId || null, targetType, targetValue]
+  );
+
+  await pool.query(
     `INSERT INTO verification_codes
      (company_id, user_id, target_type, target_value, code_hash, token_hash, expires_at)
      VALUES ($1,$2,$3,$4,$5,$6,NOW() + INTERVAL '10 minutes')`,
@@ -968,12 +986,15 @@ async function sendVerificationMessage({ targetType, targetValue, code, verifyUr
 async function activateVerifiedAccount({ companyId, userId, targetType }) {
   const userColumn = targetType === "phone" ? "phone_verified" : "email_verified";
   const companyColumn = targetType === "phone" ? "phone_verified" : "email_verified";
+  const usersHasVerificationStatus = await columnExists("users", "verification_status");
+  const companiesHasVerificationStatus = await columnExists("companies", "verification_status");
 
   await pool.query(
     `UPDATE users
      SET ${userColumn}=true,
          account_status='active',
          verification_required=false,
+         ${usersHasVerificationStatus ? "verification_status='verified'," : ""}
          invitation_status=CASE WHEN invitation_status='pending_verification' THEN 'active' ELSE invitation_status END,
          updated_at=CURRENT_TIMESTAMP
      WHERE id=$1`,
@@ -984,6 +1005,7 @@ async function activateVerifiedAccount({ companyId, userId, targetType }) {
     `UPDATE companies
      SET ${companyColumn}=true,
          account_status='active',
+         ${companiesHasVerificationStatus ? "verification_status='verified'," : ""}
          subscription_status=COALESCE(NULLIF(subscription_status,''), 'trial'),
          updated_at=CURRENT_TIMESTAMP
      WHERE id=$1`,
@@ -2324,10 +2346,16 @@ app.post("/verification/verify", async (req, res) => {
       { target_type: verification.target_type }
     );
 
+    const loginPayload = verification.user_id
+      ? await buildLoginResponseForUser(verification.user_id)
+      : null;
+
     res.json({
       success: true,
       message: "Vérification réussie. Vous pouvez vous connecter.",
-      redirect: "/login"
+      redirect: loginPayload?.token ? "/dashboard" : "/login",
+      token: loginPayload?.token,
+      user: loginPayload?.user
     });
   } catch (error) {
     console.error("ERREUR VERIFICATION :", error);
@@ -8354,6 +8382,92 @@ function canAdminMarketplace(user) {
   return user?.is_super_admin === true || role === "super_admin" || role === "marketplace_admin";
 }
 
+const MARKETPLACE_ORDER_STATUSES = {
+  pending: "En attente",
+  pending_payment: "En attente",
+  confirmed: "Acceptée",
+  accepted: "Acceptée",
+  paid: "Paiement confirmé",
+  preparing: "En préparation",
+  ready: "Prête",
+  shipped: "Expédiée",
+  delivered: "Livrée",
+  closed: "Clôturée",
+  completed: "Clôturée",
+  cancelled: "Annulée",
+  canceled: "Annulée",
+  rejected: "Refusée",
+  refused: "Refusée",
+  received: "Clôturée"
+};
+
+const MARKETPLACE_PAYMENT_STATUSES = {
+  pending: "En attente",
+  "en attente": "En attente",
+  paid: "Payé",
+  paye: "Payé",
+  payé: "Payé",
+  failed: "Échoué",
+  cancelled: "Annulé",
+  canceled: "Annulé",
+  annule: "Annulé",
+  annulé: "Annulé",
+  partial: "Partiel",
+  partiel: "Partiel"
+};
+
+function normalizeMarketplaceOrderStatus(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const key = raw.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  return MARKETPLACE_ORDER_STATUSES[key] || MARKETPLACE_ORDER_STATUSES[raw.toLowerCase()] || raw;
+}
+
+function normalizeMarketplacePaymentStatus(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const key = raw.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  return MARKETPLACE_PAYMENT_STATUSES[key] || MARKETPLACE_PAYMENT_STATUSES[raw.toLowerCase()] || raw;
+}
+
+function isMarketplaceClosedStatus(value) {
+  const status = normalizeMarketplaceOrderStatus(value).toLowerCase();
+  return ["clôturée", "cloturee", "annulée", "annulee", "refusée", "refusee"].includes(
+    status.normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+  );
+}
+
+async function refreshMarketplaceOrderPaymentState(client, orderId) {
+  const paidResult = await client.query(
+    `SELECT COALESCE(SUM(amount),0)::numeric AS amount_paid
+     FROM marketplace_payments
+     WHERE order_id=$1
+       AND LOWER(status) IN ('payé','paye','paid')`,
+    [orderId]
+  );
+  const orderResult = await client.query("SELECT * FROM marketplace_orders WHERE id=$1 FOR UPDATE", [orderId]);
+  const order = orderResult.rows[0];
+  if (!order) throw new Error("Commande marketplace introuvable.");
+  const amountPaid = Number(paidResult.rows[0]?.amount_paid || 0);
+  const totalAmount = Number(order.total_amount || 0);
+  const amountDue = Math.max(totalAmount - amountPaid, 0);
+  const paymentStatus = amountDue <= 0 && totalAmount > 0 ? "Payé" : amountPaid > 0 ? "Partiel" : "En attente";
+  const nextStatus = normalizeMarketplaceOrderStatus(order.status || "En attente");
+  const updated = await client.query(
+    `UPDATE marketplace_orders
+     SET amount_paid=$1,
+         amount_due=$2,
+         payment_status=$3,
+         status=$4,
+         closed_at=CASE WHEN $4='Clôturée' THEN COALESCE(closed_at, CURRENT_TIMESTAMP) ELSE closed_at END,
+         updated_at=CURRENT_TIMESTAMP
+     WHERE id=$5
+     RETURNING *`,
+    [amountPaid, amountDue, paymentStatus, nextStatus, orderId]
+  );
+  return updated.rows[0];
+}
+
 async function getOrCreateMarketplaceCart(clientOrPool, user) {
   const role = normalizeRole(user?.role);
   const isCustomer = role === "customer";
@@ -8450,7 +8564,7 @@ async function finalizeMarketplaceOrder(client, orderId, user = {}) {
   const order = orderResult.rows[0];
   if (!order) throw new Error("Commande marketplace introuvable.");
 
-  if (["paid", "payé", "completed", "confirmée", "confirmed"].includes(String(order.payment_status || "").toLowerCase())) {
+  if (["paid", "payé", "paye"].includes(String(order.payment_status || "").toLowerCase())) {
     return order;
   }
 
@@ -8531,53 +8645,60 @@ async function finalizeMarketplaceOrder(client, orderId, user = {}) {
     );
   }
 
+  const paidSumResult = await client.query(
+    `SELECT COALESCE(SUM(amount),0)::numeric AS amount_paid
+     FROM marketplace_payments
+     WHERE order_id=$1
+       AND LOWER(status) IN ('payé','paye','paid')`,
+    [order.id]
+  );
+  const amountAlreadyPaid = Number(paidSumResult.rows[0]?.amount_paid || 0);
+  const totalToPay = Number(order.total_amount || 0);
+  const amountToComplete = Math.max(totalToPay - amountAlreadyPaid, 0);
+
   const paidOrder = await client.query(
     `UPDATE marketplace_orders
-     SET payment_status='paid',
-         status='paid',
+     SET payment_status='Payé',
+         status='Paiement confirmé',
+         amount_paid=$2,
+         amount_due=0,
          buyer_user_id=COALESCE(buyer_user_id, customer_user_id),
          seller_company_id=COALESCE(seller_company_id, vendor_company_id),
          updated_at=CURRENT_TIMESTAMP
      WHERE id=$1
      RETURNING *`,
-    [order.id]
+    [order.id, totalToPay]
   );
 
-  const paymentResult = await client.query(
-    `UPDATE marketplace_payments
-     SET amount=$1,
-         method=$2,
-         status='paid',
-         provider_reference=COALESCE(NULLIF(provider_reference,''), $3),
-         paid_at=CURRENT_TIMESTAMP,
-         updated_at=CURRENT_TIMESTAMP
-     WHERE order_id=$4
-     RETURNING *`,
-    [
-      Number(order.total_amount || 0),
-      order.payment_method || "Espèces",
-      order.order_number,
-      order.id
-    ]
-  );
-  let marketplacePayment = paymentResult.rows[0];
-  if (!marketplacePayment) {
+  let marketplacePayment = null;
+  if (amountToComplete > 0) {
     const createdPayment = await client.query(
       `INSERT INTO marketplace_payments
        (order_id, company_id, amount, currency, method, status, provider_reference,
         paid_at, created_by)
-       VALUES ($1,$2,$3,'FCFA',$4,'paid',$5,CURRENT_TIMESTAMP,$6)
+       VALUES ($1,$2,$3,'FCFA',$4,'Payé',$5,CURRENT_TIMESTAMP,$6)
        RETURNING *`,
       [
         order.id,
         order.vendor_company_id,
-        Number(order.total_amount || 0),
+        amountToComplete,
         order.payment_method || "Espèces",
         order.order_number,
         user.id || order.customer_user_id || null
       ]
     );
     marketplacePayment = createdPayment.rows[0];
+  } else {
+    const existingPayment = await client.query(
+      `SELECT *
+       FROM marketplace_payments
+       WHERE order_id=$1
+         AND LOWER(status) IN ('payé','paye','paid')
+       ORDER BY id DESC
+       LIMIT 1`,
+      [order.id]
+    );
+    marketplacePayment = existingPayment.rows[0] || null;
   }
 
   const accountingPayment = await client.query(
@@ -9714,8 +9835,8 @@ app.post("/marketplace/orders", authenticateToken, async (req, res) => {
           delivery_method, delivery_city, delivery_neighborhood, delivery_phone,
           delivery_note,
           order_type, status, payment_status, payment_method, subtotal,
-          delivery_fee, total_amount, notes)
-         VALUES ($1,$2,$2,$3,$4,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'pending','pending',$15,$16,$17,$18,$19)
+          delivery_fee, total_amount, amount_paid, amount_due, notes)
+         VALUES ($1,$2,$2,$3,$4,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'En attente','En attente',$15,$16,$17,0,$18,$19)
          RETURNING *`,
         [
           orderNumber,
@@ -9744,7 +9865,7 @@ app.post("/marketplace/orders", authenticateToken, async (req, res) => {
         `INSERT INTO marketplace_payments
          (order_id, company_id, amount, currency, method, status,
           provider_reference, created_by)
-         VALUES ($1,$2,$3,'FCFA',$4,'pending',$5,$6)`,
+         VALUES ($1,$2,$3,'FCFA',$4,'En attente',$5,$6)`,
         [
           order.id,
           Number(vendorCompanyId || 0),
@@ -10089,7 +10210,8 @@ app.put("/marketplace/vendor/orders/:id/status", authenticateToken, async (req, 
   try {
     if (!canManageMarketplaceVendor(req.user)) return res.status(403).json({ error: "Accès vendeur marketplace refusé." });
     const companyId = getEffectiveCompanyId(req);
-    const { status, payment_status } = req.body || {};
+    const requestedStatus = normalizeMarketplaceOrderStatus(req.body?.status);
+    const requestedPaymentStatus = normalizeMarketplacePaymentStatus(req.body?.payment_status);
     await client.query("BEGIN");
     const orderCheck = await client.query(
       "SELECT * FROM marketplace_orders WHERE id=$1 AND vendor_company_id=$2 FOR UPDATE",
@@ -10099,30 +10221,40 @@ app.put("/marketplace/vendor/orders/:id/status", authenticateToken, async (req, 
       await client.query("ROLLBACK");
       return res.status(404).json({ error: "Commande marketplace introuvable" });
     }
+    if (isMarketplaceClosedStatus(orderCheck.rows[0].status) && req.user.is_super_admin !== true) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "Commande clôturée. Seul le super admin peut la modifier." });
+    }
     let result;
-    if (["paid", "payé", "confirmée", "confirmed"].includes(String(payment_status || status || "").toLowerCase())) {
+    if (
+      requestedPaymentStatus === "Payé" ||
+      requestedStatus === "Paiement confirmé"
+    ) {
       result = await finalizeMarketplaceOrder(client, req.params.id, req.user);
-      if (status && !["paid", "payé", "confirmée", "confirmed"].includes(String(status).toLowerCase())) {
+      if (requestedStatus && requestedStatus !== "Paiement confirmé") {
         const statusUpdate = await client.query(
           `UPDATE marketplace_orders
            SET status=$1,
+               closed_at=CASE WHEN $1='Clôturée' THEN COALESCE(closed_at, CURRENT_TIMESTAMP) ELSE closed_at END,
                updated_at=CURRENT_TIMESTAMP
            WHERE id=$2
            RETURNING *`,
-          [status, req.params.id]
+          [requestedStatus === "Livrée" ? "Clôturée" : requestedStatus, req.params.id]
         );
         result = { ...result, ...statusUpdate.rows[0] };
       }
     } else {
+      const finalStatus = requestedStatus === "Livrée" ? "Clôturée" : requestedStatus;
       const update = await client.query(
         `UPDATE marketplace_orders
          SET status=COALESCE(NULLIF($1,''), status),
              payment_status=COALESCE(NULLIF($2,''), payment_status),
              vendor_message=COALESCE(NULLIF($3,''), vendor_message),
+             closed_at=CASE WHEN $1='Clôturée' THEN COALESCE(closed_at, CURRENT_TIMESTAMP) ELSE closed_at END,
              updated_at=CURRENT_TIMESTAMP
          WHERE id=$4
          RETURNING *`,
-        [status || "", payment_status || "", req.body?.vendor_message || "", req.params.id]
+        [finalStatus || "", requestedPaymentStatus || "", req.body?.vendor_message || "", req.params.id]
       );
       result = update.rows[0];
     }
@@ -10143,6 +10275,67 @@ app.put("/marketplace/vendor/orders/:id/status", authenticateToken, async (req, 
     await client.query("ROLLBACK");
     console.error("ERREUR VENDOR ORDER STATUS :", error);
     res.status(500).json({ error: error.detail || error.message || "Erreur statut commande marketplace" });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/marketplace/vendor/orders/:id/payments", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    if (!canManageMarketplaceVendor(req.user)) return res.status(403).json({ error: "Accès paiement marketplace refusé." });
+    const companyId = getEffectiveCompanyId(req);
+    const amount = Number(req.body?.amount || 0);
+    if (amount <= 0) return res.status(400).json({ error: "Montant paiement obligatoire." });
+
+    await client.query("BEGIN");
+    const orderResult = await client.query(
+      `SELECT *
+       FROM marketplace_orders
+       WHERE id=$1 AND vendor_company_id=$2
+       FOR UPDATE`,
+      [req.params.id, companyId]
+    );
+    const order = orderResult.rows[0];
+    if (!order) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Commande marketplace introuvable" });
+    }
+    if (isMarketplaceClosedStatus(order.status) && req.user.is_super_admin !== true) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "Commande clôturée. Paiement impossible sans super admin." });
+    }
+
+    const reference =
+      req.body?.provider_reference ||
+      `${order.order_number}-PAY-${Date.now().toString().slice(-6)}`;
+    await client.query(
+      `INSERT INTO marketplace_payments
+       (order_id, company_id, amount, currency, method, status,
+        provider_reference, notes, paid_at, created_by)
+       VALUES ($1,$2,$3,'FCFA',$4,'Payé',$5,$6,CURRENT_TIMESTAMP,$7)`,
+      [
+        order.id,
+        companyId,
+        amount,
+        req.body?.method || order.payment_method || "Espèces",
+        reference,
+        req.body?.notes || "Paiement partiel marketplace",
+        req.user.id
+      ]
+    );
+
+    const updated = await refreshMarketplaceOrderPaymentState(client, order.id);
+    await client.query("COMMIT");
+    res.status(201).json({
+      success: true,
+      message: updated.amount_due <= 0 ? "Commande payée entièrement." : "Paiement partiel enregistré.",
+      order: updated
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("ERREUR MARKETPLACE PARTIAL PAYMENT :", error);
+    res.status(500).json({ error: error.detail || error.message || "Erreur paiement marketplace" });
   } finally {
     client.release();
   }
@@ -10450,21 +10643,32 @@ app.post("/automobile/vehicles", authenticateToken, async (req, res) => {
     const {
       product_id, marque, modele, immatriculation, numero_chassis, annee,
       couleur, kilometrage, carburant, statut = "disponible",
-      prix_vente, prix_location_jour, prix_location_mois
+      boite_vitesse, nombre_places, etat_vehicule,
+      prix_vente, prix_location_jour, prix_location_semaine,
+      prix_location_mois, disponibilite,
+      is_sellable, is_rentable, publish_on_marketplace
     } = req.body || {};
     const result = await pool.query(
       `INSERT INTO vehicles
        (company_id, product_id, marque, modele, immatriculation, numero_chassis,
         annee, couleur, kilometrage, carburant, statut, prix_vente,
-        prix_location_jour, prix_location_mois, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+        prix_location_jour, prix_location_semaine, prix_location_mois,
+        boite_vitesse, nombre_places, etat_vehicule, disponibilite,
+        is_sellable, is_rentable, publish_on_marketplace, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
        RETURNING *`,
       [
         companyId, product_id || null, marque || "", modele || "",
         immatriculation || "", numero_chassis || "", annee || null,
         couleur || "", Number(kilometrage || 0), carburant || "", statut,
         Number(prix_vente || 0), Number(prix_location_jour || 0),
-        Number(prix_location_mois || 0), req.user.id
+        Number(prix_location_semaine || 0), Number(prix_location_mois || 0),
+        boite_vitesse || "", Number(nombre_places || 0), etat_vehicule || "",
+        disponibilite || statut || "disponible",
+        toBooleanFlag(is_sellable, true),
+        toBooleanFlag(is_rentable, false),
+        toBooleanFlag(publish_on_marketplace, false),
+        req.user.id
       ]
     );
     res.status(201).json(result.rows[0]);
@@ -10693,18 +10897,29 @@ app.post("/immobilier/properties", authenticateToken, async (req, res) => {
   try {
     if (!canManageBusinessModule(req.user)) return res.status(403).json({ error: "Accès modification immobilier refusé." });
     const companyId = getEffectiveCompanyId(req);
-    const { type, title, description, address, city, surface, rooms_count, price_sale, price_rent_day, price_rent_month, status } = req.body || {};
+    const {
+      type, title, description, address, city, neighborhood, surface,
+      rooms_count, beds_count, guests_count, price_sale, price_rent_day,
+      price_rent_month, price_night, status,
+      is_sellable, is_rentable, is_bookable, publish_on_marketplace
+    } = req.body || {};
     const result = await pool.query(
       `INSERT INTO properties
        (company_id, type, title, description, address, city, surface,
-        rooms_count, price_sale, price_rent_day, price_rent_month, status, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+        rooms_count, price_sale, price_rent_day, price_rent_month, status,
+        neighborhood, beds_count, guests_count, price_night,
+        is_sellable, is_rentable, is_bookable, publish_on_marketplace, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
        RETURNING *`,
       [
         companyId, type || "maison", title || "", description || "",
         address || "", city || "", Number(surface || 0), Number(rooms_count || 0),
         Number(price_sale || 0), Number(price_rent_day || 0),
-        Number(price_rent_month || 0), status || "disponible", req.user.id
+        Number(price_rent_month || 0), status || "disponible",
+        neighborhood || "", Number(beds_count || 0), Number(guests_count || 0),
+        Number(price_night || 0), toBooleanFlag(is_sellable, true),
+        toBooleanFlag(is_rentable, false), toBooleanFlag(is_bookable, false),
+        toBooleanFlag(publish_on_marketplace, false), req.user.id
       ]
     );
     res.status(201).json(result.rows[0]);
@@ -10981,17 +11196,18 @@ app.post("/restaurant/menu-items", authenticateToken, async (req, res) => {
   try {
     if (!canManageBusinessModule(req.user)) return res.status(403).json({ error: "Accès modification restaurant refusé." });
     const companyId = getEffectiveCompanyId(req);
-    const { product_id, name, description, category, price, image, is_available = true, preparation_time } = req.body || {};
+    const { product_id, name, description, category, price, image, is_available = true, preparation_time, publish_on_marketplace } = req.body || {};
     const result = await pool.query(
       `INSERT INTO restaurant_menu_items
        (company_id, product_id, name, description, category, price, image,
-        is_available, preparation_time, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+        is_available, preparation_time, publish_on_marketplace, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
        RETURNING *`,
       [
         companyId, product_id || null, name || "", description || "",
         category || "", Number(price || 0), image || "",
-        is_available !== false, Number(preparation_time || 0), req.user.id
+        toBooleanFlag(is_available, true), Number(preparation_time || 0),
+        toBooleanFlag(publish_on_marketplace, false), req.user.id
       ]
     );
     res.status(201).json(result.rows[0]);
