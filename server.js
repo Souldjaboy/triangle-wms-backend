@@ -9171,15 +9171,39 @@ app.post("/laboratory/analyses", authenticateToken, async (req, res) => {
   try {
     if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "Accès laboratoire refusé." });
     const companyId = getEffectiveCompanyId(req);
-    const { name, description = "", price = 0, result_delay = "", is_available = true, home_sampling_available = false, patient_instructions = "" } = req.body || {};
+    const {
+      name,
+      description = "",
+      price = 0,
+      result_delay = "",
+      estimated_duration = "",
+      is_available = true,
+      home_sampling_available = false,
+      on_site_available = true,
+      teleconsultation_available = false,
+      patient_instructions = ""
+    } = req.body || {};
     if (!name) return res.status(400).json({ error: "Nom analyse obligatoire." });
     const result = await pool.query(
       `INSERT INTO laboratory_analyses
        (company_id, name, description, price, result_delay, is_available,
-        home_sampling_available, patient_instructions)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        home_sampling_available, patient_instructions, estimated_duration,
+        on_site_available, teleconsultation_available)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
        RETURNING *`,
-      [companyId, name, description, Number(price || 0), result_delay, is_available, home_sampling_available, patient_instructions]
+      [
+        companyId,
+        name,
+        description,
+        Number(price || 0),
+        result_delay,
+        is_available,
+        home_sampling_available,
+        patient_instructions,
+        estimated_duration,
+        on_site_available,
+        teleconsultation_available
+      ]
     );
     res.status(201).json(result.rows[0]);
   } catch (error) {
@@ -9192,16 +9216,42 @@ app.put("/laboratory/analyses/:id", authenticateToken, async (req, res) => {
   try {
     if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "Accès laboratoire refusé." });
     const companyId = getEffectiveCompanyId(req);
-    const { name = "", description = "", price = 0, result_delay = "", is_available = true, home_sampling_available = false, patient_instructions = "" } = req.body || {};
+    const {
+      name = "",
+      description = "",
+      price = 0,
+      result_delay = "",
+      estimated_duration = "",
+      is_available = true,
+      home_sampling_available = false,
+      on_site_available = true,
+      teleconsultation_available = false,
+      patient_instructions = ""
+    } = req.body || {};
     const result = await pool.query(
       `UPDATE laboratory_analyses
        SET name=COALESCE(NULLIF($1,''), name), description=$2, price=$3,
            result_delay=$4, is_available=$5, home_sampling_available=$6,
            patient_instructions=$7, company_id=COALESCE(company_id,$8),
+           estimated_duration=$10, on_site_available=$11,
+           teleconsultation_available=$12,
            updated_at=CURRENT_TIMESTAMP
        WHERE id=$9 AND (company_id=$8 OR company_id IS NULL)
        RETURNING *`,
-      [name, description, Number(price || 0), result_delay, is_available, home_sampling_available, patient_instructions, companyId, req.params.id]
+      [
+        name,
+        description,
+        Number(price || 0),
+        result_delay,
+        is_available,
+        home_sampling_available,
+        patient_instructions,
+        companyId,
+        req.params.id,
+        estimated_duration,
+        on_site_available,
+        teleconsultation_available
+      ]
     );
     if (!result.rows[0]) return res.status(404).json({ error: "Analyse introuvable." });
     res.json(result.rows[0]);
@@ -9309,20 +9359,73 @@ app.post("/laboratory/appointments", authenticateToken, async (req, res) => {
     if (!companyId) {
       return res.status(400).json({ error: "Laboratoire obligatoire." });
     }
+    if (isCustomer) {
+      const labExists = await pool.query(
+        "SELECT 1 FROM laboratory_settings WHERE company_id=$1 AND is_published=true AND is_active=true LIMIT 1",
+        [companyId]
+      );
+      if (!labExists.rows[0]) {
+        return res.status(404).json({ error: "Laboratoire public introuvable." });
+      }
+    }
     const {
       patient_name = req.user?.fullname || "", patient_phone = req.user?.phone || "",
       patient_email = req.user?.email || "", analysis_id = null, analysis_name = "",
       requested_date = null, requested_time = "", home_sampling = false,
-      home_address = "", message = ""
+      home_address = "", message = "", service_type = "sur_place"
     } = req.body || {};
+    const rawAnalysisIds = Array.isArray(req.body?.analysis_ids)
+      ? req.body.analysis_ids
+      : analysis_id
+        ? [analysis_id]
+        : [];
+    const analysisIds = rawAnalysisIds
+      .map((id) => Number(id))
+      .filter((id) => Number.isInteger(id) && id > 0);
+
+    if (analysisIds.length === 0) {
+      return res.status(400).json({ error: "Veuillez choisir au moins une analyse." });
+    }
+
+    const selectedAnalyses = await pool.query(
+      `SELECT id, name, price
+       FROM laboratory_analyses
+       WHERE company_id=$1 AND is_available=true AND id=ANY($2::int[])
+       ORDER BY name ASC`,
+      [companyId, analysisIds]
+    );
+
+    if (selectedAnalyses.rows.length !== analysisIds.length) {
+      return res.status(400).json({ error: "Une analyse sélectionnée est indisponible pour ce laboratoire." });
+    }
+
+    const selectedNames = selectedAnalyses.rows.map((analysis) => analysis.name).join(", ");
+    const totalAmount = selectedAnalyses.rows.reduce((sum, analysis) => sum + Number(analysis.price || 0), 0);
     const result = await pool.query(
       `INSERT INTO laboratory_appointments
        (company_id, client_user_id, patient_name, patient_phone, patient_email,
         analysis_id, analysis_name, requested_date, requested_time,
-        home_sampling, home_address, message, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'En attente')
+        home_sampling, home_address, message, status, analysis_ids,
+        total_amount, service_type)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'En attente',$13,$14,$15)
        RETURNING *`,
-      [companyId, req.user?.id || null, patient_name, patient_phone, patient_email, analysis_id, analysis_name, requested_date || null, requested_time, home_sampling, home_address, message]
+      [
+        companyId,
+        req.user?.id || null,
+        patient_name,
+        patient_phone,
+        patient_email,
+        analysisIds[0],
+        analysis_name || selectedNames,
+        requested_date || null,
+        requested_time,
+        home_sampling || service_type === "domicile",
+        home_address,
+        message,
+        analysisIds,
+        totalAmount,
+        service_type
+      ]
     );
     res.status(201).json(result.rows[0]);
   } catch (error) {
