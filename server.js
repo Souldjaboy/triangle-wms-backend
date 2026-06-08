@@ -988,6 +988,8 @@ async function activateVerifiedAccount({ companyId, userId, targetType }) {
   const companyColumn = targetType === "phone" ? "phone_verified" : "email_verified";
   const usersHasVerificationStatus = await columnExists("users", "verification_status");
   const companiesHasVerificationStatus = await columnExists("companies", "verification_status");
+  const usersHasVerifiedAt = await columnExists("users", "verified_at");
+  const companiesHasVerifiedAt = await columnExists("companies", "verified_at");
 
   await pool.query(
     `UPDATE users
@@ -995,6 +997,7 @@ async function activateVerifiedAccount({ companyId, userId, targetType }) {
          account_status='active',
          verification_required=false,
          ${usersHasVerificationStatus ? "verification_status='verified'," : ""}
+         ${usersHasVerifiedAt ? "verified_at=COALESCE(verified_at, CURRENT_TIMESTAMP)," : ""}
          invitation_status=CASE WHEN invitation_status='pending_verification' THEN 'active' ELSE invitation_status END,
          updated_at=CURRENT_TIMESTAMP
      WHERE id=$1`,
@@ -1006,6 +1009,7 @@ async function activateVerifiedAccount({ companyId, userId, targetType }) {
      SET ${companyColumn}=true,
          account_status='active',
          ${companiesHasVerificationStatus ? "verification_status='verified'," : ""}
+         ${companiesHasVerifiedAt ? "verified_at=COALESCE(verified_at, CURRENT_TIMESTAMP)," : ""}
          subscription_status=COALESCE(NULLIF(subscription_status,''), 'trial'),
          updated_at=CURRENT_TIMESTAMP
      WHERE id=$1`,
@@ -2349,11 +2353,14 @@ app.post("/verification/verify", async (req, res) => {
     const loginPayload = verification.user_id
       ? await buildLoginResponseForUser(verification.user_id)
       : null;
+    const verifiedRole = normalizeRole(loginPayload?.user?.role);
 
     res.json({
       success: true,
       message: "Vérification réussie. Vous pouvez vous connecter.",
-      redirect: loginPayload?.token ? "/dashboard" : "/login",
+      redirect: loginPayload?.token
+        ? (verifiedRole === "customer" ? "/client/dashboard" : "/dashboard")
+        : "/login",
       token: loginPayload?.token,
       user: loginPayload?.user
     });
@@ -9295,7 +9302,13 @@ app.get("/laboratory/appointments", authenticateToken, async (req, res) => {
 
 app.post("/laboratory/appointments", authenticateToken, async (req, res) => {
   try {
-    const companyId = Number(req.body?.company_id || getEffectiveCompanyId(req));
+    const isCustomer = normalizeRole(req.user?.role) === "customer";
+    const companyId = isCustomer
+      ? Number(req.body?.company_id || 0)
+      : Number(req.body?.company_id || getEffectiveCompanyId(req));
+    if (!companyId) {
+      return res.status(400).json({ error: "Laboratoire obligatoire." });
+    }
     const {
       patient_name = req.user?.fullname || "", patient_phone = req.user?.phone || "",
       patient_email = req.user?.email || "", analysis_id = null, analysis_name = "",
@@ -9307,7 +9320,7 @@ app.post("/laboratory/appointments", authenticateToken, async (req, res) => {
        (company_id, client_user_id, patient_name, patient_phone, patient_email,
         analysis_id, analysis_name, requested_date, requested_time,
         home_sampling, home_address, message, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'pending')
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'En attente')
        RETURNING *`,
       [companyId, req.user?.id || null, patient_name, patient_phone, patient_email, analysis_id, analysis_name, requested_date || null, requested_time, home_sampling, home_address, message]
     );
@@ -9322,14 +9335,42 @@ app.put("/laboratory/appointments/:id/status", authenticateToken, async (req, re
   try {
     if (!canManageLaboratory(req.user)) return res.status(403).json({ error: "Accès laboratoire refusé." });
     const companyId = getEffectiveCompanyId(req);
-    const { status = "accepted", proposed_date = null, proposed_time = "", lab_response = "" } = req.body || {};
+    const {
+      status = "Confirmé",
+      proposed_date = null,
+      proposed_time = "",
+      lab_response = "",
+      laboratory_message = "",
+      message = ""
+    } = req.body || {};
+    const normalizedStatusMap = {
+      pending: "En attente",
+      accepted: "Confirmé",
+      confirmed: "Confirmé",
+      rejected: "Refusé",
+      refused: "Refusé",
+      postponed: "Reporté",
+      completed: "Terminé",
+      "en attente": "En attente",
+      confirmé: "Confirmé",
+      confirmée: "Confirmé",
+      refusé: "Refusé",
+      refusée: "Refusé",
+      reporté: "Reporté",
+      reportée: "Reporté",
+      terminé: "Terminé",
+      terminée: "Terminé"
+    };
+    const normalizedStatus =
+      normalizedStatusMap[String(status || "").toLowerCase()] || String(status || "Confirmé");
+    const responseMessage = laboratory_message || lab_response || message || "";
     const result = await pool.query(
       `UPDATE laboratory_appointments
        SET status=$1, proposed_date=$2, proposed_time=$3, lab_response=$4,
            updated_at=CURRENT_TIMESTAMP
        WHERE id=$5 AND company_id=$6
        RETURNING *`,
-      [status, proposed_date || null, proposed_time, lab_response, req.params.id, companyId]
+      [normalizedStatus, proposed_date || null, proposed_time, responseMessage, req.params.id, companyId]
     );
     if (!result.rows[0]) return res.status(404).json({ error: "Rendez-vous introuvable." });
     res.json(result.rows[0]);
@@ -9836,7 +9877,7 @@ app.post("/marketplace/orders", authenticateToken, async (req, res) => {
           delivery_note,
           order_type, status, payment_status, payment_method, subtotal,
           delivery_fee, total_amount, amount_paid, amount_due, notes)
-         VALUES ($1,$2,$2,$3,$4,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'En attente','En attente',$15,$16,$17,0,$18,$19)
+         VALUES ($1,$2,$2,$3,$4,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'En attente','En attente',$15,$16,$17,$18,0,$18,$19)
          RETURNING *`,
         [
           orderNumber,
@@ -9934,6 +9975,7 @@ app.post("/marketplace/orders", authenticateToken, async (req, res) => {
       orders.push(order);
     }
 
+    await client.query("DELETE FROM marketplace_cart_items WHERE cart_id=$1", [cart.id]);
     await client.query("UPDATE marketplace_carts SET status='ordered', updated_at=CURRENT_TIMESTAMP WHERE id=$1", [cart.id]);
     await client.query("COMMIT");
     res.status(201).json({ orders });
