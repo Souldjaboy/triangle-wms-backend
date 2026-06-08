@@ -8709,9 +8709,9 @@ async function refreshMarketplaceOrderPaymentState(client, orderId) {
     `UPDATE marketplace_orders
      SET amount_paid=$1,
          amount_due=$2,
-         payment_status=$3,
-         status=$4,
-         closed_at=CASE WHEN $4='Clôturée' THEN COALESCE(closed_at, CURRENT_TIMESTAMP) ELSE closed_at END,
+         payment_status=$3::text,
+         status=$4::text,
+         closed_at=CASE WHEN $4::text='Clôturée' THEN COALESCE(closed_at, CURRENT_TIMESTAMP) ELSE closed_at END,
          updated_at=CURRENT_TIMESTAMP
      WHERE id=$5
      RETURNING *`,
@@ -9059,7 +9059,7 @@ async function finalizeMarketplaceOrder(client, orderId, user = {}) {
     company_id: order.buyer_company_id || order.vendor_company_id,
     related_entity_type: "marketplace_order",
     related_entity_id: order.id,
-    action_url: `/client/orders/${order.id}`
+    action_url: order.buyer_company_id ? `/marketplace/orders/${order.id}` : `/client/orders/${order.id}`
   });
 
   return { ...paidOrder.rows[0], payment: marketplacePayment };
@@ -9163,7 +9163,7 @@ app.get("/marketplace/business", authenticateToken, async (req, res) => {
   try {
     const { q = "", category = "" } = req.query;
     const values = [req.user.company_id || 0];
-    let where = "WHERE (mp.status='published' OR mp.is_published=true) AND mp.is_b2b=true AND mp.company_id<>$1 AND p.is_sellable IS NOT FALSE AND p.is_active IS NOT FALSE";
+    let where = "WHERE (mp.status='published' OR mp.is_published=true) AND mp.is_b2b=true AND p.is_sellable IS NOT FALSE AND p.is_active IS NOT FALSE";
     if (q) {
       values.push(`%${q}%`);
       where += ` AND (COALESCE(NULLIF(mp.public_title,''), mp.title) ILIKE $${values.length} OR p.reference ILIKE $${values.length} OR p.name ILIKE $${values.length})`;
@@ -9177,7 +9177,9 @@ app.get("/marketplace/business", authenticateToken, async (req, res) => {
               COALESCE(NULLIF(mp.public_description,''), mp.description) AS description,
               COALESCE(NULLIF(mp.public_price,0), mp.price, 0) AS price,
               LEAST(COALESCE(p.stock,0), COALESCE(mp.available_quantity, mp.available_stock, 0)) AS display_stock,
-              p.reference, p.name AS product_name, c.name AS vendor_name
+              p.reference, p.name AS product_name, c.name AS vendor_name,
+              mp.company_id AS vendor_company_id,
+              (mp.company_id=$1) AS is_own_product
        FROM marketplace_products mp
        LEFT JOIN products p ON p.id=mp.product_id
        LEFT JOIN companies c ON c.id=mp.company_id
@@ -10317,7 +10319,7 @@ app.post("/marketplace/orders", authenticateToken, async (req, res) => {
         company_id: req.user.company_id || Number(vendorCompanyId || 0),
         related_entity_type: "marketplace_order",
         related_entity_id: order.id,
-        action_url: `/client/orders/${order.id}`,
+        action_url: req.user.company_id ? `/marketplace/orders/${order.id}` : `/client/orders/${order.id}`,
         created_by: req.user.id
       });
       orders.push(order);
@@ -10624,8 +10626,8 @@ app.put("/marketplace/vendor/orders/:id/status", authenticateToken, async (req, 
       if (requestedStatus && requestedStatus !== "Paiement confirmé") {
         const statusUpdate = await client.query(
           `UPDATE marketplace_orders
-           SET status=$1,
-               closed_at=CASE WHEN $1='Clôturée' THEN COALESCE(closed_at, CURRENT_TIMESTAMP) ELSE closed_at END,
+           SET status=$1::text,
+               closed_at=CASE WHEN $1::text='Clôturée' THEN COALESCE(closed_at, CURRENT_TIMESTAMP) ELSE closed_at END,
                updated_at=CURRENT_TIMESTAMP
            WHERE id=$2
            RETURNING *`,
@@ -10637,10 +10639,10 @@ app.put("/marketplace/vendor/orders/:id/status", authenticateToken, async (req, 
       const finalStatus = requestedStatus === "Livrée" ? "Clôturée" : requestedStatus;
       const update = await client.query(
         `UPDATE marketplace_orders
-         SET status=COALESCE(NULLIF($1,''), status),
-             payment_status=COALESCE(NULLIF($2,''), payment_status),
-             vendor_message=COALESCE(NULLIF($3,''), vendor_message),
-             closed_at=CASE WHEN $1='Clôturée' THEN COALESCE(closed_at, CURRENT_TIMESTAMP) ELSE closed_at END,
+         SET status=COALESCE(NULLIF($1::text,''), status::text),
+             payment_status=COALESCE(NULLIF($2::text,''), payment_status::text),
+             vendor_message=COALESCE(NULLIF($3::text,''), vendor_message::text),
+             closed_at=CASE WHEN $1::text='Clôturée' THEN COALESCE(closed_at, CURRENT_TIMESTAMP) ELSE closed_at END,
              updated_at=CURRENT_TIMESTAMP
          WHERE id=$4
          RETURNING *`,
@@ -10656,7 +10658,7 @@ app.put("/marketplace/vendor/orders/:id/status", authenticateToken, async (req, 
       company_id: result.buyer_company_id || result.vendor_company_id,
       related_entity_type: "marketplace_order",
       related_entity_id: result.id,
-      action_url: `/client/orders/${result.id}`,
+      action_url: result.buyer_company_id ? `/marketplace/orders/${result.id}` : `/client/orders/${result.id}`,
       created_by: req.user.id
     });
     await client.query("COMMIT");
