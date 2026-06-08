@@ -983,6 +983,52 @@ async function sendVerificationMessage({ targetType, targetValue, code, verifyUr
   return { sent: false, provider: process.env.SMS_PROVIDER, message: "Provider SMS préparé." };
 }
 
+async function sendPasswordResetMessage({ targetType, targetValue, code, resetUrl }) {
+  if (targetType === "email") {
+    if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
+      return {
+        sent: false,
+        provider: "smtp",
+        message: "SMTP non configuré. Configurez SMTP pour envoyer le code de réinitialisation."
+      };
+    }
+
+    const transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: Number(process.env.SMTP_PORT || 587),
+      secure: Number(process.env.SMTP_PORT || 587) === 465,
+      auth: {
+        user: process.env.SMTP_USER,
+        pass: process.env.SMTP_PASS
+      }
+    });
+
+    await transporter.sendMail({
+      from: process.env.SMTP_FROM || process.env.SMTP_USER,
+      to: targetValue,
+      subject: "Réinitialisation mot de passe Triangle WMS Pro",
+      text: `Votre code de réinitialisation Triangle WMS Pro est : ${code}. Il expire dans 15 minutes.\n\nLien sécurisé : ${resetUrl}`,
+      html: `
+        <div style="font-family:Arial,sans-serif;color:#111">
+          <h2>Réinitialisation mot de passe</h2>
+          <p>Votre code de réinitialisation est :</p>
+          <p style="font-size:28px;font-weight:700;letter-spacing:4px">${code}</p>
+          <p>Ce code expire dans 15 minutes.</p>
+          <p><a href="${escapeHtml(resetUrl)}">Créer un nouveau mot de passe</a></p>
+        </div>
+      `
+    });
+
+    return { sent: true, provider: process.env.EMAIL_PROVIDER || "smtp", message: "Code envoyé par email." };
+  }
+
+  return {
+    sent: false,
+    provider: process.env.SMS_PROVIDER || "sms",
+    message: "SMS/WhatsApp non configuré. Utilisez un email ou configurez un provider SMS."
+  };
+}
+
 async function activateVerifiedAccount({ companyId, userId, targetType }) {
   const userColumn = targetType === "phone" ? "phone_verified" : "email_verified";
   const companyColumn = targetType === "phone" ? "phone_verified" : "email_verified";
@@ -1770,6 +1816,205 @@ app.post("/register-saas", async (req, res) => {
       table: error.table || "",
       column: error.column || ""
     });
+  }
+});
+
+app.post("/password-reset/request", async (req, res) => {
+  try {
+    const identifier = String(req.body?.identifier || "").trim();
+    const accountType = String(req.body?.account_type || "auto").toLowerCase();
+
+    if (!identifier) {
+      return res.status(400).json({ error: "Email ou téléphone obligatoire." });
+    }
+
+    const usersHasPhone = await columnExists("users", "phone");
+    const looksLikeEmail = identifier.includes("@");
+    const normalizedPhone = identifier.replace(/[^0-9+]/g, "");
+    const targetType = looksLikeEmail ? "email" : "phone";
+    const targetValue = looksLikeEmail ? identifier.toLowerCase() : normalizedPhone;
+
+    if (targetType === "phone" && (!usersHasPhone || normalizedPhone.length < 6)) {
+      return res.status(400).json({ error: "Téléphone invalide." });
+    }
+
+    const result = await pool.query(
+      `SELECT id, email, phone, role, company_id, is_active
+       FROM users
+       WHERE ${looksLikeEmail ? "LOWER(email)=LOWER($1)" : "regexp_replace(COALESCE(phone,''), '[^0-9+]', '', 'g')=$1"}
+       ORDER BY id DESC
+       LIMIT 1`,
+      [targetValue]
+    );
+    const user = result.rows[0];
+    const genericMessage = "Si ce compte existe, un code de réinitialisation a été envoyé.";
+
+    if (!user) {
+      return res.json({ success: true, message: genericMessage });
+    }
+
+    const role = normalizeRole(user.role);
+    if (accountType === "client" && role !== "customer") {
+      return res.json({ success: true, message: genericMessage });
+    }
+    if (accountType === "enterprise" && role === "customer") {
+      return res.json({ success: true, message: genericMessage });
+    }
+    if (user.is_active === false) {
+      return res.status(403).json({ error: "Compte désactivé. Contactez un administrateur." });
+    }
+
+    const code = generateOtpCode();
+    const token = crypto.randomBytes(24).toString("hex");
+    const codeHash = await bcrypt.hash(code, BCRYPT_ROUNDS);
+    const tokenHash = hashVerificationSecret(token);
+
+    await pool.query(
+      `UPDATE password_reset_codes
+       SET used_at=NOW()
+       WHERE used_at IS NULL AND user_id=$1`,
+      [user.id]
+    );
+
+    const created = await pool.query(
+      `INSERT INTO password_reset_codes
+       (user_id, company_id, target_type, target_value, code_hash, token_hash, expires_at)
+       VALUES ($1,$2,$3,$4,$5,$6,NOW() + INTERVAL '15 minutes')
+       RETURNING id`,
+      [user.id, user.company_id || null, targetType, targetValue, codeHash, tokenHash]
+    );
+
+    const resetUrl = `${publicAppUrl()}/mot-de-passe-oublie?token=${token}`;
+    const delivery = await sendPasswordResetMessage({
+      targetType,
+      targetValue,
+      code,
+      resetUrl
+    });
+
+    if (!delivery.sent) {
+      return res.status(503).json({
+        error: delivery.message,
+        provider: delivery.provider
+      });
+    }
+
+    await logAudit(
+      { ...req, user: { id: user.id, company_id: user.company_id, role: user.role, email: user.email } },
+      "password_reset_requested",
+      "password_reset_code",
+      created.rows[0].id,
+      { target_type: targetType, provider: delivery.provider }
+    );
+
+    res.json({
+      success: true,
+      message: delivery.message || genericMessage,
+      target_type: targetType,
+      target_value: targetValue,
+      token_hint: token ? "" : undefined
+    });
+  } catch (error) {
+    console.error("ERREUR PASSWORD RESET REQUEST :", error);
+    res.status(500).json({ error: "Erreur demande réinitialisation mot de passe" });
+  }
+});
+
+app.post("/password-reset/confirm", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const {
+      token = "",
+      code = "",
+      identifier = "",
+      new_password = "",
+      confirm_password = ""
+    } = req.body || {};
+
+    if (!token && !code) {
+      return res.status(400).json({ error: "Code ou lien sécurisé obligatoire." });
+    }
+    if (String(new_password) !== String(confirm_password)) {
+      return res.status(400).json({ error: "Les deux mots de passe ne correspondent pas." });
+    }
+    const passwordError = validatePasswordStrength(new_password);
+    if (passwordError) return res.status(400).json({ error: passwordError });
+
+    const values = [];
+    let filter = "used_at IS NULL AND expires_at > NOW()";
+
+    if (token) {
+      values.push(hashVerificationSecret(token));
+      filter += ` AND token_hash=$${values.length}`;
+    } else {
+      const normalizedIdentifier = String(identifier || "").trim();
+      if (!normalizedIdentifier) {
+        return res.status(400).json({ error: "Email ou téléphone obligatoire avec le code." });
+      }
+      const targetValue = normalizedIdentifier.includes("@")
+        ? normalizedIdentifier.toLowerCase()
+        : normalizedIdentifier.replace(/[^0-9+]/g, "");
+      values.push(targetValue);
+      filter += ` AND LOWER(target_value)=LOWER($${values.length})`;
+    }
+
+    const result = await client.query(
+      `SELECT pr.*, u.email, u.role
+       FROM password_reset_codes pr
+       JOIN users u ON u.id=pr.user_id
+       WHERE ${filter}
+       ORDER BY pr.id DESC
+       LIMIT 1`,
+      values
+    );
+    const reset = result.rows[0];
+
+    if (!reset) {
+      return res.status(400).json({ error: "Code expiré ou introuvable." });
+    }
+
+    if (Number(reset.attempts || 0) >= 5) {
+      return res.status(429).json({ error: "Trop de tentatives. Demandez un nouveau code." });
+    }
+
+    if (code) {
+      const validCode = await bcrypt.compare(String(code || ""), reset.code_hash);
+      if (!validCode) {
+        await client.query("UPDATE password_reset_codes SET attempts=attempts+1 WHERE id=$1", [reset.id]);
+        return res.status(400).json({ error: "Code incorrect." });
+      }
+    }
+
+    await client.query("BEGIN");
+    await client.query("UPDATE users SET password=$1, updated_at=CURRENT_TIMESTAMP WHERE id=$2", [
+      await hashPassword(new_password),
+      reset.user_id
+    ]);
+    await client.query("UPDATE password_reset_codes SET used_at=NOW() WHERE id=$1", [reset.id]);
+    await client.query(
+      "UPDATE password_reset_codes SET used_at=NOW() WHERE used_at IS NULL AND user_id=$1 AND id<>$2",
+      [reset.user_id, reset.id]
+    );
+    await client.query("COMMIT");
+
+    await logAudit(
+      { ...req, user: { id: reset.user_id, company_id: reset.company_id, role: reset.role, email: reset.email } },
+      "password_reset_confirmed",
+      "user",
+      reset.user_id,
+      { target_type: reset.target_type }
+    );
+
+    res.json({
+      success: true,
+      message: "Mot de passe réinitialisé. Vous pouvez vous connecter."
+    });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("ERREUR PASSWORD RESET CONFIRM :", error);
+    res.status(500).json({ error: "Erreur confirmation réinitialisation mot de passe" });
+  } finally {
+    client.release();
   }
 });
 
