@@ -11,6 +11,13 @@ const crypto = require("crypto");
 const nodemailer = require("nodemailer");
 require("dotenv").config();
 
+let webPush = null;
+try {
+  webPush = require("web-push");
+} catch (error) {
+  webPush = null;
+}
+
 const app = express();
 
 const allowedOrigins = [
@@ -18,6 +25,12 @@ const allowedOrigins = [
   process.env.PUBLIC_BASE_URL,
   "https://trianglewmspro.com",
   "https://www.trianglewmspro.com",
+  "https://malilinkglobal.com",
+  "https://www.malilinkglobal.com",
+  "https://hafiyalab.com",
+  "https://www.hafiyalab.com",
+  "https://afia.trianglewmspro.com",
+  "https://malilink.trianglewmspro.com",
   "http://localhost:3000"
 ].filter(Boolean);
 
@@ -50,6 +63,8 @@ app.use((req, res, next) => {
 
   next();
 });
+
+app.use(requireTenant);
 
 if (!fs.existsSync("uploads")) {
   fs.mkdirSync("uploads");
@@ -208,6 +223,110 @@ if (!process.env.JWT_SECRET && process.env.NODE_ENV === "production") {
 const SUPER_ADMIN_EMAILS = new Set([
   "diallogcif@gmail.com"
 ]);
+
+const VALID_TENANTS = new Set(["triangle", "malilink", "hafiya"]);
+
+function normalizeTenantId(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]/g, "");
+  return VALID_TENANTS.has(normalized) ? normalized : "";
+}
+
+function getTenantFromRequest(req) {
+  const rawHeaderTenant =
+    req?.headers?.["x-tenant-id"] ||
+    req?.headers?.["x-app-product"] ||
+    req?.headers?.["x-product-id"] ||
+    req?.query?.tenant_id;
+  const headerTenant = normalizeTenantId(rawHeaderTenant);
+
+  if (headerTenant) return headerTenant;
+  if (rawHeaderTenant) return "__invalid__";
+
+  const host = String(
+    req?.headers?.host ||
+      req?.headers?.["x-forwarded-host"] ||
+      req?.hostname ||
+      ""
+  )
+    .split(",")[0]
+    .split(":")[0]
+    .toLowerCase();
+
+  if (host.includes("malilinkglobal.com") || host.includes("malilink.trianglewmspro.com")) {
+    return "malilink";
+  }
+  if (host.includes("hafiyalab.com") || host.includes("afia.trianglewmspro.com")) {
+    return "hafiya";
+  }
+  return normalizeTenantId(process.env.DEFAULT_TENANT_ID) || "triangle";
+}
+
+function requireTenant(req, res, next) {
+  const tenantId = getTenantFromRequest(req);
+  if (!VALID_TENANTS.has(tenantId)) {
+    return res.status(400).json({ error: "Tenant invalide." });
+  }
+
+  req.tenant_id = tenantId;
+  res.locals.tenant_id = tenantId;
+  next();
+}
+
+function parseCookieHeader(req) {
+  return String(req?.headers?.cookie || "")
+    .split(";")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .reduce((cookies, part) => {
+      const separatorIndex = part.indexOf("=");
+      if (separatorIndex === -1) return cookies;
+      const key = decodeURIComponent(part.slice(0, separatorIndex).trim());
+      const value = decodeURIComponent(part.slice(separatorIndex + 1).trim());
+      cookies[key] = value;
+      return cookies;
+    }, {});
+}
+
+function getAuthTokenFromRequest(req) {
+  const authHeader = req?.headers?.authorization || "";
+  const bearerToken = authHeader.startsWith("Bearer ") ? authHeader.split(" ")[1] : "";
+  if (bearerToken) return bearerToken;
+
+  const cookies = parseCookieHeader(req);
+  return cookies.auth_token || cookies.triangle_auth_token || "";
+}
+
+function setSecureAuthCookies(req, res, token, tenantId) {
+  const secure =
+    req?.secure === true ||
+    String(req?.headers?.["x-forwarded-proto"] || "").includes("https") ||
+    process.env.NODE_ENV === "production";
+  const options = {
+    httpOnly: true,
+    secure,
+    sameSite: "lax",
+    path: "/",
+    maxAge: 24 * 60 * 60 * 1000
+  };
+
+  res.cookie("auth_token", token, options);
+  res.cookie("tenant_id", tenantId, options);
+}
+
+async function companyBelongsToTenant(companyId, tenantId) {
+  if (!companyId || !tenantId) return true;
+  if (!(await columnExists("companies", "tenant_id"))) return true;
+
+  const result = await pool.query(
+    "SELECT tenant_id FROM companies WHERE id=$1 LIMIT 1",
+    [companyId]
+  );
+  const companyTenant = normalizeTenantId(result.rows[0]?.tenant_id) || "triangle";
+  return companyTenant === tenantId;
+}
 
 function getCompanyFilter(req) {
   const userIsSuperAdmin =
@@ -796,28 +915,43 @@ function getUserCompanyId(req) {
   return req.user?.company_id || null;
 }
 
-function authenticateToken(req, res, next) {
-  const authHeader = req.headers["authorization"];
-
-  const token = authHeader && authHeader.split(" ")[1];
-
+async function authenticateToken(req, res, next) {
+  const token = getAuthTokenFromRequest(req);
   if (!token) {
     return res.status(401).json({
       error: "Token manquant"
     });
   }
 
-  jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) {
+  try {
+    const user = jwt.verify(token, JWT_SECRET);
+    const requestTenant = getTenantFromRequest(req);
+    const tokenTenant = normalizeTenantId(user.tenant_id);
+
+    if (tokenTenant && tokenTenant !== requestTenant) {
       return res.status(403).json({
-        error: "Token invalide"
+        error: "Accès refusé : ce compte n’appartient pas à cette version."
       });
     }
 
-    req.user = user;
+    if (!(await companyBelongsToTenant(user.company_id, requestTenant))) {
+      return res.status(403).json({
+        error: "Accès refusé : entreprise non autorisée pour ce tenant."
+      });
+    }
+
+    req.user = {
+      ...user,
+      tenant_id: tokenTenant || requestTenant
+    };
+    req.tenant_id = requestTenant;
 
     next();
-  });
+  } catch (err) {
+    return res.status(403).json({
+      error: "Token invalide"
+    });
+  }
 }
 
 async function getCompanyPlanLimits(companyId) {
@@ -2062,6 +2196,14 @@ app.post("/login", async (req, res) => {
 
     if (!user) return res.status(401).json({ error: "Identifiant incorrect" });
 
+    const tenantId = getTenantFromRequest(req);
+
+    if (!(await companyBelongsToTenant(user.company_id, tenantId))) {
+      return res.status(403).json({
+        error: "Accès refusé : ce compte n’appartient pas à cette version."
+      });
+    }
+
     if (user.is_active === false) {
       return res.status(403).json({ error: "Compte désactivé" });
     }
@@ -2154,6 +2296,7 @@ app.post("/login", async (req, res) => {
         email: user.email,
         role: user.role,
         company_id: user.company_id,
+        tenant_id: tenantId,
         is_super_admin: isSuperAdmin,
         subscription_status: user.subscription_status || ""
       },
@@ -2178,6 +2321,8 @@ app.post("/login", async (req, res) => {
 
     const companyModules = isSuperAdmin ? await getCompanyModules(null) : await getCompanyModules(user.company_id);
 
+    setSecureAuthCookies(req, res, token, tenantId);
+
     res.json({
       message: "Connexion réussie",
       token,
@@ -2187,6 +2332,7 @@ app.post("/login", async (req, res) => {
         email: user.email,
         role: isSuperAdmin ? "super_admin" : user.role,
         company_id: user.company_id,
+        tenant_id: tenantId,
         company_name: user.company_name || "",
         company_status: user.company_status || "",
         is_super_admin: isSuperAdmin,
@@ -5941,6 +6087,249 @@ app.get("/pos/receipts/:id", authenticateToken, async (req, res) => {
   } catch (error) {
     console.error("ERREUR RECU POS :", error);
     res.status(500).json({ error: "Erreur lecture reçu" });
+  }
+});
+
+app.post("/pos/send-receipt-email", authenticateToken, async (req, res) => {
+  try {
+    if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
+      return res.status(503).json({
+        error: "Configuration SMTP manquante. Configurez SMTP_HOST, SMTP_USER et SMTP_PASS."
+      });
+    }
+
+    const { receipt_id, sale_id, recipient_email, subject = "", message = "" } = req.body || {};
+    const recipientEmail = String(recipient_email || "").trim();
+
+    if (!recipientEmail || !recipientEmail.includes("@")) {
+      return res.status(400).json({ error: "Email destinataire invalide." });
+    }
+
+    const companyId = getEffectiveCompanyId(req);
+    const isSuperAdmin = req.user.is_super_admin === true;
+    const shouldFilterByCompany = !isSuperAdmin || Boolean(companyId);
+    const values = [receipt_id || null, sale_id || null];
+    let companyFilter = "";
+    if (shouldFilterByCompany) {
+      values.push(companyId);
+      companyFilter = `AND r.company_id=$${values.length}`;
+    }
+
+    const receiptResult = await pool.query(
+      `SELECT r.*, s.sale_number, s.customer_name, s.customer_phone,
+              s.payment_method, s.payment_status, s.created_at AS sale_created_at
+       FROM receipts r
+       LEFT JOIN sales s ON s.id=r.sale_id
+       WHERE (($1::int IS NOT NULL AND r.id=$1) OR ($2::int IS NOT NULL AND r.sale_id=$2))
+       ${companyFilter}
+       ORDER BY r.id DESC
+       LIMIT 1`,
+      values
+    );
+
+    const receipt = receiptResult.rows[0];
+    if (!receipt) {
+      return res.status(404).json({ error: "Reçu introuvable." });
+    }
+
+    const companySettings = await getCompanySettingsForCompany(pool, receipt.company_id || companyId);
+    const rawReceiptData = receipt.receipt_data || {};
+    const receiptData =
+      typeof rawReceiptData === "string"
+        ? JSON.parse(rawReceiptData || "{}")
+        : rawReceiptData;
+    const items = Array.isArray(receiptData.items) ? receiptData.items : [];
+    const appName = companySettings?.company_name || receiptData.company_name || "Triangle WMS Pro";
+    const totalAmount = Number(receipt.total_amount || receiptData.total_amount || 0);
+    const emailSubject =
+      subject ||
+      `Reçu ${receipt.receipt_number || receipt.sale_number || ""} - ${appName}`;
+    const htmlItems = items
+      .map(
+        (item) => `<tr>
+          <td>${escapeHtml(item.product_name || item.name || "")}</td>
+          <td style="text-align:right">${Number(item.quantity || 0)}</td>
+          <td style="text-align:right">${Number(item.unit_price || item.price || 0).toLocaleString("fr-FR", { maximumFractionDigits: 0 })} FCFA</td>
+          <td style="text-align:right">${Number(item.total_price || item.total || 0).toLocaleString("fr-FR", { maximumFractionDigits: 0 })} FCFA</td>
+        </tr>`
+      )
+      .join("");
+    const html = `
+      <div style="font-family:Arial,sans-serif;color:#111827">
+        <h2>${escapeHtml(appName)}</h2>
+        <p>${escapeHtml(message || "Veuillez trouver ci-dessous votre reçu POS.")}</p>
+        <p><strong>Reçu :</strong> ${escapeHtml(receipt.receipt_number || "")}</p>
+        <p><strong>Vente :</strong> ${escapeHtml(receipt.sale_number || "")}</p>
+        <p><strong>Client :</strong> ${escapeHtml(receipt.customer_name || receiptData.customer_name || "Client comptoir")}</p>
+        <table width="100%" cellpadding="6" cellspacing="0" style="border-collapse:collapse;border:1px solid #e5e7eb">
+          <thead>
+            <tr style="background:#f9fafb">
+              <th align="left">Produit</th>
+              <th align="right">Qté</th>
+              <th align="right">Prix</th>
+              <th align="right">Total</th>
+            </tr>
+          </thead>
+          <tbody>${htmlItems || "<tr><td colspan=\"4\">Aucun article détaillé.</td></tr>"}</tbody>
+        </table>
+        <h3 style="text-align:right">Total : ${totalAmount.toLocaleString("fr-FR", { maximumFractionDigits: 0 })} FCFA</h3>
+      </div>`;
+
+    const logResult = await pool.query(
+      `INSERT INTO pos_receipt_email_logs
+       (tenant_id, company_id, sale_id, receipt_id, recipient_email, subject, status, sent_by)
+       VALUES ($1,$2,$3,$4,$5,$6,'pending',$7)
+       RETURNING id`,
+      [req.tenant_id || getTenantFromRequest(req), receipt.company_id || companyId, receipt.sale_id || null, receipt.id, recipientEmail, emailSubject, req.user.id || null]
+    );
+
+    const transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: Number(process.env.SMTP_PORT || 587),
+      secure: Number(process.env.SMTP_PORT || 587) === 465,
+      auth: {
+        user: process.env.SMTP_USER,
+        pass: process.env.SMTP_PASS
+      }
+    });
+
+    const info = await transporter.sendMail({
+      from: process.env.SMTP_FROM || process.env.SMTP_USER,
+      to: recipientEmail,
+      subject: emailSubject,
+      html
+    });
+
+    await pool.query(
+      `UPDATE pos_receipt_email_logs
+       SET status='sent',
+           provider_message_id=$1,
+           sent_at=CURRENT_TIMESTAMP
+       WHERE id=$2`,
+      [info.messageId || "", logResult.rows[0].id]
+    );
+
+    await logAudit(req, "email_pos_receipt", "receipt", receipt.id, {
+      recipient_email: recipientEmail,
+      message_id: info.messageId || ""
+    });
+
+    res.json({ message: "Reçu envoyé par email.", message_id: info.messageId || "" });
+  } catch (error) {
+    console.error("ERREUR EMAIL RECU POS :", error);
+    res.status(500).json({ error: error.message || "Erreur envoi reçu POS" });
+  }
+});
+
+app.post("/push/subscribe", authenticateToken, async (req, res) => {
+  try {
+    if (!process.env.WEB_PUSH_VAPID_PUBLIC_KEY || !process.env.WEB_PUSH_VAPID_PRIVATE_KEY) {
+      return res.status(503).json({
+        error: "Configuration Web Push manquante. Configurez WEB_PUSH_VAPID_PUBLIC_KEY et WEB_PUSH_VAPID_PRIVATE_KEY."
+      });
+    }
+
+    const { endpoint, keys = {} } = req.body || {};
+    if (!endpoint || !keys.p256dh || !keys.auth) {
+      return res.status(400).json({ error: "Abonnement push invalide." });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO push_subscriptions
+       (tenant_id, company_id, user_id, endpoint, p256dh, auth, user_agent, is_active)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,true)
+       ON CONFLICT (tenant_id, endpoint)
+       DO UPDATE SET
+         company_id=EXCLUDED.company_id,
+         user_id=EXCLUDED.user_id,
+         p256dh=EXCLUDED.p256dh,
+         auth=EXCLUDED.auth,
+         user_agent=EXCLUDED.user_agent,
+         is_active=true,
+         updated_at=CURRENT_TIMESTAMP
+       RETURNING id`,
+      [
+        req.tenant_id || getTenantFromRequest(req),
+        getEffectiveCompanyId(req),
+        req.user.id || null,
+        endpoint,
+        keys.p256dh,
+        keys.auth,
+        req?.headers?.["user-agent"] || ""
+      ]
+    );
+
+    res.status(201).json({ message: "Abonnement notification enregistré.", id: result.rows[0].id });
+  } catch (error) {
+    console.error("ERREUR PUSH SUBSCRIBE :", error);
+    res.status(500).json({ error: "Erreur abonnement notification" });
+  }
+});
+
+app.post("/push/test", authenticateToken, async (req, res) => {
+  try {
+    if (!process.env.WEB_PUSH_VAPID_PUBLIC_KEY || !process.env.WEB_PUSH_VAPID_PRIVATE_KEY) {
+      return res.status(503).json({
+        error: "Configuration Web Push manquante. Configurez WEB_PUSH_VAPID_PUBLIC_KEY et WEB_PUSH_VAPID_PRIVATE_KEY."
+      });
+    }
+
+    if (!webPush) {
+      return res.status(503).json({
+        error: "Module web-push non installé côté backend. Installez web-push avant d’envoyer des notifications réelles."
+      });
+    }
+
+    webPush.setVapidDetails(
+      process.env.WEB_PUSH_CONTACT || `mailto:${process.env.SMTP_FROM || process.env.SMTP_USER || "support@trianglewmspro.com"}`,
+      process.env.WEB_PUSH_VAPID_PUBLIC_KEY,
+      process.env.WEB_PUSH_VAPID_PRIVATE_KEY
+    );
+
+    const result = await pool.query(
+      `SELECT *
+       FROM push_subscriptions
+       WHERE tenant_id=$1
+         AND user_id=$2
+         AND is_active=true
+       ORDER BY id DESC
+       LIMIT 5`,
+      [req.tenant_id || getTenantFromRequest(req), req.user.id || null]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Aucun abonnement push actif pour cet utilisateur." });
+    }
+
+    const payload = JSON.stringify({
+      title: "Triangle WMS Pro",
+      message: "Notification test envoyée depuis le backend.",
+      url: "/notifications"
+    });
+
+    const deliveries = [];
+    for (const subscription of result.rows) {
+      try {
+        await webPush.sendNotification(
+          {
+            endpoint: subscription.endpoint,
+            keys: {
+              p256dh: subscription.p256dh,
+              auth: subscription.auth
+            }
+          },
+          payload
+        );
+        deliveries.push({ id: subscription.id, sent: true });
+      } catch (pushError) {
+        deliveries.push({ id: subscription.id, sent: false, error: pushError.message || String(pushError) });
+      }
+    }
+
+    res.json({ message: "Test Web Push terminé.", deliveries });
+  } catch (error) {
+    console.error("ERREUR PUSH TEST :", error);
+    res.status(500).json({ error: "Erreur test notification push" });
   }
 });
 
