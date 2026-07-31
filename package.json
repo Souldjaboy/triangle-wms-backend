@@ -4,7 +4,10 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "test:import": "node tests/import.test.js",
+    "test:import:real": "node tests/import-real.test.js",
+    "test:import:prod": "node tests/import-prod.test.js"
   },
   "keywords": [],
   "author": "",
@@ -18,12 +21,14 @@
     "express": "^5.2.1",
     "jsonwebtoken": "^9.0.3",
     "lucide-react": "^1.16.0",
+    "mammoth": "^1.8.0",
     "multer": "^2.1.1",
     "nodemailer": "^6.10.1",
     "nodemon": "^3.1.14",
     "openai": "^6.38.0",
     "pg": "^8.20.0",
     "qrcode": "^1.5.4",
-    "react-qr-scanner": "^1.0.0-alpha.11"
+    "react-qr-scanner": "^1.0.0-alpha.11",
+    "xlsx": "^0.18.5"
   }
 }

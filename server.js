@@ -17270,6 +17270,55 @@ app.post("/attendance/scan", async (req, res) => {
     });
   }
 });
+// ===================================================================
+// CENTRE D'IMPORTATION (moteur commun porté, adapté à Triangle WMS)
+// RBAC simplifié : gating par RÔLE (Triangle n'a pas le moteur RBAC
+// complet). Un utilisateur sans rôle autorisé reçoit 403.
+// ===================================================================
+function importRolePermission(moduleKey, action) {
+  return (req, res, next) => {
+    const role = normalizeRole(req.user && req.user.role);
+    const allowed =
+      isSuperAdminUser(req.user) ||
+      ["admin", "administrateur", "direction", "directeur", "comptable", "manager", "gerant"].includes(role);
+    if (!allowed) {
+      return res.status(403).json({ error: "Droit d'importation requis.", code: "PERMISSION_DENIED", module: moduleKey, action });
+    }
+    return next();
+  };
+}
+
+const createImportRouter = require("./routes/import");
+app.use(
+  "/import",
+  createImportRouter({
+    pool,
+    authenticateToken,
+    getEffectiveCompanyId,
+    isSuperAdminUser,
+    requirePermission: importRolePermission,
+    accounting: { nextAccountingNumber, createAccountingEntry },
+  })
+);
+
+const createAccountingRouter = require("./routes/accounting");
+app.use(
+  "/accounting",
+  createAccountingRouter({ pool, authenticateToken, getEffectiveCompanyId, isSuperAdminUser, requirePermission: importRolePermission })
+);
+
+const createFacturesCamionsRouter = require("./routes/factures-camions");
+app.use(
+  "/",
+  createFacturesCamionsRouter({
+    pool,
+    authenticateToken,
+    getEffectiveCompanyId,
+    requirePermission: importRolePermission,
+    accounting: { nextAccountingNumber, createAccountingEntry },
+  })
+);
+
 app.listen(5050, () => {
   console.log("Backend sécurisé démarré sur le port 5050");
 });
