@@ -7,7 +7,8 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "test:import": "node tests/import.test.js",
     "test:import:real": "node tests/import-real.test.js",
-    "test:import:prod": "node tests/import-prod.test.js"
+    "test:import:prod": "node tests/import-prod.test.js",
+    "test:import:triangle": "node tests/product-triangle.test.js"
   },
   "keywords": [],
   "author": "",
