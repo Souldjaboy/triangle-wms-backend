@@ -17369,6 +17369,17 @@ app.get("/products/search", authenticateToken, async (req, res) => {
 });
 
 // ===================================================================
+// WORKFLOWS STOCK MULTI-PRODUITS (PHASES 3-10)
+// Demandes entrée/sortie/transfert/inventaire, réception, documents, audit.
+// Le stock ne bouge qu'à la confirmation réelle (transactionnel, verrouillé).
+// ===================================================================
+const createStockWorkflowRouter = require("./routes/stock-workflow");
+app.use(
+  "/",
+  createStockWorkflowRouter({ pool, authenticateToken, getEffectiveCompanyId, requirePermission })
+);
+
+// ===================================================================
 // CENTRE D'IMPORTATION (moteur commun porté, adapté à Triangle WMS)
 // RBAC simplifié : gating par RÔLE (Triangle n'a pas le moteur RBAC
 // complet). Un utilisateur sans rôle autorisé reçoit 403.
