@@ -403,6 +403,27 @@ function canAccessDirectionModule(user) {
   );
 }
 
+
+/* Numéro de document COURT et lisible : PREFIX-AAMMJJ-NNN (ex. BR-260801-001).
+   Unique par entreprise + préfixe + jour. Séquence atomique (UPSERT) : deux
+   requêtes simultanées obtiennent deux numéros différents. Jamais Date.now(). */
+async function nextShortDocumentNumber(prefix, companyId, client = pool) {
+  const d = new Date();
+  const stamp = String(d.getFullYear()).slice(2) +
+    String(d.getMonth() + 1).padStart(2, "0") +
+    String(d.getDate()).padStart(2, "0");
+  const key = `${prefix}#${stamp}`;
+  const { rows } = await client.query(
+    `INSERT INTO stock_request_counters (company_id, year, prefix, last_seq)
+     VALUES ($1, $2, $3, 1)
+     ON CONFLICT (company_id, year, prefix)
+     DO UPDATE SET last_seq = stock_request_counters.last_seq + 1
+     RETURNING last_seq`,
+    [companyId || 0, d.getFullYear(), key]
+  );
+  return `${prefix}-${stamp}-${String(rows[0].last_seq).padStart(3, "0")}`;
+}
+
 const rbacTriangle = require("./rbac-triangle");
 const requirePermission = rbacTriangle.createRequirePermission(pool);
 
@@ -8771,7 +8792,7 @@ app.post("/documents", authenticateToken, async (req, res) => {
             ? "BR"
             : "BL";
 
-    const document_number = `${prefix}-${Date.now()}`;
+    const document_number = await nextShortDocumentNumber(prefix, getEffectiveCompanyId(req, req.user && req.user.company_id));
 
     const total_amount = (items || []).reduce((sum, item) => {
       return sum + Number(item.quantity || 0) * Number(item.unit_price || 0);
@@ -8949,7 +8970,7 @@ app.post("/documents/from-movement/:id", authenticateToken, async (req, res) => 
                   ? "INV"
                   : "BL";
 
-    const document_number = `${prefix}-${Date.now()}`;
+    const document_number = await nextShortDocumentNumber(prefix, getEffectiveCompanyId(req, req.user && req.user.company_id));
 
     const documentResult = await pool.query(
       `INSERT INTO documents
@@ -17376,7 +17397,36 @@ app.get("/products/search", authenticateToken, async (req, res) => {
 const createStockWorkflowRouter = require("./routes/stock-workflow");
 app.use(
   "/",
-  createStockWorkflowRouter({ pool, authenticateToken, getEffectiveCompanyId, requirePermission })
+  createStockWorkflowRouter({ pool, authenticateToken, getEffectiveCompanyId, requirePermission, createNotification, rbac: rbacTriangle })
+);
+
+// ===================================================================
+// DÉCAISSEMENTS + DIRECTION (PHASES 13-22) — réutilise disbursement_requests.
+// La trésorerie ne bouge qu'au décaissement réel (écritures équilibrées).
+// ===================================================================
+const multerDisb = require("multer");
+const fsDisb = require("fs");
+const pathDisb = require("path");
+const disbDir = pathDisb.join(__dirname, "uploads", "disbursements");
+fsDisb.mkdirSync(disbDir, { recursive: true });
+const disbUpload = multerDisb({
+  storage: multerDisb.diskStorage({
+    destination: (req, file, cb) => cb(null, disbDir),
+    filename: (req, file, cb) => cb(null, `just_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${pathDisb.extname(file.originalname || "").toLowerCase()}`),
+  }),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const ok = /\.(pdf|jpg|jpeg|png)$/i.test(file.originalname || "");
+    cb(ok ? null : new Error("Formats acceptés : PDF, JPG, JPEG, PNG."), ok);
+  },
+});
+const createDisbursementsRouter = require("./routes/disbursements");
+app.use(
+  "/",
+  createDisbursementsRouter({
+    pool, authenticateToken, getEffectiveCompanyId, requirePermission, createNotification,
+    accounting: { nextAccountingNumber, createAccountingEntry }, upload: disbUpload,
+  })
 );
 
 // ===================================================================

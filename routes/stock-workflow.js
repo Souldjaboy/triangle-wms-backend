@@ -23,10 +23,47 @@ const PREFIX = { entree: "DE", sortie: "DS", transfert: "TR", inventaire: "IN" }
 const TYPES = Object.keys(PREFIX);
 
 module.exports = function createStockWorkflowRouter(deps) {
-  const { pool, authenticateToken, getEffectiveCompanyId, requirePermission } = deps;
+  const { pool, authenticateToken, getEffectiveCompanyId, requirePermission, createNotification, rbac } = deps;
   const router = express.Router();
   const companyOf = (req) => getEffectiveCompanyId(req, req.user.company_id);
   const perm = (action) => requirePermission("stock", action);
+
+  /* Numéro COURT PREFIX-AAMMJJ-NNN, unique par entreprise + préfixe + jour.
+     Séquence atomique (UPSERT) : sûr en cas d'appels simultanés. */
+  async function shortDocNumber(client, prefix, companyId) {
+    const d = new Date();
+    const stamp = String(d.getFullYear()).slice(2) + String(d.getMonth() + 1).padStart(2, "0") + String(d.getDate()).padStart(2, "0");
+    const { rows } = await client.query(
+      `INSERT INTO stock_request_counters (company_id, year, prefix, last_seq) VALUES ($1,$2,$3,1)
+       ON CONFLICT (company_id, year, prefix) DO UPDATE SET last_seq = stock_request_counters.last_seq + 1
+       RETURNING last_seq`,
+      [companyId, d.getFullYear(), `${prefix}#${stamp}`]
+    );
+    return `${prefix}-${stamp}-${String(rows[0].last_seq).padStart(3, "0")}`;
+  }
+
+  /* PHASE 5 — notifications (moteur existant réutilisé, jamais bloquant). */
+  async function notifyUsers(userIds, payload) {
+    if (!createNotification) return;
+    for (const uid of [...new Set(userIds.filter(Boolean))]) {
+      try { await createNotification({ ...payload, user_id: uid }); } catch { /* non bloquant */ }
+    }
+  }
+  /* Destinataires = utilisateurs de l'entreprise pouvant VALIDER le stock
+     (permission explicite, sinon rôles de repli) — aucun nom codé en dur. */
+  async function validatorsOf(companyId) {
+    const { rows } = await pool.query(
+      `SELECT DISTINCT u.id FROM users u
+         LEFT JOIN user_permissions p ON p.user_id=u.id AND p.module_key='stock'
+        WHERE u.company_id=$1
+          AND (p.can_validate = TRUE
+               OR (p.can_validate IS NULL AND lower(u.role) IN
+                   ('admin','administrateur','super_admin','direction','directeur','gerant','manager',
+                    'chef_entrepot','responsable_entrepot')))`,
+      [companyId]
+    );
+    return rows.map((r) => r.id);
+  }
 
   async function audit(client, { companyId, userId, action, entity, entityId, reference, oldValue, newValue, ip }) {
     await client.query(
@@ -151,6 +188,13 @@ module.exports = function createStockWorkflowRouter(deps) {
       const { rows } = await client.query(`UPDATE stock_requests SET status=$3, updated_at=NOW() WHERE id=$1 AND company_id=$2 RETURNING *`, [cur.id, companyId, STATUS.PENDING]);
       await audit(client, { companyId, userId: req.user.id, action: "update", entity: "stock_request", entityId: cur.id, reference: cur.reference, oldValue: { status: cur.status }, newValue: { status: STATUS.PENDING }, ip: req.ip });
       await client.query("COMMIT");
+      // Notifie les utilisateurs habilités à valider.
+      await notifyUsers(await validatorsOf(companyId), {
+        company_id: companyId, type: "stock", title: "Demande stock à valider",
+        message: `La demande ${cur.reference} attend votre validation.`,
+        related_entity_type: "stock_request", related_entity_id: cur.id,
+        action_url: "/demandes-stock", created_by: req.user.id, priority: "high",
+      });
       res.json({ ...rows[0], stock_impacted: false });
     } catch (e) { await client.query("ROLLBACK").catch(() => {}); console.error(e); res.status(500).json({ error: "Erreur soumission." }); }
     finally { client.release(); }
@@ -179,6 +223,12 @@ module.exports = function createStockWorkflowRouter(deps) {
       );
       await audit(client, { companyId, userId: req.user.id, action: "validate", entity: "stock_request", entityId: cur.id, reference: cur.reference, oldValue: { status: cur.status }, newValue: { status: STATUS.VALIDATED }, ip: req.ip });
       await client.query("COMMIT");
+      await notifyUsers([cur.requested_by], {
+        company_id: companyId, type: "stock", title: "Demande stock validée",
+        message: `Votre demande ${cur.reference} a été validée. Le stock sera mis à jour à la réception.`,
+        related_entity_type: "stock_request", related_entity_id: cur.id,
+        action_url: "/demandes-stock", created_by: req.user.id,
+      });
       res.json({ ...rows[0], stock_impacted: false });
     } catch (e) { await client.query("ROLLBACK").catch(() => {}); console.error(e); res.status(500).json({ error: "Erreur validation." }); }
     finally { client.release(); }
@@ -204,6 +254,12 @@ module.exports = function createStockWorkflowRouter(deps) {
       );
       await audit(client, { companyId, userId: req.user.id, action: "reject", entity: "stock_request", entityId: cur.id, reference: cur.reference, oldValue: { status: cur.status }, newValue: { status: STATUS.REJECTED, reason }, ip: req.ip });
       await client.query("COMMIT");
+      await notifyUsers([cur.requested_by], {
+        company_id: companyId, type: "stock", title: "Demande stock refusée",
+        message: `Votre demande ${cur.reference} a été refusée. Motif : ${reason}`,
+        related_entity_type: "stock_request", related_entity_id: cur.id,
+        action_url: "/demandes-stock", created_by: req.user.id, priority: "high",
+      });
       res.json({ ...rows[0], stock_impacted: false });
     } catch (e) { await client.query("ROLLBACK").catch(() => {}); console.error(e); res.status(500).json({ error: "Erreur refus." }); }
     finally { client.release(); }
@@ -334,12 +390,9 @@ module.exports = function createStockWorkflowRouter(deps) {
         const existing = (await client.query(`SELECT * FROM stock_documents WHERE request_id=$1 LIMIT 1`, [cur.id])).rows[0];
         if (existing) doc = existing;
         else {
-          const year = new Date().getFullYear();
-          const seq = await client.query(
-            `INSERT INTO stock_request_counters (company_id, year, prefix, last_seq) VALUES ($1,$2,'BR',1)
-             ON CONFLICT (company_id, year, prefix) DO UPDATE SET last_seq = stock_request_counters.last_seq + 1 RETURNING last_seq`,
-            [companyId, year]
-          );
+          // Numéro COURT : BR-AAMMJJ-NNN / BS- / BT- (jamais Date.now()).
+          const docPrefix = type === "sortie" ? "BS" : type === "transfert" ? "BT" : "BR";
+          const docNumber = await shortDocNumber(client, docPrefix, companyId);
           const me = (await client.query(`SELECT fullname, role FROM users WHERE id=$1`, [req.user.id])).rows[0] || {};
           const now = new Date();
           const docType = type === "sortie" ? "sortie" : type === "transfert" ? "transfert" : "reception";
@@ -348,7 +401,7 @@ module.exports = function createStockWorkflowRouter(deps) {
                received_by_name, received_by_function, received_at_date, received_at_time,
                delivered_by_name, delivered_by_function, generated_by)
              VALUES ($1,$2,$3,$4,'BROUILLON',$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
-            [companyId, cur.id, `BR-${year}-${String(seq.rows[0].last_seq).padStart(5, "0")}`, docType,
+            [companyId, cur.id, docNumber, docType,
              me.fullname || null, me.role || null, now.toISOString().slice(0, 10), now.toTimeString().slice(0, 5),
              cur.supplier_name || null, cur.supplier_name ? "Fournisseur" : null, req.user.id]
           )).rows[0];
@@ -357,6 +410,16 @@ module.exports = function createStockWorkflowRouter(deps) {
 
       await audit(client, { companyId, userId: req.user.id, action: "receive", entity: "stock_request", entityId: cur.id, reference: cur.reference, oldValue: { status: cur.status }, newValue: { status: newStatus, lines: results.length }, ip: req.ip });
       await client.query("COMMIT");
+      const partial = newStatus === STATUS.PARTIAL;
+      await notifyUsers([cur.requested_by, ...(await validatorsOf(companyId))], {
+        company_id: companyId, type: "stock",
+        title: partial ? "Réception partielle" : "Réception confirmée",
+        message: partial
+          ? `Demande ${cur.reference} : ${results.length} ligne(s) reçue(s), un reliquat reste attendu.`
+          : `Demande ${cur.reference} : réception complète, stock mis à jour.`,
+        related_entity_type: "stock_request", related_entity_id: cur.id,
+        action_url: "/demandes-stock", created_by: req.user.id,
+      });
       res.json({ ok: true, status: newStatus, moved_lines: results.length, results, document: doc, stock_impacted: true });
     } catch (e) {
       await client.query("ROLLBACK").catch(() => {});
