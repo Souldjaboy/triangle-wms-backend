@@ -102,7 +102,7 @@ module.exports = function createDisbursementsRouter(deps) {
           company_id: companyId, type: "finance", title: "Demande de décaissement à valider",
           message: `${number} — ${amount} FCFA — ${String(b.reason).slice(0, 60)}`,
           related_entity_type: "disbursement_request", related_entity_id: rows[0].id,
-          action_url: "/direction", created_by: req.user.id, priority: "high",
+          action_url: `/direction?id=${rows[0].id}`, created_by: req.user.id, priority: "high",
         });
       }
       res.status(201).json({ ...rows[0], treasury_impacted: false });
@@ -148,7 +148,7 @@ module.exports = function createDisbursementsRouter(deps) {
       await notify(await usersWithCapability(companyId, "finance.direction", DIRECTION_ROLES), {
         company_id: companyId, type: "finance", title: "Demande de décaissement à valider",
         message: `${cur.request_number} — ${cur.amount} FCFA`, related_entity_type: "disbursement_request",
-        related_entity_id: cur.id, action_url: "/direction", created_by: req.user.id, priority: "high",
+        related_entity_id: cur.id, action_url: `/direction?id=${cur.id}`, created_by: req.user.id, priority: "high",
       });
       res.json({ ...rows[0], treasury_impacted: false });
     } catch (e) { await client.query("ROLLBACK").catch(() => {}); console.error(e); res.status(500).json({ error: "Erreur soumission." }); }
@@ -180,7 +180,7 @@ module.exports = function createDisbursementsRouter(deps) {
         company_id: companyId, type: "finance", title: "Décaissement à effectuer",
         message: `${cur.request_number} validée par la Direction — ${cur.amount} FCFA à décaisser.`,
         related_entity_type: "disbursement_request", related_entity_id: cur.id,
-        action_url: "/decaissements", created_by: req.user.id, priority: "high",
+        action_url: `/decaissements?id=${cur.id}`, created_by: req.user.id, priority: "high",
       });
       res.json({ ...rows[0], treasury_impacted: false });
     } catch (e) { await client.query("ROLLBACK").catch(() => {}); console.error(e); res.status(500).json({ error: "Erreur validation." }); }
@@ -213,7 +213,7 @@ module.exports = function createDisbursementsRouter(deps) {
         company_id: companyId, type: "finance", title: "Demande de décaissement refusée",
         message: `${cur.request_number} refusée. Motif : ${reason}`,
         related_entity_type: "disbursement_request", related_entity_id: cur.id,
-        action_url: "/decaissements", created_by: req.user.id, priority: "high",
+        action_url: `/decaissements?id=${cur.id}`, created_by: req.user.id, priority: "high",
       });
       res.json({ ...rows[0], treasury_impacted: false });
     } catch (e) { await client.query("ROLLBACK").catch(() => {}); console.error(e); res.status(500).json({ error: "Erreur refus." }); }
@@ -285,7 +285,7 @@ module.exports = function createDisbursementsRouter(deps) {
         company_id: companyId, type: "finance", title: "Décaissement effectué",
         message: `${cur.request_number} : ${real} FCFA décaissés. Justificatifs attendus.`,
         related_entity_type: "disbursement_request", related_entity_id: cur.id,
-        action_url: "/decaissements", created_by: req.user.id,
+        action_url: `/decaissements?id=${cur.id}`, created_by: req.user.id,
       });
       res.json({ ...rows[0], voucher_number: voucher, transaction_id: tx.rows[0].id, treasury_impacted: true });
     } catch (e) {
@@ -313,10 +313,141 @@ module.exports = function createDisbursementsRouter(deps) {
         company_id: companyId, type: "finance", title: "Justificatif déposé",
         message: `${rows[0].request_number} : justificatif à contrôler.`,
         related_entity_type: "disbursement_request", related_entity_id: rows[0].id,
-        action_url: "/decaissements", created_by: req.user.id,
+        action_url: `/decaissements?id=${cur.id}`, created_by: req.user.id,
       });
       res.json({ ...rows[0], treasury_impacted: false });
     } catch (e) { console.error(e); res.status(500).json({ error: "Erreur justificatif." }); }
+  });
+
+  /* Synthèse des montants d'une demande : décaissé / justifié / remboursé /
+     reste à justifier. Un justificatif REFUSÉ ne compte pas. */
+  async function amountsOf(companyId, requestId, client = pool) {
+    const req = (await client.query(`SELECT amount, amount_disbursed FROM disbursement_requests WHERE id=$1 AND company_id=$2`, [requestId, companyId])).rows[0];
+    if (!req) return null;
+    const justified = Number((await client.query(
+      `SELECT COALESCE(SUM(amount),0) s FROM disbursement_receipts
+        WHERE request_id=$1 AND company_id=$2 AND review_status <> 'REFUSE'`, [requestId, companyId]
+    )).rows[0].s) || 0;
+    const refunded = Number((await client.query(
+      `SELECT COALESCE(SUM(amount),0) s FROM disbursement_refunds WHERE request_id=$1 AND company_id=$2`, [requestId, companyId]
+    )).rows[0].s) || 0;
+    const disbursed = Number(req.amount_disbursed) || 0;
+    const remaining = Math.max(0, disbursed - justified - refunded);
+    return { disbursed, justified, refunded, remaining, fully_justified: remaining <= 0.009 };
+  }
+
+  // Détail complet : demande + justificatifs + remboursements + montants.
+  router.get("/disbursements/:id/details", authenticateToken, permRequest("view"), async (req, res) => {
+    try {
+      const companyId = companyOf(req);
+      const request = (await pool.query(`SELECT * FROM disbursement_requests WHERE id=$1 AND company_id=$2`, [req.params.id, companyId])).rows[0];
+      if (!request) return res.status(404).json({ error: "Demande introuvable." });
+      const receipts = (await pool.query(
+        `SELECT r.*, COALESCE(u.fullname,'') AS uploaded_by_name FROM disbursement_receipts r
+           LEFT JOIN users u ON u.id=r.uploaded_by
+          WHERE r.request_id=$1 AND r.company_id=$2 ORDER BY r.uploaded_at DESC`, [req.params.id, companyId]
+      )).rows;
+      const refunds = (await pool.query(`SELECT * FROM disbursement_refunds WHERE request_id=$1 AND company_id=$2 ORDER BY created_at DESC`, [req.params.id, companyId])).rows;
+      const history = (await pool.query(
+        `SELECT a.action, a.new_value, a.created_at, COALESCE(u.fullname,'') AS user_name FROM stock_audit_logs a
+           LEFT JOIN users u ON u.id=a.user_id
+          WHERE a.company_id=$1 AND a.entity='disbursement_request' AND a.entity_id=$2 ORDER BY a.created_at`, [companyId, req.params.id]
+      )).rows;
+      res.json({ request, receipts, refunds, amounts: await amountsOf(companyId, req.params.id), history });
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur détail." }); }
+  });
+
+  // Dépôt d'un justificatif AVEC montant (photo mobile, PDF, JPG, PNG).
+  router.post("/disbursements/:id/receipts", authenticateToken, permRequest("update"), receiptUpload, async (req, res) => {
+    try {
+      const companyId = companyOf(req);
+      const cur = (await pool.query(`SELECT * FROM disbursement_requests WHERE id=$1 AND company_id=$2`, [req.params.id, companyId])).rows[0];
+      if (!cur) return res.status(404).json({ error: "Demande introuvable." });
+      const url = req.file ? `/uploads/disbursements/${req.file.filename}` : (req.body?.file_url || null);
+      if (!url) return res.status(400).json({ error: "Aucun fichier (PDF, JPG, JPEG ou PNG)." });
+      const amount = Number(req.body?.amount) || 0;
+      const { rows } = await pool.query(
+        `INSERT INTO disbursement_receipts (company_id, request_id, file_url, file_name, mime_type, amount, label, uploaded_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+        [companyId, cur.id, url, req.file ? req.file.originalname : (req.body?.file_name || null),
+         req.file ? req.file.mimetype : null, amount, req.body?.label || null, req.user.id]
+      );
+      // Le premier justificatif fait avancer le statut + renseigne receipt_url (compat).
+      await pool.query(
+        `UPDATE disbursement_requests SET receipt_url=COALESCE(receipt_url,$3), receipt_uploaded_at=NOW(),
+           status=CASE WHEN status=$4 THEN $5 ELSE status END, updated_at=NOW()
+         WHERE id=$1 AND company_id=$2`,
+        [cur.id, companyId, url, S.WAITING_RECEIPTS, S.RECEIPTS_UPLOADED]
+      );
+      await notify(await usersWithCapability(companyId, "finance.disbursement", ACCOUNTING_ROLES), {
+        company_id: companyId, type: "finance", title: "Justificatif à contrôler",
+        message: `${cur.request_number} : justificatif de ${amount} FCFA déposé.`,
+        related_entity_type: "disbursement_request", related_entity_id: cur.id,
+        action_url: `/decaissements?id=${cur.id}`, created_by: req.user.id,
+      });
+      res.status(201).json({ receipt: rows[0], amounts: await amountsOf(companyId, cur.id), treasury_impacted: false });
+    } catch (e) { console.error("receipts:", e); res.status(500).json({ error: "Erreur justificatif." }); }
+  });
+
+  // Contrôle d'un justificatif par le comptable.
+  router.patch("/disbursement-receipts/:id/review", authenticateToken, permDisburse("validate"), async (req, res) => {
+    try {
+      const companyId = companyOf(req);
+      const decision = String(req.body?.review_status || "").toUpperCase();
+      if (!["ACCEPTE", "REFUSE", "COMPLEMENT"].includes(decision)) {
+        return res.status(400).json({ error: "Décision invalide (ACCEPTE, REFUSE ou COMPLEMENT)." });
+      }
+      const { rows } = await pool.query(
+        `UPDATE disbursement_receipts SET review_status=$3, review_comment=$4, reviewed_by=$5, reviewed_at=NOW()
+          WHERE id=$1 AND company_id=$2 RETURNING *`,
+        [req.params.id, companyId, decision, req.body?.comment || null, req.user.id]
+      );
+      if (!rows[0]) return res.status(404).json({ error: "Justificatif introuvable." });
+      await pool.query(`UPDATE disbursement_requests SET status=$3, updated_at=NOW() WHERE id=$1 AND company_id=$2 AND status=$4`,
+        [rows[0].request_id, companyId, S.IN_REVIEW, S.RECEIPTS_UPLOADED]);
+      res.json({ receipt: rows[0], amounts: await amountsOf(companyId, rows[0].request_id) });
+    } catch (e) { console.error(e); res.status(500).json({ error: "Erreur contrôle." }); }
+  });
+
+  /* REMBOURSEMENT du reliquat — crée une VRAIE entrée de trésorerie
+     + écritures équilibrées (jamais de solde modifié directement). */
+  router.post("/disbursements/:id/refund", authenticateToken, permDisburse("validate"), async (req, res) => {
+    const client = await pool.connect();
+    try {
+      const companyId = companyOf(req);
+      const amount = Number(req.body?.amount);
+      if (!(amount > 0)) return res.status(400).json({ error: "Montant de remboursement invalide." });
+      await client.query("BEGIN");
+      const cur = (await client.query(`SELECT * FROM disbursement_requests WHERE id=$1 AND company_id=$2 FOR UPDATE`, [req.params.id, companyId])).rows[0];
+      if (!cur) { await client.query("ROLLBACK"); return res.status(404).json({ error: "Demande introuvable." }); }
+      const before = await amountsOf(companyId, cur.id, client);
+      if (amount > before.remaining + 0.009) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: `Remboursement (${amount}) supérieur au reste à justifier (${before.remaining}).`, code: "OVER_REFUND" });
+      }
+      const num = await accounting.nextAccountingNumber(client, "accounting_transactions", "transaction_number", "REMB", companyId);
+      const tx = await client.query(
+        `INSERT INTO accounting_transactions (company_id, transaction_number, transaction_type, source_type, source_id,
+           amount, currency, direction, category, description, status, created_by, validated_by, validated_at, created_at, updated_at)
+         VALUES ($1,$2,'remboursement','disbursement_request',$3,$4,'FCFA','entrée','Remboursement reliquat',$5,'validé',$6,$6,NOW(),NOW(),NOW()) RETURNING id`,
+        [companyId, num, cur.id, amount, `Remboursement ${cur.request_number}`, req.user.id]
+      );
+      await client.query(`UPDATE treasury_accounts SET current_balance=COALESCE(current_balance,0)+$1, updated_by=$2, updated_at=NOW() WHERE company_id=$3`,
+        [amount, req.user.id, companyId]);
+      await accounting.createAccountingEntry(client, { companyId, sourceType: "disbursement_refund", sourceId: tx.rows[0].id,
+        accountLabel: "Caisse", debit: amount, credit: 0, description: `Remboursement ${cur.request_number}`, createdBy: req.user.id });
+      await accounting.createAccountingEntry(client, { companyId, sourceType: "disbursement_refund", sourceId: tx.rows[0].id,
+        accountLabel: "Charges / Décaissements", debit: 0, credit: amount, description: `Remboursement ${cur.request_number}`, createdBy: req.user.id });
+      const { rows } = await client.query(
+        `INSERT INTO disbursement_refunds (company_id, request_id, amount, method, reference, accounting_transaction_id, comment, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+        [companyId, cur.id, amount, req.body?.method || null, req.body?.reference || null, tx.rows[0].id, req.body?.comment || null, req.user.id]
+      );
+      await audit(client, companyId, req.user.id, "refund", cur.id, cur.request_number, { remaining: before.remaining }, { amount, transaction_id: tx.rows[0].id }, req.ip);
+      await client.query("COMMIT");
+      res.status(201).json({ refund: rows[0], amounts: await amountsOf(companyId, cur.id), treasury_impacted: true });
+    } catch (e) { await client.query("ROLLBACK").catch(() => {}); console.error("refund:", e); res.status(500).json({ error: "Erreur remboursement." }); }
+    finally { client.release(); }
   });
 
   // ---------- CLÔTURE (contrôle comptable) ----------
@@ -331,9 +462,14 @@ module.exports = function createDisbursementsRouter(deps) {
         await client.query("ROLLBACK");
         return res.status(409).json({ error: `Clôture impossible : demande ${cur.status}.`, code: "INVALID_STATE" });
       }
-      if (!cur.receipt_url && req.body?.force !== true) {
+      // Clôture autorisée seulement si tout est justifié (ou remboursé).
+      const amt = await amountsOf(companyId, cur.id, client);
+      if (amt && !amt.fully_justified && req.body?.force !== true) {
         await client.query("ROLLBACK");
-        return res.status(409).json({ error: "Aucun justificatif déposé : clôture refusée.", code: "RECEIPT_REQUIRED" });
+        return res.status(409).json({
+          error: `Clôture impossible : reste à justifier ${amt.remaining} FCFA (décaissé ${amt.disbursed}, justifié ${amt.justified}, remboursé ${amt.refunded}).`,
+          code: "NOT_FULLY_JUSTIFIED", amounts: amt,
+        });
       }
       const me = (await client.query(`SELECT fullname FROM users WHERE id=$1`, [req.user.id])).rows[0] || {};
       const { rows } = await client.query(
@@ -346,7 +482,7 @@ module.exports = function createDisbursementsRouter(deps) {
       await notify([cur.requester_id], {
         company_id: companyId, type: "finance", title: "Demande clôturée",
         message: `${cur.request_number} est clôturée.`, related_entity_type: "disbursement_request",
-        related_entity_id: cur.id, action_url: "/decaissements", created_by: req.user.id,
+        related_entity_id: cur.id, action_url: `/decaissements?id=${cur.id}`, created_by: req.user.id,
       });
       res.json({ ...rows[0], treasury_impacted: false });
     } catch (e) { await client.query("ROLLBACK").catch(() => {}); console.error(e); res.status(500).json({ error: "Erreur clôture." }); }
