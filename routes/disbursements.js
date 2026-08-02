@@ -23,7 +23,7 @@ const S = {
 
 module.exports = function createDisbursementsRouter(deps) {
   const { pool, authenticateToken, getEffectiveCompanyId, requirePermission,
-          createNotification, accounting, upload } = deps;
+          createNotification, accounting, upload, rbacHelper } = deps;
   const router = express.Router();
   const companyOf = (req) => getEffectiveCompanyId(req, req.user.company_id);
   // Permissions : finance.request (création/suivi), finance.direction (validation),
@@ -50,6 +50,32 @@ module.exports = function createDisbursementsRouter(deps) {
     return rows.map((r) => r.id);
   }
   const DIRECTION_ROLES = ["direction", "directeur", "admin", "super_admin", "gerant"];
+
+  /* Voit-il TOUTES les demandes de l'entreprise ? Oui si une permission de
+     Direction ou de Décaissement lui est accordée (explicitement ou par rôle).
+     Sinon : il ne voit que les siennes (finance.request.view_own implicite). */
+  async function canSeeAll(req) {
+    if (rbacHelper && rbacHelper.isSuperAdmin(req.user)) return true;
+    const perms = await pool.query(
+      `SELECT module_key, can_view FROM user_permissions WHERE user_id=$1 AND module_key IN ('finance.direction','finance.disbursement')`,
+      [req.user.id]
+    );
+    if (perms.rows.some((r) => r.can_view === true)) return true;
+    if (perms.rows.length > 0) return false; // configuré explicitement -> refus
+    const role = String(req.user.role || "").toLowerCase().trim();
+    return [...DIRECTION_ROLES, ...ACCOUNTING_ROLES].includes(role);
+  }
+
+  /* Garde de périmètre : une demande hors périmètre renvoie 404 (on ne révèle
+     pas son existence), même en changeant l'ID dans l'URL. */
+  async function loadScoped(req, id) {
+    const companyId = companyOf(req);
+    const { rows } = await pool.query(`SELECT * FROM disbursement_requests WHERE id=$1 AND company_id=$2`, [id, companyId]);
+    const row = rows[0];
+    if (!row) return null;
+    if (await canSeeAll(req)) return row;
+    return Number(row.requester_id) === Number(req.user.id) ? row : null;
+  }
   const ACCOUNTING_ROLES = ["comptable", "admin", "super_admin", "direction"];
 
   async function shortNumber(client, prefix, companyId) {
@@ -119,7 +145,10 @@ module.exports = function createDisbursementsRouter(deps) {
       const params = [companyOf(req)];
       let where = "company_id=$1";
       if (req.query.status) { params.push(req.query.status); where += ` AND status=$${params.length}`; }
-      if (req.query.mine === "1") { params.push(req.user.id); where += ` AND requester_id=$${params.length}`; }
+      // Périmètre : seuls les profils habilités (Direction / Comptabilité) voient
+      // TOUTES les demandes. Sinon l'utilisateur ne voit que les siennes.
+      const seeAll = await canSeeAll(req);
+      if (req.query.mine === "1" || !seeAll) { params.push(req.user.id); where += ` AND requester_id=$${params.length}`; }
       const { rows } = await pool.query(
         `SELECT * FROM disbursement_requests WHERE ${where} ORDER BY created_at DESC LIMIT 300`, params
       );
@@ -128,9 +157,9 @@ module.exports = function createDisbursementsRouter(deps) {
   });
 
   router.get("/disbursements/:id", authenticateToken, permRequest("view"), async (req, res) => {
-    const { rows } = await pool.query(`SELECT * FROM disbursement_requests WHERE id=$1 AND company_id=$2`, [req.params.id, companyOf(req)]);
-    if (!rows[0]) return res.status(404).json({ error: "Demande introuvable." });
-    res.json(rows[0]);
+    const row = await loadScoped(req, req.params.id);
+    if (!row) return res.status(404).json({ error: "Demande introuvable." });
+    res.json(row);
   });
 
   // ---------- SOUMISSION ----------
@@ -275,9 +304,11 @@ module.exports = function createDisbursementsRouter(deps) {
       const { rows } = await client.query(
         `UPDATE disbursement_requests SET status=$3, amount_disbursed=$4, disbursed_by=$5, disbursed_by_name=$6,
            disbursed_at=NOW(), payment_method=COALESCE($7, payment_method),
-           disbursement_comment=$8, updated_at=NOW() WHERE id=$1 AND company_id=$2 RETURNING *`,
+           disbursement_comment=$8, voucher_number=$9, updated_at=NOW() WHERE id=$1 AND company_id=$2 RETURNING *`,
         [cur.id, companyId, S.WAITING_RECEIPTS, real, req.user.id, me.fullname || null,
-         b.payment_method || null, `Bon ${voucher}${b.justification ? " — " + b.justification : ""}${b.payment_reference ? " — réf " + b.payment_reference : ""}`]
+         b.payment_method || null,
+         [b.justification, b.payment_reference ? `Réf. ${b.payment_reference}` : null].filter(Boolean).join(" — ") || null,
+         voucher]
       );
       await audit(client, companyId, req.user.id, "disburse", cur.id, cur.request_number, { status: cur.status }, { status: S.WAITING_RECEIPTS, amount: real, voucher, transaction_id: tx.rows[0].id }, req.ip);
       await client.query("COMMIT");
@@ -340,7 +371,7 @@ module.exports = function createDisbursementsRouter(deps) {
   router.get("/disbursements/:id/details", authenticateToken, permRequest("view"), async (req, res) => {
     try {
       const companyId = companyOf(req);
-      const request = (await pool.query(`SELECT * FROM disbursement_requests WHERE id=$1 AND company_id=$2`, [req.params.id, companyId])).rows[0];
+      const request = await loadScoped(req, req.params.id);
       if (!request) return res.status(404).json({ error: "Demande introuvable." });
       const receipts = (await pool.query(
         `SELECT r.*, COALESCE(u.fullname,'') AS uploaded_by_name FROM disbursement_receipts r

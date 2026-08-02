@@ -17425,7 +17425,7 @@ app.use(
   "/",
   createDisbursementsRouter({
     pool, authenticateToken, getEffectiveCompanyId, requirePermission, createNotification,
-    accounting: { nextAccountingNumber, createAccountingEntry }, upload: disbUpload,
+    accounting: { nextAccountingNumber, createAccountingEntry }, upload: disbUpload, rbacHelper: rbacTriangle,
   })
 );
 
