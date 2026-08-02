@@ -28,6 +28,10 @@ module.exports = function createStockWorkflowRouter(deps) {
   const companyOf = (req) => getEffectiveCompanyId(req, req.user.company_id);
   const perm = (action) => requirePermission("stock", action);
 
+  /* Date au format AAAA-MM-JJ à partir des composantes LOCALES : toISOString()
+     renvoie la date UTC et décalait le bon d'un jour en soirée. */
+  const localDate = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+
   /* Numéro COURT PREFIX-AAMMJJ-NNN, unique par entreprise + préfixe + jour.
      Séquence atomique (UPSERT) : sûr en cas d'appels simultanés. */
   async function shortDocNumber(client, prefix, companyId) {
@@ -402,7 +406,7 @@ module.exports = function createStockWorkflowRouter(deps) {
                delivered_by_name, delivered_by_function, generated_by)
              VALUES ($1,$2,$3,$4,'BROUILLON',$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
             [companyId, cur.id, docNumber, docType,
-             me.fullname || null, me.role || null, now.toISOString().slice(0, 10), now.toTimeString().slice(0, 5),
+             me.fullname || null, me.role || null, localDate(now), now.toTimeString().slice(0, 5),
              cur.supplier_name || null, cur.supplier_name ? "Fournisseur" : null, req.user.id]
           )).rows[0];
         }
@@ -432,7 +436,11 @@ module.exports = function createStockWorkflowRouter(deps) {
   router.get("/stock-documents/:id", authenticateToken, perm("view"), async (req, res) => {
     try {
       const companyId = companyOf(req);
-      const doc = (await pool.query(`SELECT * FROM stock_documents WHERE id=$1 AND company_id=$2`, [req.params.id, companyId])).rows[0];
+      // Les colonnes DATE sont renvoyées en TEXTE : évite toute conversion UTC
+      // côté client (le bon affichait la veille en soirée).
+      const doc = (await pool.query(
+        `SELECT *, received_at_date::text AS received_at_date, delivered_at_date::text AS delivered_at_date
+           FROM stock_documents WHERE id=$1 AND company_id=$2`, [req.params.id, companyId])).rows[0];
       if (!doc) return res.status(404).json({ error: "Document introuvable." });
       const request = doc.request_id ? await loadRequest(companyId, doc.request_id) : null;
       res.json({ document: doc, request });
