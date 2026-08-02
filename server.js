@@ -403,6 +403,12 @@ function canAccessDirectionModule(user) {
   );
 }
 
+const rbacTriangle = require("./rbac-triangle");
+const requirePermission = rbacTriangle.createRequirePermission(pool);
+
+/* Repli historique (utilisé UNIQUEMENT si aucune permission explicite n'est
+   configurée pour l'utilisateur). `responsable_entrepot` est ajouté : ce rôle
+   figure dans l'écran Permissions et devait pouvoir valider. */
 function canValidateStockMovement(user) {
   const role = normalizeRole(user?.role);
   return (
@@ -411,8 +417,26 @@ function canValidateStockMovement(user) {
     role === "super_admin" ||
     role === "chef_entrepot" ||
     role === "chef d'entrepôt" ||
-    role === "chef d'entrepot"
+    role === "chef d'entrepot" ||
+    role === "responsable_entrepot" ||
+    role === "responsable d'entrepôt" ||
+    role === "responsable d'entrepot"
   );
+}
+
+/**
+ * Validation d'un mouvement : la table `user_permissions` est la SOURCE DE
+ * VÉRITÉ (case « Valider » du module stock). Si aucune ligne explicite n'existe
+ * pour cet utilisateur, on retombe sur les rôles historiques ci-dessus.
+ * Corrige le bug : une case cochée n'était jamais consultée par le backend.
+ */
+async function canValidateStockMovementAsync(user) {
+  if (rbacTriangle.isSuperAdmin(user)) return true;
+  const perms = await rbacTriangle.loadUserPermissions(pool, user?.id);
+  const row = perms.get("stock") || null;
+  if (row && row.can_validate === true) return true;   // case cochée = autorisé
+  if (row && row.can_validate === false) return false;  // case décochée = refusé
+  return canValidateStockMovement(user);                // aucune config -> repli rôle
 }
 
 function isReadOnlyRole(user) {
@@ -3924,7 +3948,7 @@ app.put(
   authenticateToken,
   async (req, res) => {
     try {
-      if (!canValidateStockMovement(req.user)) {
+      if (!(await canValidateStockMovementAsync(req.user))) {
         return res.status(403).json({
           error: "Accès refusé : vous ne pouvez pas valider ce mouvement."
         });
@@ -4061,7 +4085,7 @@ app.put(
 
 app.put("/stock-movements/:id/reject", authenticateToken, async (req, res) => {
   try {
-    if (!canValidateStockMovement(req.user)) {
+    if (!(await canValidateStockMovementAsync(req.user))) {
       return res.status(403).json({
         error: "Accès refusé : vous ne pouvez pas refuser ce mouvement."
       });
@@ -17270,6 +17294,80 @@ app.post("/attendance/scan", async (req, res) => {
     });
   }
 });
+// ===================================================================
+// RBAC : permissions effectives de l'utilisateur courant.
+// PHASE 31 — propagation immédiate : le frontend interroge cet endpoint à
+// chaque chargement, il ne dépend donc PAS des permissions figées dans le JWT.
+// Une modification par le Super Admin est effective au rechargement suivant.
+// ===================================================================
+app.get("/me/permissions", authenticateToken, async (req, res) => {
+  try {
+    res.set("Cache-Control", "no-store");
+    res.json(await rbacTriangle.effectivePermissions(pool, req.user));
+  } catch (error) {
+    console.error("ERREUR /me/permissions :", error);
+    res.status(500).json({ error: "Erreur lecture permissions" });
+  }
+});
+
+// ===================================================================
+// PHASE 1 — RECHERCHE PRODUIT ULTRA-RAPIDE (serveur, paginée)
+// Ne charge JAMAIS tout le catalogue. Recherche multi-mots, insensible à la
+// casse ET aux accents (translate() : aucune extension PostgreSQL requise).
+// Chaque mot doit apparaître dans le texte recherchable (nom, référence, SKU,
+// code-barres, catégorie, description) — « plaf met d » trouve
+// « FAUX PLAFOND MÉTALLIQUE D ».
+// ===================================================================
+const ACCENTS_FROM = "áàâäãåéèêëíìîïóòôöõúùûüýÿçñÁÀÂÄÃÅÉÈÊËÍÌÎÏÓÒÔÖÕÚÙÛÜÝÇÑ";
+const ACCENTS_TO   = "aaaaaaeeeeiiiiooooouuuuyycnAAAAAAEEEEIIIIOOOOOUUUUYCN";
+
+app.get("/products/search", authenticateToken, async (req, res) => {
+  try {
+    const companyId = getEffectiveCompanyId(req, req.user.company_id);
+    const q = String(req.query.q || "").trim();
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 50);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+
+    // Texte recherchable normalisé (sans accents, minuscules).
+    const norm = (expr) => `lower(translate(coalesce(${expr},''), '${ACCENTS_FROM}', '${ACCENTS_TO}'))`;
+    const haystack = `(${norm("p.name")} || ' ' || ${norm("p.reference")} || ' ' || ${norm("p.sku")} || ' ' || ` +
+                     `${norm("p.barcode")} || ' ' || ${norm("p.category")} || ' ' || ${norm("p.description")})`;
+
+    const params = [companyId];
+    const conds = ["p.company_id = $1"];
+
+    // Multi-mots : chaque token doit être présent (ET logique).
+    const tokens = q.toLowerCase().split(/\s+/).filter(Boolean).slice(0, 8);
+    for (const token of tokens) {
+      const normalized = token.normalize("NFD").replace(/[̀-ͯ]/g, "");
+      params.push(`%${normalized}%`);
+      conds.push(`${haystack} LIKE $${params.length}`);
+    }
+    // Index du dernier token (pertinence : correspondance sur le nom d'abord).
+    const lastTokenIdx = tokens.length ? params.length : null;
+
+    params.push(limit, offset);
+    const relevance = lastTokenIdx ? `(${norm("p.name")} LIKE $${lastTokenIdx}) DESC, ` : "";
+    const sql =
+      `SELECT p.id, p.reference, p.name, p.category, p.unit, p.stock,
+              p.warehouse, p.location_code, p.barcode, p.sku, p.sale_price, p.minimum_stock
+         FROM products p
+        WHERE ${conds.join(" AND ")}
+        ORDER BY ${relevance}p.name ASC
+        LIMIT $${params.length - 1} OFFSET $${params.length}`;
+
+    const { rows } = await pool.query(sql, params);
+    const totalRow = await pool.query(
+      `SELECT COUNT(*)::int AS n FROM products p WHERE ${conds.join(" AND ")}`,
+      params.slice(0, params.length - 2)
+    );
+    res.json({ items: rows, total: totalRow.rows[0].n, limit, offset, query: q });
+  } catch (error) {
+    console.error("ERREUR RECHERCHE PRODUITS :", error);
+    res.status(500).json({ error: "Erreur recherche produits" });
+  }
+});
+
 // ===================================================================
 // CENTRE D'IMPORTATION (moteur commun porté, adapté à Triangle WMS)
 // RBAC simplifié : gating par RÔLE (Triangle n'a pas le moteur RBAC
