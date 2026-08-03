@@ -3994,12 +3994,6 @@ app.put(
       if (!movement)
         return res.status(404).json({ error: "Mouvement introuvable" });
 
-      if (!isSuperAdmin && Number(movement.created_by) === Number(req.user.id)) {
-        return res.status(403).json({
-          error: "Vous ne pouvez pas valider votre propre demande."
-        });
-      }
-
       if (movement.status !== "En attente") {
         return res.status(400).json({ error: "Mouvement déjà traité" });
       }
@@ -6378,11 +6372,8 @@ app.post("/push/test", authenticateToken, async (req, res) => {
   }
 });
 
-app.get("/pos/reports/daily", authenticateToken, async (req, res) => {
+app.get("/pos/reports/daily", authenticateToken, requirePermission("rapport", "view"), async (req, res) => {
   try {
-    if (!canAccessDirectionModule(req.user)) {
-      return res.status(403).json({ error: "Accès refusé : module réservé à la direction" });
-    }
 
     const companyId = getEffectiveCompanyId(req);
     const isSuperAdmin = req.user.is_super_admin === true;
@@ -6841,11 +6832,8 @@ app.post("/payments/webhook/wave", async (req, res) => {
   await handlePaymentWebhook(req, res, "wave");
 });
 
-app.get("/pos/reports/products", authenticateToken, async (req, res) => {
+app.get("/pos/reports/products", authenticateToken, requirePermission("rapport", "view"), async (req, res) => {
   try {
-    if (!canAccessDirectionModule(req.user)) {
-      return res.status(403).json({ error: "Accès refusé : module réservé à la direction" });
-    }
 
     const companyId = getEffectiveCompanyId(req);
     const isSuperAdmin = req.user.is_super_admin === true;
@@ -6870,11 +6858,8 @@ app.get("/pos/reports/products", authenticateToken, async (req, res) => {
   }
 });
 
-app.get("/pos/reports/payments", authenticateToken, async (req, res) => {
+app.get("/pos/reports/payments", authenticateToken, requirePermission("rapport", "view"), async (req, res) => {
   try {
-    if (!canAccessDirectionModule(req.user)) {
-      return res.status(403).json({ error: "Accès refusé : module réservé à la direction" });
-    }
 
     const companyId = getEffectiveCompanyId(req);
     const isSuperAdmin = req.user.is_super_admin === true;
@@ -8508,11 +8493,8 @@ app.put("/super-admin/modules/company/:companyId", authenticateToken, async (req
 });
 
 /* DOCUMENTS SAAS */
-app.get("/documents", authenticateToken, async (req, res) => {
+app.get("/documents", authenticateToken, requirePermission("document", "view"), async (req, res) => {
   try {
-    if (!canAccessDirectionModule(req.user)) {
-      return res.status(403).json({ error: "Accès refusé : module réservé à la direction" });
-    }
 
     const companyId = getEffectiveCompanyId(req);
     const isSuperAdmin = req.user.is_super_admin === true;
@@ -8541,11 +8523,8 @@ app.get("/documents", authenticateToken, async (req, res) => {
   }
 });
 
-app.get("/documents/:id", authenticateToken, async (req, res) => {
+app.get("/documents/:id", authenticateToken, requirePermission("document", "view"), async (req, res) => {
   try {
-    if (!canAccessDirectionModule(req.user)) {
-      return res.status(403).json({ error: "Accès refusé : module réservé à la direction" });
-    }
 
     const companyId = getEffectiveCompanyId(req);
     const isSuperAdmin = req.user.is_super_admin === true;
@@ -8651,11 +8630,8 @@ function renderDocumentHtml(document, items = [], companySettings = {}) {
   </html>`;
 }
 
-app.post("/documents/:id/email", authenticateToken, async (req, res) => {
+app.post("/documents/:id/email", authenticateToken, requirePermission("document", "view"), async (req, res) => {
   try {
-    if (!canAccessDirectionModule(req.user)) {
-      return res.status(403).json({ error: "Accès refusé : module réservé à la direction" });
-    }
 
     const { recipient_email, subject, message } = req.body || {};
     if (!recipient_email || !String(recipient_email).includes("@")) {
@@ -8732,11 +8708,8 @@ app.post("/documents/:id/email", authenticateToken, async (req, res) => {
   }
 });
 
-app.post("/reports/email", authenticateToken, async (req, res) => {
+app.post("/reports/email", authenticateToken, requirePermission("rapport", "create"), async (req, res) => {
   try {
-    if (!canAccessDirectionModule(req.user)) {
-      return res.status(403).json({ error: "Accès refusé : module réservé à la direction" });
-    }
     const { recipient_email = "", subject = "Rapport Triangle WMS Pro", html = "", message = "" } = req.body || {};
     if (!recipient_email || !String(recipient_email).includes("@")) {
       return res.status(400).json({ error: "Email destinataire invalide." });
@@ -8767,11 +8740,8 @@ app.post("/reports/email", authenticateToken, async (req, res) => {
   }
 });
 
-app.post("/documents", authenticateToken, async (req, res) => {
+app.post("/documents", authenticateToken, requirePermission("document", "create"), async (req, res) => {
   try {
-    if (!canAccessDirectionModule(req.user)) {
-      return res.status(403).json({ error: "Accès refusé : module réservé à la direction" });
-    }
 
     const {
       document_type,
@@ -8869,7 +8839,7 @@ app.post("/documents", authenticateToken, async (req, res) => {
   }
 });
 
-app.delete("/documents/:id", authenticateToken, async (req, res) => {
+app.delete("/documents/:id", authenticateToken, requirePermission("document", "delete"), async (req, res) => {
   try {
     if (!canAccessAdminSettings(req.user)) {
       return res.status(403).json({ error: "Accès refusé : réservé à l’administrateur" });
@@ -8900,11 +8870,8 @@ app.delete("/documents/:id", authenticateToken, async (req, res) => {
 });
 
 /* GÉNÉRER DOCUMENT DEPUIS MOUVEMENT STOCK */
-app.post("/documents/from-movement/:id", authenticateToken, async (req, res) => {
+app.post("/documents/from-movement/:id", authenticateToken, requirePermission("document", "create"), async (req, res) => {
   try {
-    if (!canAccessDirectionModule(req.user)) {
-      return res.status(403).json({ error: "Accès refusé : module réservé à la direction" });
-    }
 
     const { id } = req.params;
 

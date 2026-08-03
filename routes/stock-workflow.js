@@ -217,10 +217,6 @@ module.exports = function createStockWorkflowRouter(deps) {
         await client.query("ROLLBACK");
         return res.status(409).json({ error: `Impossible de valider : demande ${cur.status}.`, code: "ALREADY_PROCESSED", status: cur.status });
       }
-      if (cur.requested_by && Number(cur.requested_by) === Number(req.user.id) && req.body?.allow_self !== true) {
-        await client.query("ROLLBACK");
-        return res.status(403).json({ error: "Vous ne pouvez pas valider votre propre demande.", code: "SELF_VALIDATION" });
-      }
       const { rows } = await client.query(
         `UPDATE stock_requests SET status=$3, validated_by=$4, validated_at=NOW(), updated_at=NOW()
           WHERE id=$1 AND company_id=$2 RETURNING *`, [cur.id, companyId, STATUS.VALIDATED, req.user.id]
