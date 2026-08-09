@@ -10,14 +10,22 @@
 -- environnement neuf, rien n'est activé — c'est le comportement voulu, un
 -- administrateur active ensuite le module depuis l'écran Modules.
 --
--- Migration NON destructive : uniquement des INSERT idempotents. Aucune ligne
--- n'est supprimée, aucun module existant n'est désactivé.
+-- RÈGLE : cette migration ne fait que CRÉER des lignes manquantes.
+--   - ligne absente + données du module  -> création avec is_enabled = TRUE
+--   - ligne déjà présente                -> laissée telle quelle, quelle que
+--                                           soit sa valeur
+-- Elle ne réactive donc JAMAIS un module qu'un administrateur a volontairement
+-- désactivé, et ne désactive jamais rien. Migration NON destructive et
+-- rejouable : aucune ligne supprimée, aucune valeur existante modifiée.
+--
+-- Schéma company_modules (production) : id, company_id, module_key, is_enabled,
+-- updated_by, created_at, updated_at. Il n'existe pas de colonne « enabled ».
 
 BEGIN;
 
 -- Entreprises ayant déjà des données Ciment.
-INSERT INTO company_modules (company_id, module_key, is_enabled, enabled, created_at, updated_at)
-SELECT DISTINCT c.company_id, 'cement', TRUE, TRUE, NOW(), NOW()
+INSERT INTO company_modules (company_id, module_key, is_enabled, created_at, updated_at)
+SELECT DISTINCT c.company_id, 'cement', TRUE, NOW(), NOW()
   FROM (
         SELECT company_id FROM cement_products
         UNION SELECT company_id FROM cement_customers
@@ -32,8 +40,8 @@ SELECT DISTINCT c.company_id, 'cement', TRUE, TRUE, NOW(), NOW()
        );
 
 -- Entreprises ayant déjà des données Sable.
-INSERT INTO company_modules (company_id, module_key, is_enabled, enabled, created_at, updated_at)
-SELECT DISTINCT s.company_id, 'sand', TRUE, TRUE, NOW(), NOW()
+INSERT INTO company_modules (company_id, module_key, is_enabled, created_at, updated_at)
+SELECT DISTINCT s.company_id, 'sand', TRUE, NOW(), NOW()
   FROM (
         SELECT company_id FROM sand_products
         UNION SELECT company_id FROM sand_customers
@@ -46,19 +54,5 @@ SELECT DISTINCT s.company_id, 'sand', TRUE, TRUE, NOW(), NOW()
          SELECT 1 FROM company_modules m
           WHERE m.company_id = s.company_id AND m.module_key = 'sand'
        );
-
--- Une ligne présente mais désactivée par erreur bloquerait un module en service :
--- on réactive uniquement là où des données existent réellement.
-UPDATE company_modules m
-   SET is_enabled = TRUE, enabled = TRUE, updated_at = NOW()
- WHERE m.module_key = 'cement'
-   AND m.is_enabled IS DISTINCT FROM TRUE
-   AND EXISTS (SELECT 1 FROM cement_sales x WHERE x.company_id = m.company_id);
-
-UPDATE company_modules m
-   SET is_enabled = TRUE, enabled = TRUE, updated_at = NOW()
- WHERE m.module_key = 'sand'
-   AND m.is_enabled IS DISTINCT FROM TRUE
-   AND EXISTS (SELECT 1 FROM sand_sales x WHERE x.company_id = m.company_id);
 
 COMMIT;
