@@ -566,6 +566,26 @@ module.exports = function createSandSalesRouter({
           });
         }
 
+        /* Garde-fou : le prix envoyé doit être un prix AU M³, pas le prix du
+           palier. La confusion s'est déjà produite en production (VS-260807-001 :
+           170 000 saisi comme prix/m³ pour 10 m³ -> 1 700 000 au lieu de
+           170 000). On refuse explicitement au lieu d'enregistrer un montant
+           dix fois trop élevé. Le client peut forcer avec confirm_unit_price. */
+        if (tariff && req.body?.confirm_unit_price !== true) {
+          const refQty = Number(tariff.quantity_reference || 1) || 1;
+          const expected = Number(tariff.price) / refQty;
+          if (expected > 0 && unitPrice >= expected * refQty) {
+            await client.query("ROLLBACK");
+            return res.status(409).json({
+              error:`Prix au m³ suspect : ${unitPrice} FCFA/m³. Le tarif ${tariff.destination} est de ${Number(tariff.price)} FCFA pour ${refQty} m³, soit ${expected} FCFA/m³. Avez-vous saisi le prix du palier au lieu du prix au m³ ?`,
+              code:"UNIT_PRICE_LOOKS_LIKE_TIER_PRICE",
+              expected_unit_price:expected,
+              reference_price:Number(tariff.price),
+              reference_qty:refQty
+            });
+          }
+        }
+
         const sandSubtotal = quantity * unitPrice;
 
         const transportMode =
@@ -664,7 +684,8 @@ module.exports = function createSandSalesRouter({
             /* Palier tarifaire FIGÉ à la vente. Sans lui, le document devrait
                rejoindre le catalogue courant et changerait d'apparence au
                moindre changement de tarif. */
-            tariff ? Number(tariff.quantity_reference || 10) : 10
+            Number(req.body?.price_reference_qty || 0) ||
+              (tariff ? Number(tariff.quantity_reference || 10) : 10)
           ]
         );
 
@@ -860,10 +881,11 @@ module.exports = function createSandSalesRouter({
   // ==========================================================
   // SAND_READ_DETAIL_PAYMENTS_V1 (P0-2)
   // Détail vente / impayés / paiements idempotents / BL.
-  // Le tarif commercial de référence (10 m³ = 170 000 F) vit dans sand_prices ;
-  // sand_sales ne stocke que le prix au m³ dérivé. Toute route servant un
-  // document DOIT donc rejoindre sand_prices, sinon la colonne « Prix 10 m³ »
-  // est impossible à restituer.
+  // Tarif : sand_prices est le CATALOGUE COURANT — il sert uniquement à
+  // proposer un prix lors de la création d'une nouvelle opération. Un document
+  // déjà créé restitue « Prix 10 m³ » depuis ses propres valeurs historiques
+  // (unit_price au m³ × price_reference_qty figé), sans jamais relire le
+  // catalogue : une facture ne change pas si l'administrateur change le tarif.
   // ==========================================================
 
   const OPERATION_LABEL = "Vente de sable";
