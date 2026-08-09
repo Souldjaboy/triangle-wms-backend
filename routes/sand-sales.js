@@ -626,12 +626,13 @@ module.exports = function createSandSalesRouter({
              voucher_number,
              notes,
              status,
-             created_by
+             created_by,
+             price_reference_qty
            )
            VALUES(
              $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
              $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-             $21,$22,$23,$24,'BROUILLON',$25
+             $21,$22,$23,$24,'BROUILLON',$25,$26
            )
            RETURNING *`,
           [
@@ -659,7 +660,11 @@ module.exports = function createSandSalesRouter({
             String(req.body?.driver_name || "").trim() || null,
             String(req.body?.voucher_number || "").trim() || null,
             String(req.body?.notes || "").trim() || null,
-            req.user.id
+            req.user.id,
+            /* Palier tarifaire FIGÉ à la vente. Sans lui, le document devrait
+               rejoindre le catalogue courant et changerait d'apparence au
+               moindre changement de tarif. */
+            tariff ? Number(tariff.quantity_reference || 10) : 10
           ]
         );
 
@@ -866,28 +871,22 @@ module.exports = function createSandSalesRouter({
   /* Bloc tarifaire d'affichage : on retrouve le palier commercial appliqué à la
      vente. unit_price_m3 vient de la vente (valeur réellement facturée) ;
      quantity_reference / reference_price viennent du tarif de la destination. */
-  async function pricingFor(runner, companyId, sale) {
+  /* Bloc tarifaire d'un document EXISTANT : reconstruit uniquement à partir de
+     ses propres valeurs historiques (unit_price au m³ + palier figé). On ne
+     rejoint JAMAIS sand_prices ici : le catalogue est le tarif COURANT, il sert
+     à proposer un prix lors de la création d'une nouvelle opération, pas à
+     réafficher un document passé. Une facture de juillet garde donc son prix de
+     juillet même si le tarif change en août. */
+  function pricingFor(sale) {
     const unitPriceM3 = Number(sale.unit_price || 0);
-    const { rows } = await runner.query(
-      `SELECT quantity_reference, price
-         FROM sand_prices
-        WHERE company_id=$1
-          AND ($2::int IS NULL OR sand_product_id=$2)
-          AND LOWER(destination)=LOWER(COALESCE($3,''))
-          AND status='ACTIF'
-        ORDER BY id DESC LIMIT 1`,
-      [companyId, sale.sand_product_id || null, sale.destination || ""]
-    );
-    const t = rows[0];
-    const qtyRef = t ? Number(t.quantity_reference) : 10;
+    const qtyRef = Number(sale.price_reference_qty || 0) || 10;
     return {
       quantity_reference: qtyRef,
-      // Prix du palier réellement facturé : on le reconstruit depuis le prix au
-      // m³ de la vente pour rester cohérent même si le tarif a changé depuis.
       reference_price: Number((unitPriceM3 * qtyRef).toFixed(2)),
       unit_price_m3: unitPriceM3,
       destination: sale.destination || null,
       label: `Prix ${qtyRef} m³`,
+      historical: true,
     };
   }
 
@@ -923,7 +922,7 @@ module.exports = function createSandSalesRouter({
           invoice,
           delivery,
           operation: OPERATION_LABEL,
-          pricing: await pricingFor(pool, companyId, sale),
+          pricing: pricingFor(sale),
         });
       } catch (e) {
         console.error("GET sand sale:", e);
@@ -1108,14 +1107,11 @@ module.exports = function createSandSalesRouter({
           [proforma.id, companyId]
         )).rows;
 
-        // Palier commercial de la destination, pour la colonne « Prix 10 m³ ».
-        const tariff = (await pool.query(
-          `SELECT quantity_reference, price FROM sand_prices
-            WHERE company_id=$1 AND LOWER(destination)=LOWER(COALESCE($2,'')) AND status='ACTIF'
-            ORDER BY id DESC LIMIT 1`,
-          [companyId, proforma.destination || ""]
-        )).rows[0];
-        const qtyRef = tariff ? Number(tariff.quantity_reference) : 10;
+        /* Tarif HISTORIQUE de la proforma : palier figé à la création +
+           prix au m³ de la ligne. Aucune lecture du catalogue courant — sinon
+           une proforma de juillet afficherait le tarif d'août. */
+        const qtyRef = Number(proforma.price_reference_qty || 0) || 10;
+        const unitPriceM3 = Number(lines[0]?.unit_price || 0);
 
         res.json({
           proforma,
@@ -1123,9 +1119,10 @@ module.exports = function createSandSalesRouter({
           operation: OPERATION_LABEL,
           pricing: {
             quantity_reference: qtyRef,
-            reference_price: tariff ? Number(tariff.price) : null,
-            unit_price_m3: tariff && qtyRef > 0 ? Number(tariff.price) / qtyRef : null,
+            reference_price: Number((unitPriceM3 * qtyRef).toFixed(2)),
+            unit_price_m3: unitPriceM3,
             destination: proforma.destination || null,
+            historical: true,
             label: `Prix ${qtyRef} m³`,
           },
         });
@@ -1193,14 +1190,17 @@ module.exports = function createSandSalesRouter({
           `INSERT INTO sand_proformas
              (company_id, customer_id, proforma_number, proforma_date, valid_until,
               customer_name, customer_phone, customer_address, destination,
-              subtotal, discount, tax_amount, total_amount, status, notes, created_by)
+              subtotal, discount, tax_amount, total_amount, status, notes, created_by,
+              price_reference_qty)
            VALUES ($1,$2,$3,COALESCE($4::date,CURRENT_DATE),$5::date,$6,$7,$8,$9,
-                   $10,$11,$12,$13,'BROUILLON',$14,$15)
+                   $10,$11,$12,$13,'BROUILLON',$14,$15,$16)
            RETURNING *`,
           [companyId, customer?.id || null, number, b.proforma_date || null, b.valid_until || null,
            customer?.name || b.customer_name || null, customer?.phone || b.customer_phone || null,
            customer?.address || b.customer_address || null, destination,
-           subtotal, discount, taxAmount, total, b.notes || null, req.user.id]
+           subtotal, discount, taxAmount, total, b.notes || null, req.user.id,
+           /* Palier figé : la proforma ne dépendra plus du catalogue courant. */
+           qtyRef]
         )).rows[0];
 
         // Ligne unique « Sable » : le métier n'a qu'un article.
@@ -1462,6 +1462,7 @@ module.exports = function createSandSalesRouter({
         const companyId = companyOf(req);
         const invoice = (await pool.query(
           `SELECT i.*, s.sale_number, s.quantity_m3, s.unit_price, s.sand_product_id,
+                  s.price_reference_qty,
                   s.destination AS sale_destination, s.notes AS sale_notes,
                   s.customer_address AS sale_customer_address,
                   COALESCE(c.name, s.customer_name) AS client_name,
@@ -1478,9 +1479,10 @@ module.exports = function createSandSalesRouter({
           invoice,
           operation: OPERATION_LABEL,
           // Palier commercial : « Prix 10 m³ », jamais le prix au m³.
-          pricing: await pricingFor(pool, companyId, {
+          // Valeurs historiques portées par la VENTE liée à la facture.
+          pricing: pricingFor({
             unit_price: invoice.unit_price,
-            sand_product_id: invoice.sand_product_id,
+            price_reference_qty: invoice.price_reference_qty,
             destination: invoice.sale_destination || invoice.destination,
           }),
         });
