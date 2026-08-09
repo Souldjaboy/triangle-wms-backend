@@ -114,11 +114,12 @@ module.exports = function createDisbursementsRouter(deps) {
       const status = b.submit === true ? S.WAITING_DIR : S.DRAFT;
       const { rows } = await client.query(
         `INSERT INTO disbursement_requests
-           (company_id, request_number, requester_id, requester_name, requester_role, amount, category,
+           (company_id, request_number, requester_id, requester_name, requester_role, beneficiary_name, amount, category,
             urgency, reason, status, payment_method, initial_attachment_url)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
-        [companyId, number, req.user.id, me.fullname || null, me.role || null, amount,
-         b.category || null, b.urgency || "normale", String(b.reason).trim(), status,
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+        [companyId, number, req.user.id, me.fullname || null, me.role || null,
+         String(b.beneficiary_name || "").trim() || null,
+         amount, b.category || null, b.urgency || "normale", String(b.reason).trim(), status,
          b.payment_method || null, b.initial_attachment_url || null]
       );
       await audit(client, companyId, req.user.id, "create", rows[0].id, number, null, { status, amount }, req.ip);
@@ -282,7 +283,7 @@ module.exports = function createDisbursementsRouter(deps) {
         `INSERT INTO accounting_transactions (company_id, transaction_number, transaction_type, source_type, source_id,
            amount, currency, direction, category, partner_name, description, status, created_by, validated_by, validated_at, created_at, updated_at)
          VALUES ($1,$2,'decaissement','disbursement_request',$3,$4,'FCFA','sortie',$5,$6,$7,'validé',$8,$8,NOW(),NOW(),NOW()) RETURNING id`,
-        [companyId, num, cur.id, real, cur.category || "Décaissement", b.beneficiary || cur.requester_name || null,
+        [companyId, num, cur.id, real, cur.category || "Décaissement", cur.beneficiary_name || null,
          `Décaissement ${cur.request_number} — ${String(cur.reason || "").slice(0, 80)}`, req.user.id]
       );
       await client.query(

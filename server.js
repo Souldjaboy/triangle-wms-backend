@@ -8967,7 +8967,7 @@ app.post("/documents/from-movement/:id", authenticateToken, requirePermission("d
         client_address || "",
         0,
         `Document généré depuis mouvement stock ID ${movement.id} - ${movement.type}`,
-        created_by || req.user.fullname || req.user.email || "Utilisateur",
+        movement.created_by_name || created_by || req.user.fullname || req.user.email || "Utilisateur",
         movement.company_id || companyId,
         "stock_movement",
         movement.id,
@@ -17444,6 +17444,156 @@ app.use(
     accounting: { nextAccountingNumber, createAccountingEntry },
   })
 );
+
+
+// ===================================================================
+// VENTE DE CIMENT — indépendant du module Stocks
+// ===================================================================
+const createCementSalesRouter = require("./routes/cement-sales");
+
+app.use(
+  "/",
+  createCementSalesRouter({
+    pool,
+    authenticateToken,
+    getEffectiveCompanyId,
+    requirePermission,
+    createNotification
+  })
+);
+
+
+// ===================================================================
+// FAT & MAT — VENTE DE SABLE
+// Indépendant du stock et du module ciment
+// ===================================================================
+const createSandSalesRouter = require("./routes/sand-sales");
+
+app.use(
+  "/",
+  createSandSalesRouter({
+    pool,
+    authenticateToken,
+    getEffectiveCompanyId,
+    requirePermission,
+    createNotification
+  })
+);
+
+
+// ============================================================
+// MULTI_COMPANY_SWITCH_V1
+// Triangle Logistics <-> FAT & MAT
+// ============================================================
+
+app.get("/companies/available", authenticateToken, async (req,res) => {
+  try {
+    const isSuper =
+      req.user?.is_super_admin === true ||
+      String(req.user?.role || "").toLowerCase() === "super_admin";
+
+    if (!isSuper) {
+      const { rows } = await pool.query(
+        `SELECT id,name,business_type,status
+         FROM companies
+         WHERE id=$1`,
+        [req.user.company_id]
+      );
+      return res.json(rows);
+    }
+
+    const { rows } = await pool.query(
+      `SELECT c.id,c.name,c.business_type,c.status,cs.logo_url
+       FROM user_company_access uca
+       JOIN companies c ON c.id=uca.company_id
+       LEFT JOIN company_settings cs ON cs.company_id=c.id
+       WHERE uca.user_id=$1
+         AND uca.is_active=TRUE
+         AND c.tenant_id=$2
+       ORDER BY c.id`,
+      [req.user.id, req.tenant_id || "triangle"]
+    );
+
+    res.json(rows);
+  } catch(e) {
+    console.error(e);
+    res.status(500).json({error:"Erreur chargement entreprises."});
+  }
+});
+
+app.post("/companies/switch", authenticateToken, async (req,res) => {
+  try {
+    const companyId = Number(req.body?.company_id);
+
+    if (!companyId) {
+      return res.status(400).json({error:"Entreprise invalide."});
+    }
+
+    const isSuper =
+      req.user?.is_super_admin === true ||
+      String(req.user?.role || "").toLowerCase() === "super_admin";
+
+    if (!isSuper && companyId !== Number(req.user.company_id)) {
+      return res.status(403).json({error:"Accès entreprise refusé."});
+    }
+
+    if (isSuper) {
+      const access = await pool.query(
+        `SELECT 1
+         FROM user_company_access
+         WHERE user_id=$1
+           AND company_id=$2
+           AND is_active=TRUE`,
+        [req.user.id, companyId]
+      );
+
+      if (!access.rowCount) {
+        return res.status(403).json({error:"Entreprise non autorisée."});
+      }
+    }
+
+    const company = (
+      await pool.query(
+        `SELECT id,name,business_type,status,tenant_id
+         FROM companies
+         WHERE id=$1`,
+        [companyId]
+      )
+    ).rows[0];
+
+    if (!company || company.status !== "active") {
+      return res.status(404).json({error:"Entreprise indisponible."});
+    }
+
+    if (company.tenant_id !== (req.tenant_id || "triangle")) {
+      return res.status(403).json({error:"Tenant entreprise invalide."});
+    }
+
+    const token = jwt.sign(
+      {
+        id: req.user.id,
+        email: req.user.email,
+        role: req.user.role,
+        company_id: company.id,
+        tenant_id: company.tenant_id,
+        is_super_admin: isSuper,
+        subscription_status: req.user.subscription_status || ""
+      },
+      JWT_SECRET,
+      { expiresIn:"1d" }
+    );
+
+    res.json({
+      success:true,
+      token,
+      company
+    });
+
+  } catch(e) {
+    console.error(e);
+    res.status(500).json({error:"Erreur changement entreprise."});
+  }
+});
 
 app.listen(5050, () => {
   console.log("Backend sécurisé démarré sur le port 5050");
