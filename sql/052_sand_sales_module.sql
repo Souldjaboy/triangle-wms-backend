@@ -254,7 +254,8 @@ WHERE NOT EXISTS (
     FROM sand_products
     WHERE company_id=5
       AND LOWER(name)='sable'
-);
+)
+AND EXISTS (SELECT 1 FROM companies WHERE id=5);
 
 -- ============================================================
 -- TARIF INITIAL
@@ -290,6 +291,7 @@ WHERE sp.company_id=5
       WHERE p.company_id=5
         AND p.sand_product_id=sp.id
         AND LOWER(p.destination)='bamako'
-  );
+  )
+  AND EXISTS (SELECT 1 FROM companies WHERE id=5);
 
 COMMIT;

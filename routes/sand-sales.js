@@ -4,28 +4,21 @@ module.exports = function createSandSalesRouter({
   pool,
   authenticateToken,
   getEffectiveCompanyId,
-  requirePermission
+  requirePermission,
+  requireCompanyModule
 }) {
   const router = express.Router();
 
   const companyOf = (req) =>
-    Number(getEffectiveCompanyId(req) || 0);
+    Number(getEffectiveCompanyId(req, req.user?.company_id) || 0);
 
   const perm = (action) =>
     requirePermission("sand", action);
 
-  function fatMatOnly(req, res, next) {
-    const companyId = companyOf(req);
-
-    if (companyId !== 5) {
-      return res.status(403).json({
-        error: "Le module Vente de Sable est réservé à FAT & MAT.",
-        code: "SAND_FATMAT_ONLY"
-      });
-    }
-
-    next();
-  }
+  /* Le module n'est plus lié en dur à une entreprise : il est accordé par la
+     configuration de modules de l'entreprise (company_modules) combinée au
+     RBAC `sand`. L'isolation reste assurée par company_id sur chaque requête. */
+  const sandModuleGuard = requireCompanyModule("sand");
 
   // ==========================================================
   // PRODUITS SABLE
@@ -34,7 +27,7 @@ module.exports = function createSandSalesRouter({
   router.get(
     "/sand/products",
     authenticateToken,
-    fatMatOnly,
+    sandModuleGuard,
     perm("view"),
     async (req, res) => {
       try {
@@ -63,7 +56,7 @@ module.exports = function createSandSalesRouter({
   router.get(
     "/sand/prices",
     authenticateToken,
-    fatMatOnly,
+    sandModuleGuard,
     perm("view"),
     async (req, res) => {
       try {
@@ -103,7 +96,7 @@ module.exports = function createSandSalesRouter({
   router.get(
     "/sand/customers",
     authenticateToken,
-    fatMatOnly,
+    sandModuleGuard,
     perm("view"),
     async (req, res) => {
       try {
@@ -132,7 +125,7 @@ module.exports = function createSandSalesRouter({
   router.get(
     "/sand/sales",
     authenticateToken,
-    fatMatOnly,
+    sandModuleGuard,
     perm("view"),
     async (req, res) => {
       try {
@@ -161,7 +154,7 @@ module.exports = function createSandSalesRouter({
   router.get(
     "/sand/invoices",
     authenticateToken,
-    fatMatOnly,
+    sandModuleGuard,
     perm("view"),
     async (req, res) => {
       try {
@@ -190,7 +183,7 @@ module.exports = function createSandSalesRouter({
   router.get(
     "/sand/deliveries",
     authenticateToken,
-    fatMatOnly,
+    sandModuleGuard,
     perm("view"),
     async (req, res) => {
       try {
@@ -219,7 +212,7 @@ module.exports = function createSandSalesRouter({
   router.get(
     "/sand/proformas",
     authenticateToken,
-    fatMatOnly,
+    sandModuleGuard,
     perm("view"),
     async (req, res) => {
       try {
@@ -272,7 +265,7 @@ module.exports = function createSandSalesRouter({
   router.post(
     "/sand/prices",
     authenticateToken,
-    fatMatOnly,
+    sandModuleGuard,
     perm("create"),
     async (req,res) => {
       try {
@@ -341,7 +334,7 @@ module.exports = function createSandSalesRouter({
   router.patch(
     "/sand/prices/:id",
     authenticateToken,
-    fatMatOnly,
+    sandModuleGuard,
     perm("update"),
     async (req,res) => {
       try {
@@ -386,7 +379,7 @@ module.exports = function createSandSalesRouter({
   router.delete(
     "/sand/prices/:id",
     authenticateToken,
-    fatMatOnly,
+    sandModuleGuard,
     perm("delete"),
     async (req,res) => {
       try {
@@ -414,7 +407,7 @@ module.exports = function createSandSalesRouter({
   router.post(
     "/sand/customers",
     authenticateToken,
-    fatMatOnly,
+    sandModuleGuard,
     perm("create"),
     async (req,res) => {
       const client = await pool.connect();
@@ -482,7 +475,7 @@ module.exports = function createSandSalesRouter({
   router.post(
     "/sand/sales",
     authenticateToken,
-    fatMatOnly,
+    sandModuleGuard,
     perm("create"),
     async (req,res) => {
       const client = await pool.connect();
@@ -686,7 +679,7 @@ module.exports = function createSandSalesRouter({
   router.post(
     "/sand/sales/:id/validate",
     authenticateToken,
-    fatMatOnly,
+    sandModuleGuard,
     perm("validate"),
     async (req,res) => {
       const client = await pool.connect();

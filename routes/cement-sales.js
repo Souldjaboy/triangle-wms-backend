@@ -7,9 +7,14 @@ module.exports = function createCementSalesRouter({
   authenticateToken,
   getEffectiveCompanyId,
   requirePermission,
+  requireCompanyModule,
 }) {
   const router = express.Router();
   const perm = (action) => requirePermission("cement", action);
+  /* Le module Ciment n'était accessible à AUCUNE condition d'entreprise : toute
+     société pouvait l'utiliser. Il est désormais soumis, comme le Sable, à
+     l'activation du module pour l'entreprise + au RBAC `cement`. */
+  const cementModuleGuard = requireCompanyModule("cement");
   const companyOf = (req) => getEffectiveCompanyId(req, req.user?.company_id);
   const txt = (v) => String(v ?? "").trim();
   const num = (v) => Number.isFinite(Number(v)) ? Number(v) : 0;
@@ -68,7 +73,7 @@ module.exports = function createCementSalesRouter({
     );
   }
 
-  router.get("/cement/dashboard", authenticateToken, perm("view"), async (req, res) => {
+  router.get("/cement/dashboard", authenticateToken, cementModuleGuard, perm("view"), async (req, res) => {
     try {
       const companyId = companyOf(req);
       const sales = await pool.query(
@@ -101,7 +106,7 @@ module.exports = function createCementSalesRouter({
     }
   });
 
-  router.get("/cement/products", authenticateToken, perm("view"), async (req, res) => {
+  router.get("/cement/products", authenticateToken, cementModuleGuard, perm("view"), async (req, res) => {
     const companyId = companyOf(req);
     const q = txt(req.query.q);
     const { rows } = await pool.query(
@@ -115,7 +120,7 @@ module.exports = function createCementSalesRouter({
     res.json(rows);
   });
 
-  router.post("/cement/products", authenticateToken, perm("create"), async (req, res) => {
+  router.post("/cement/products", authenticateToken, cementModuleGuard, perm("create"), async (req, res) => {
     const client = await pool.connect();
     try {
       const companyId = companyOf(req);
@@ -140,7 +145,7 @@ module.exports = function createCementSalesRouter({
     } finally { client.release(); }
   });
 
-  router.patch("/cement/products/:id", authenticateToken, perm("update"), async (req, res) => {
+  router.patch("/cement/products/:id", authenticateToken, cementModuleGuard, perm("update"), async (req, res) => {
     const companyId = companyOf(req);
     const b = req.body || {};
     const { rows } = await pool.query(
@@ -155,7 +160,7 @@ module.exports = function createCementSalesRouter({
     res.json(rows[0]);
   });
 
-  router.get("/cement/prices", authenticateToken, perm("view"), async (req, res) => {
+  router.get("/cement/prices", authenticateToken, cementModuleGuard, perm("view"), async (req, res) => {
     const companyId = companyOf(req);
     const q = txt(req.query.q);
     const { rows } = await pool.query(
@@ -171,7 +176,7 @@ module.exports = function createCementSalesRouter({
     res.json(rows);
   });
 
-  router.post("/cement/prices", authenticateToken, perm("create"), async (req, res) => {
+  router.post("/cement/prices", authenticateToken, cementModuleGuard, perm("create"), async (req, res) => {
     const companyId = companyOf(req);
     const b = req.body || {};
     if (!b.cement_product_id || !txt(b.destination)) {
@@ -189,7 +194,7 @@ module.exports = function createCementSalesRouter({
     res.status(201).json(rows[0]);
   });
 
-  router.patch("/cement/prices/:id", authenticateToken, perm("update"), async (req, res) => {
+  router.patch("/cement/prices/:id", authenticateToken, cementModuleGuard, perm("update"), async (req, res) => {
     const client = await pool.connect();
     try {
       const companyId = companyOf(req);
@@ -234,7 +239,7 @@ module.exports = function createCementSalesRouter({
     } finally { client.release(); }
   });
 
-  router.delete("/cement/prices/:id", authenticateToken, perm("delete"), async (req, res) => {
+  router.delete("/cement/prices/:id", authenticateToken, cementModuleGuard, perm("delete"), async (req, res) => {
     const companyId = companyOf(req);
     const { rows } = await pool.query(
       `UPDATE cement_prices SET status='INACTIF',effective_to=COALESCE(effective_to,CURRENT_DATE),updated_at=NOW()
@@ -245,7 +250,7 @@ module.exports = function createCementSalesRouter({
     res.json({ success:true,disabled:true,price:rows[0] });
   });
 
-  router.get("/cement/customers", authenticateToken, perm("view"), async (req, res) => {
+  router.get("/cement/customers", authenticateToken, cementModuleGuard, perm("view"), async (req, res) => {
     const companyId = companyOf(req);
     const q = txt(req.query.q);
     const { rows } = await pool.query(
@@ -264,7 +269,7 @@ module.exports = function createCementSalesRouter({
     res.json(rows);
   });
 
-  router.post("/cement/customers", authenticateToken, perm("create"), async (req, res) => {
+  router.post("/cement/customers", authenticateToken, cementModuleGuard, perm("create"), async (req, res) => {
     const client = await pool.connect();
     try {
       const companyId = companyOf(req);
@@ -290,7 +295,7 @@ module.exports = function createCementSalesRouter({
     } finally { client.release(); }
   });
 
-  router.get("/cement/sales", authenticateToken, perm("view"), async (req, res) => {
+  router.get("/cement/sales", authenticateToken, cementModuleGuard, perm("view"), async (req, res) => {
     const companyId = companyOf(req);
     const q = txt(req.query.q);
     const { rows } = await pool.query(
@@ -307,7 +312,7 @@ module.exports = function createCementSalesRouter({
     res.json(rows);
   });
 
-  router.post("/cement/sales", authenticateToken, perm("create"), async (req, res) => {
+  router.post("/cement/sales", authenticateToken, cementModuleGuard, perm("create"), async (req, res) => {
     const client = await pool.connect();
     try {
       const companyId = companyOf(req);
@@ -396,7 +401,7 @@ module.exports = function createCementSalesRouter({
     } finally { client.release(); }
   });
 
-  router.get("/cement/invoices/unpaid", authenticateToken, perm("view"), async (req, res) => {
+  router.get("/cement/invoices/unpaid", authenticateToken, cementModuleGuard, perm("view"), async (req, res) => {
     const companyId = companyOf(req);
     const customerId = req.query.customer_id ? Number(req.query.customer_id) : null;
     const from = req.query.from || "2000-01-01";
@@ -482,6 +487,7 @@ module.exports = function createCementSalesRouter({
   router.get(
     "/cement/sales/:id",
     authenticateToken,
+    cementModuleGuard,
     perm("view"),
     async (req, res) => {
       try {
@@ -506,6 +512,7 @@ module.exports = function createCementSalesRouter({
   router.post(
     "/cement/sales/:id/validate",
     authenticateToken,
+    cementModuleGuard,
     perm("validate"),
     async (req, res) => {
       const client = await pool.connect();
@@ -772,6 +779,7 @@ module.exports = function createCementSalesRouter({
   router.get(
     "/cement/invoices",
     authenticateToken,
+    cementModuleGuard,
     perm("view"),
     async (req, res) => {
       try {
@@ -821,6 +829,7 @@ module.exports = function createCementSalesRouter({
   router.post(
     "/cement/invoices/:id/payments",
     authenticateToken,
+    cementModuleGuard,
     perm("create"),
     async (req, res) => {
       const client = await pool.connect();
@@ -1010,7 +1019,7 @@ module.exports = function createCementSalesRouter({
   // Proformas + Bons de livraison + Rapports
   // ============================================================
 
-  router.get("/cement/proformas", authenticateToken, perm("view"), async (req,res) => {
+  router.get("/cement/proformas", authenticateToken, cementModuleGuard, perm("view"), async (req,res) => {
     try {
       const companyId = companyOf(req);
       const q = txt(req.query.q);
@@ -1038,7 +1047,7 @@ module.exports = function createCementSalesRouter({
     }
   });
 
-  router.get("/cement/proformas/:id", authenticateToken, perm("view"), async (req,res) => {
+  router.get("/cement/proformas/:id", authenticateToken, cementModuleGuard, perm("view"), async (req,res) => {
     try {
       const companyId = companyOf(req);
 
@@ -1070,7 +1079,7 @@ module.exports = function createCementSalesRouter({
     }
   });
 
-  router.post("/cement/proformas", authenticateToken, perm("create"), async (req,res) => {
+  router.post("/cement/proformas", authenticateToken, cementModuleGuard, perm("create"), async (req,res) => {
     const client = await pool.connect();
     try {
       const companyId = companyOf(req);
@@ -1197,7 +1206,7 @@ module.exports = function createCementSalesRouter({
     }
   });
 
-  router.post("/cement/proformas/:id/validate", authenticateToken, perm("validate"), async (req,res) => {
+  router.post("/cement/proformas/:id/validate", authenticateToken, cementModuleGuard, perm("validate"), async (req,res) => {
     const client = await pool.connect();
     try {
       const companyId = companyOf(req);
@@ -1245,7 +1254,7 @@ module.exports = function createCementSalesRouter({
     }
   });
 
-  router.get("/cement/deliveries", authenticateToken, perm("view"), async (req,res) => {
+  router.get("/cement/deliveries", authenticateToken, cementModuleGuard, perm("view"), async (req,res) => {
     try {
       const companyId = companyOf(req);
       const q = txt(req.query.q);
@@ -1284,7 +1293,7 @@ module.exports = function createCementSalesRouter({
     }
   });
 
-  router.get("/cement/deliveries/:id", authenticateToken, perm("view"), async (req,res) => {
+  router.get("/cement/deliveries/:id", authenticateToken, cementModuleGuard, perm("view"), async (req,res) => {
     try {
       const companyId = companyOf(req);
 
@@ -1323,7 +1332,7 @@ module.exports = function createCementSalesRouter({
     }
   });
 
-  router.get("/cement/reports/summary", authenticateToken, perm("view"), async (req,res) => {
+  router.get("/cement/reports/summary", authenticateToken, cementModuleGuard, perm("view"), async (req,res) => {
     try {
       const companyId = companyOf(req);
       const from = req.query.from || null;

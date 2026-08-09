@@ -1330,8 +1330,53 @@ const COMPANY_MODULE_KEYS = [
   "informatique",
   "beaute",
   "maison_meubles",
-  "services"
+  "services",
+  // Modules métier vendus séparément (Vente de ciment / Vente de sable).
+  "cement",
+  "sand"
 ];
+
+/* Modules « opt-in » : contrairement aux modules généraux, ils ne sont PAS
+   accordés par défaut. getCompanyModules() considère qu'un module non
+   configuré est actif ; ce serait une régression de sécurité ici (le Sable
+   deviendrait accessible à toutes les entreprises). Pour ceux-ci on exige donc
+   une ligne company_modules explicitement activée. */
+const OPT_IN_MODULE_KEYS = new Set(["cement", "sand"]);
+
+async function isCompanyModuleEnabled(companyId, moduleKey) {
+  if (!companyId) return false;
+  const { rows } = await pool.query(
+    `SELECT is_enabled, enabled FROM company_modules WHERE company_id=$1 AND module_key=$2 LIMIT 1`,
+    [companyId, moduleKey]
+  );
+  const row = rows[0];
+  if (row) return row.is_enabled === true || row.enabled === true;
+  // Non configuré : refusé pour un module opt-in, autorisé pour les autres.
+  return !OPT_IN_MODULE_KEYS.has(moduleKey);
+}
+
+/* Middleware : le module doit être activé pour l'entreprise EFFECTIVE (donc en
+   tenant compte de x-active-company-id pour un super-admin qui bascule).
+   Il se combine avec requirePermission() — module activé ET permission RBAC. */
+function requireCompanyModule(moduleKey) {
+  return async function companyModuleGuard(req, res, next) {
+    try {
+      const companyId = getEffectiveCompanyId(req, req.user?.company_id);
+      if (!companyId) {
+        return res.status(403).json({ error: "Aucune entreprise active.", code: "NO_ACTIVE_COMPANY" });
+      }
+      if (await isCompanyModuleEnabled(companyId, moduleKey)) return next();
+      return res.status(403).json({
+        error: "Ce module n'est pas activé pour votre entreprise.",
+        code: "MODULE_NOT_ENABLED",
+        module: moduleKey,
+      });
+    } catch (error) {
+      console.error("requireCompanyModule:", error.message || error);
+      return res.status(500).json({ error: "Erreur de vérification du module." });
+    }
+  };
+}
 
 async function getCompanyModules(companyId) {
   const moduleKeys = COMPANY_MODULE_KEYS;
@@ -17458,6 +17503,7 @@ app.use(
     authenticateToken,
     getEffectiveCompanyId,
     requirePermission,
+    requireCompanyModule,
     createNotification
   })
 );
@@ -17476,6 +17522,7 @@ app.use(
     authenticateToken,
     getEffectiveCompanyId,
     requirePermission,
+    requireCompanyModule,
     createNotification
   })
 );
