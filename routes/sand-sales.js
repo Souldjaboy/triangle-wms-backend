@@ -159,10 +159,18 @@ module.exports = function createSandSalesRouter({
     async (req, res) => {
       try {
         const { rows } = await pool.query(
-          `SELECT *
-           FROM sand_invoices
-           WHERE company_id=$1
-           ORDER BY invoice_date DESC,id DESC`,
+          /* Client et Site viennent de la vente / de la fiche client : sans ces
+             jointures, les colonnes « Client » et « Site » de l'état restaient
+             vides. Mêmes jointures que /sand/invoices/unpaid. */
+          `SELECT i.*,
+                  s.destination AS site,
+                  s.quantity_m3,
+                  COALESCE(c.name, s.customer_name) AS client_name
+           FROM sand_invoices i
+           LEFT JOIN sand_sales s ON s.id = i.sale_id AND s.company_id = i.company_id
+           LEFT JOIN sand_customers c ON c.id = i.customer_id AND c.company_id = i.company_id
+           WHERE i.company_id=$1
+           ORDER BY i.invoice_date DESC,i.id DESC`,
           [companyOf(req)]
         );
 
@@ -1439,6 +1447,46 @@ module.exports = function createSandSalesRouter({
       } catch (e) {
         console.error("POST sand statement:", e);
         res.status(500).json({ error: "Erreur génération de l'état." });
+      }
+    }
+  );
+
+  // ---------------- DÉTAIL D'UNE FACTURE ----------------
+  router.get(
+    "/sand/invoices/:id",
+    authenticateToken,
+    sandModuleGuard,
+    perm("view"),
+    async (req, res) => {
+      try {
+        const companyId = companyOf(req);
+        const invoice = (await pool.query(
+          `SELECT i.*, s.sale_number, s.quantity_m3, s.unit_price, s.sand_product_id,
+                  s.destination AS sale_destination, s.notes AS sale_notes,
+                  s.customer_address AS sale_customer_address,
+                  COALESCE(c.name, s.customer_name) AS client_name,
+                  COALESCE(c.address, s.customer_address) AS client_address
+             FROM sand_invoices i
+             LEFT JOIN sand_sales s ON s.id = i.sale_id AND s.company_id = i.company_id
+             LEFT JOIN sand_customers c ON c.id = i.customer_id AND c.company_id = i.company_id
+            WHERE i.id=$1 AND i.company_id=$2`,
+          [req.params.id, companyId]
+        )).rows[0];
+        if (!invoice) return res.status(404).json({ error: "Facture introuvable." });
+
+        res.json({
+          invoice,
+          operation: OPERATION_LABEL,
+          // Palier commercial : « Prix 10 m³ », jamais le prix au m³.
+          pricing: await pricingFor(pool, companyId, {
+            unit_price: invoice.unit_price,
+            sand_product_id: invoice.sand_product_id,
+            destination: invoice.sale_destination || invoice.destination,
+          }),
+        });
+      } catch (e) {
+        console.error("GET sand invoice:", e);
+        res.status(500).json({ error: "Erreur lecture de la facture." });
       }
     }
   );
