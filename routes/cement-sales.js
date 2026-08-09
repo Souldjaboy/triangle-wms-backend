@@ -299,9 +299,14 @@ module.exports = function createCementSalesRouter({
     const companyId = companyOf(req);
     const q = txt(req.query.q);
     const { rows } = await pool.query(
-      `SELECT s.*,p.name product_name
+      /* invoice_id / delivery_id : permettent d'ouvrir depuis la liste des ventes
+         les documents DÉJÀ créés par la validation, sans jamais en générer un
+         second. LATERAL + LIMIT 1 : une seule ligne par vente. */
+      `SELECT s.*,p.name product_name, i.id AS invoice_id, d.id AS delivery_id
        FROM cement_sales s
        LEFT JOIN cement_products p ON p.id=s.cement_product_id AND p.company_id=s.company_id
+       LEFT JOIN LATERAL (SELECT id FROM cement_invoices WHERE sale_id=s.id AND company_id=s.company_id ORDER BY id DESC LIMIT 1) i ON TRUE
+       LEFT JOIN LATERAL (SELECT id FROM cement_deliveries WHERE sale_id=s.id AND company_id=s.company_id ORDER BY id DESC LIMIT 1) d ON TRUE
        WHERE s.company_id=$1 AND (
          $2='' OR s.sale_number ILIKE '%'||$2||'%' OR s.customer_name ILIKE '%'||$2||'%'
          OR s.customer_phone ILIKE '%'||$2||'%' OR s.destination ILIKE '%'||$2||'%'
@@ -1398,6 +1403,59 @@ module.exports = function createCementSalesRouter({
     } catch(e) {
       console.error(e);
       res.status(500).json({error:"Erreur génération rapport ciment."});
+    }
+  });
+
+
+  /* Détail d'une facture ciment. Manquait alors que les BL et les ventes
+     avaient déjà leur route :id — la page facture devait sinon charger toute la
+     liste puis filtrer côté client. Lecture seule : ne crée jamais de document,
+     la validation de la vente s'en est déjà chargée.
+     Les colonnes DATE partent en TEXTE pour ne pas repasser par UTC (sinon le
+     document imprimé affiche la veille en soirée). */
+  router.get("/cement/invoices/:id", authenticateToken, cementModuleGuard, perm("view"), async (req,res) => {
+    try {
+      const companyId = companyOf(req);
+      const row = (
+        await pool.query(
+          `SELECT
+             i.*,
+             i.invoice_date::text AS invoice_date,
+             i.due_date::text AS due_date,
+             s.sale_number, s.sale_date::text AS sale_date,
+             s.customer_name, s.customer_phone, s.customer_address,
+             s.customer_nif, s.customer_rccm,
+             s.cement_type, s.strength, s.tonnage, s.unit_price,
+             s.transport_price, s.transport_mode, s.transport_total,
+             s.cement_subtotal, s.discount, s.tax_amount,
+             s.destination AS sale_destination,
+             c.name AS customer_full_name
+           FROM cement_invoices i
+           LEFT JOIN cement_sales s ON s.id=i.sale_id AND s.company_id=i.company_id
+           LEFT JOIN cement_customers c ON c.id=i.customer_id AND c.company_id=i.company_id
+           WHERE i.id=$1 AND i.company_id=$2`,
+          [req.params.id,companyId]
+        )
+      ).rows[0];
+
+      if(!row) {
+        return res.status(404).json({error:"Facture introuvable."});
+      }
+
+      const payments = (
+        await pool.query(
+          `SELECT id, payment_number, payment_date::text AS payment_date, amount, payment_method
+             FROM cement_payments
+            WHERE company_id=$1 AND invoice_id=$2
+            ORDER BY payment_date, id`,
+          [companyId, row.id]
+        )
+      ).rows;
+
+      res.json({ invoice: row, payments, operation: "Vente de ciment" });
+    } catch(e) {
+      console.error("GET cement invoice:",e);
+      res.status(500).json({error:"Erreur lecture de la facture."});
     }
   });
 

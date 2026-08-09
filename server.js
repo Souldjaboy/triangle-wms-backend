@@ -1,6 +1,17 @@
 const express = require("express");
 const cors = require("cors");
-const { Pool } = require("pg");
+const { Pool, types: pgTypes } = require("pg");
+
+/* Les colonnes DATE (OID 1082) sont renvoyées en TEXTE brut « AAAA-MM-JJ ».
+   Par défaut le pilote les convertit en objet Date, sérialisé ensuite en
+   horodatage UTC : « 2026-08-09 » devenait « 2026-08-08T22:00:00.000Z » et les
+   documents imprimés affichaient LA VEILLE en soirée. Ce bug est apparu trois
+   fois (bon de réception, état sable, bon de livraison ciment) ; on le traite
+   ici à la source plutôt que requête par requête.
+   Une DATE n'a ni heure ni fuseau : la garder en texte est aussi plus juste.
+   Les colonnes TIMESTAMP ne sont pas concernées. */
+pgTypes.setTypeParser(1082, (value) => value);
+
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
 const QRCode = require("qrcode");
