@@ -1356,12 +1356,14 @@ const OPT_IN_MODULE_KEYS = new Set(["cement", "sand"]);
 
 async function isCompanyModuleEnabled(companyId, moduleKey) {
   if (!companyId) return false;
+  /* La table de PRODUCTION n'a que « is_enabled » — il n'existe pas de colonne
+     « enabled ». Lire les deux faisait échouer la requête en production. */
   const { rows } = await pool.query(
-    `SELECT is_enabled, enabled FROM company_modules WHERE company_id=$1 AND module_key=$2 LIMIT 1`,
+    `SELECT is_enabled FROM company_modules WHERE company_id=$1 AND module_key=$2 LIMIT 1`,
     [companyId, moduleKey]
   );
   const row = rows[0];
-  if (row) return row.is_enabled === true || row.enabled === true;
+  if (row) return row.is_enabled === true;
   // Non configuré : refusé pour un module opt-in, autorisé pour les autres.
   return !OPT_IN_MODULE_KEYS.has(moduleKey);
 }
@@ -17515,7 +17517,9 @@ app.use(
     getEffectiveCompanyId,
     requirePermission,
     requireCompanyModule,
-    createNotification
+    createNotification,
+    // Encaissements : on réutilise le moteur comptable existant, pas de second.
+    accounting: { nextAccountingNumber, createAccountingEntry }
   })
 );
 
@@ -17534,7 +17538,9 @@ app.use(
     getEffectiveCompanyId,
     requirePermission,
     requireCompanyModule,
-    createNotification
+    createNotification,
+    // Encaissements : on réutilise le moteur comptable existant, pas de second.
+    accounting: { nextAccountingNumber, createAccountingEntry }
   })
 );
 

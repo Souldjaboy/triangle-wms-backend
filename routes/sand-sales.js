@@ -1,11 +1,13 @@
 const express = require("express");
+const { listActiveBanks, recordSalePaymentAccounting } = require("./sales-payment-accounting");
 
 module.exports = function createSandSalesRouter({
   pool,
   authenticateToken,
   getEffectiveCompanyId,
   requirePermission,
-  requireCompanyModule
+  requireCompanyModule,
+  accounting = {}
 }) {
   const router = express.Router();
 
@@ -983,6 +985,25 @@ module.exports = function createSandSalesRouter({
     }
   );
 
+  /* Banques disponibles pour encaisser — route MÉTIER volontairement distincte
+     de la comptabilité : un encaisseur Sable n'a pas besoin de accounting.view
+     pour choisir sa banque. Ne renvoie que les banques ACTIVES de l'entreprise
+     active, et rien d'autre de la comptabilité. */
+  router.get(
+    "/sand/payment-destinations",
+    authenticateToken,
+    sandModuleGuard,
+    perm("view"),
+    async (req, res) => {
+      try {
+        res.json({ banks: await listActiveBanks(pool, companyOf(req)) });
+      } catch (e) {
+        console.error("GET sand payment-destinations:", e);
+        res.status(500).json({ error: "Erreur chargement des banques." });
+      }
+    }
+  );
+
   // ---------------- D. PAIEMENT (IDEMPOTENT) ----------------
   router.post(
     "/sand/invoices/:id/payments",
@@ -995,7 +1016,14 @@ module.exports = function createSandSalesRouter({
         const companyId = companyOf(req);
         const amount = Number(req.body?.amount);
         const idemKey = String(req.headers["idempotency-key"] || req.body?.idempotency_key || "").trim() || null;
+        /* « banque » exige une banque explicite : on ne choisit JAMAIS la
+           première banque à la place de l'utilisateur. */
+        const method = String(req.body?.payment_method || "especes").toLowerCase();
+        const bankId = Number(req.body?.bank_id) || null;
         if (!(amount > 0)) return res.status(400).json({ error: "Montant de paiement invalide." });
+        if ((method === "banque" || method === "bank") && !bankId) {
+          return res.status(400).json({ error: "Sélectionnez la banque qui reçoit le paiement.", code: "BANK_REQUIRED" });
+        }
 
         await client.query("BEGIN");
 
@@ -1017,8 +1045,20 @@ module.exports = function createSandSalesRouter({
             [companyId, invoice.id, idemKey]
           )).rows[0];
           if (prev) {
+            /* REJEU : aucune écriture. Ni second paiement, ni second mouvement
+               de banque/trésorerie, ni seconde transaction comptable. */
+            const tx = prev.accounting_transaction_id
+              ? (await client.query(`SELECT * FROM accounting_transactions WHERE id=$1 AND company_id=$2`,
+                  [prev.accounting_transaction_id, companyId])).rows[0] || null
+              : null;
             await client.query("COMMIT");
-            return res.status(200).json({ payment: prev, invoice, replayed: true });
+            return res.status(200).json({
+              success: true, payment: prev, invoice, replayed: true,
+              accounting_transaction: tx,
+              destination: tx
+                ? { type: tx.bank_id ? "BANK" : "CASH", bank_id: tx.bank_id, label: tx.destination_label }
+                : null,
+            });
           }
         }
 
@@ -1039,12 +1079,12 @@ module.exports = function createSandSalesRouter({
         const payment = (await client.query(
           `INSERT INTO sand_payments
              (company_id, invoice_id, payment_number, payment_date, amount,
-              payment_method, reference, notes, created_by, idempotency_key)
-           VALUES ($1,$2,$3,COALESCE($4::date,CURRENT_DATE),$5,$6,$7,$8,$9,$10)
+              payment_method, reference, notes, created_by, idempotency_key, bank_id)
+           VALUES ($1,$2,$3,COALESCE($4::date,CURRENT_DATE),$5,$6,$7,$8,$9,$10,$11)
            RETURNING *`,
           [companyId, invoice.id, paymentNumber, req.body?.payment_date || null, amount,
-           req.body?.payment_method || "especes", req.body?.reference || null,
-           req.body?.notes || null, req.user.id, idemKey]
+           bankId ? "banque" : "especes", req.body?.reference || null,
+           req.body?.notes || null, req.user.id, idemKey, bankId]
         )).rows[0];
 
         /* Solde RECONSTRUIT depuis la somme réelle des paiements — jamais
@@ -1065,13 +1105,32 @@ module.exports = function createSandSalesRouter({
           [companyId, invoice.id]
         )).rows[0];
 
+        /* Argent + transaction + écritures, dans CETTE transaction : si l'une
+           de ces étapes échoue, le paiement lui-même est annulé. */
+        const { transaction, destination } = await recordSalePaymentAccounting(client, {
+          companyId, module: "sand", payment, amount,
+          invoiceNumber: invoice.invoice_number,
+          partnerName: req.body?.partner_name || null,
+          bankId, userId: req.user.id, accounting,
+        });
+        await client.query(
+          `UPDATE sand_payments SET accounting_transaction_id=$1 WHERE id=$2 AND company_id=$3`,
+          [transaction.id, payment.id, companyId]
+        );
+
         await client.query("COMMIT");
-        res.status(201).json({ payment, invoice: updated, replayed: false });
+        res.status(201).json({
+          success: true, payment: { ...payment, accounting_transaction_id: transaction.id },
+          invoice: updated, accounting_transaction: transaction, destination, replayed: false,
+        });
       } catch (e) {
         await client.query("ROLLBACK").catch(() => {});
         // Course perdue sur la clé d'idempotence : l'autre requête a gagné.
         if (e && e.code === "23505") {
           return res.status(409).json({ error: "Paiement déjà enregistré.", code: "DUPLICATE_PAYMENT" });
+        }
+        if (e && e.httpStatus) {
+          return res.status(e.httpStatus).json({ error: e.message, code: e.code });
         }
         console.error("POST sand payment:", e);
         res.status(500).json({ error: "Erreur enregistrement du paiement." });

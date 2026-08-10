@@ -1,6 +1,7 @@
 "use strict";
 
 const express = require("express");
+const { listActiveBanks, recordSalePaymentAccounting } = require("./sales-payment-accounting");
 
 module.exports = function createCementSalesRouter({
   pool,
@@ -8,6 +9,7 @@ module.exports = function createCementSalesRouter({
   getEffectiveCompanyId,
   requirePermission,
   requireCompanyModule,
+  accounting = {},
 }) {
   const router = express.Router();
   const perm = (action) => requirePermission("cement", action);
@@ -842,10 +844,19 @@ module.exports = function createCementSalesRouter({
       try {
         const companyId = companyOf(req);
         const amount = positive(req.body?.amount);
+        /* « banque » exige une banque explicite : jamais de choix automatique. */
+        const method = txt(req.body?.payment_method).toLowerCase();
+        const bankId = Number(req.body?.bank_id) || null;
 
         if (amount <= 0) {
           return res.status(400).json({
             error: "Montant paiement invalide."
+          });
+        }
+        if ((method === "banque" || method === "bank") && !bankId) {
+          return res.status(400).json({
+            error: "Sélectionnez la banque qui reçoit le paiement.",
+            code: "BANK_REQUIRED"
           });
         }
 
@@ -901,12 +912,13 @@ module.exports = function createCementSalesRouter({
                payment_method,
                reference,
                notes,
-               created_by
+               created_by,
+               bank_id
              )
              VALUES(
                $1,$2,$3,
                COALESCE($4,CURRENT_DATE),
-               $5,$6,$7,$8,$9
+               $5,$6,$7,$8,$9,$10
              )
              RETURNING *`,
             [
@@ -915,16 +927,22 @@ module.exports = function createCementSalesRouter({
               paymentNumber,
               req.body?.payment_date || null,
               amount,
-              txt(req.body?.payment_method) || null,
+              bankId ? "banque" : (txt(req.body?.payment_method) || "especes"),
               txt(req.body?.reference) || null,
               txt(req.body?.notes) || null,
-              req.user.id
+              req.user.id,
+              bankId
             ]
           )
         ).rows[0];
 
-        const newPaid =
-          Number(invoice.paid_amount || 0) + amount;
+        /* Solde reconstruit depuis la SOMME réelle des paiements (comme le
+           Sable) : « ancien + montant » dérive au moindre incident. */
+        const newPaid = Number((await client.query(
+          `SELECT COALESCE(SUM(amount),0) AS total FROM cement_payments
+            WHERE company_id=$1 AND invoice_id=$2`,
+          [companyId, invoice.id]
+        )).rows[0].total);
 
         const newRemaining =
           Math.max(
@@ -993,22 +1011,40 @@ module.exports = function createCementSalesRouter({
           }
         );
 
+        /* Argent + transaction + écritures dans CETTE transaction : un échec
+           ici annule aussi le paiement et la mise à jour de la facture. */
+        const { transaction, destination } = await recordSalePaymentAccounting(client, {
+          companyId, module: "cement", payment, amount,
+          invoiceNumber: invoice.invoice_number,
+          partnerName: txt(req.body?.partner_name) || null,
+          bankId, userId: req.user.id, accounting,
+        });
+        await client.query(
+          `UPDATE cement_payments SET accounting_transaction_id=$1 WHERE id=$2 AND company_id=$3`,
+          [transaction.id, payment.id, companyId]
+        );
+
         await client.query("COMMIT");
 
         res.status(201).json({
           success: true,
-          payment,
+          payment: { ...payment, accounting_transaction_id: transaction.id },
           invoice: {
             ...invoice,
             paid_amount: newPaid,
             remaining_amount: newRemaining,
             status: newStatus
-          }
+          },
+          accounting_transaction: transaction,
+          destination
         });
       } catch (e) {
         await client.query("ROLLBACK").catch(() => {});
         console.error(e);
 
+        if (e && e.httpStatus) {
+          return res.status(e.httpStatus).json({ error: e.message, code: e.code });
+        }
         res.status(500).json({
           error: "Erreur paiement facture ciment."
         });
@@ -1413,6 +1449,17 @@ module.exports = function createCementSalesRouter({
      la validation de la vente s'en est déjà chargée.
      Les colonnes DATE partent en TEXTE pour ne pas repasser par UTC (sinon le
      document imprimé affiche la veille en soirée). */
+  /* Banques disponibles pour encaisser — route métier, distincte de la
+     comptabilité : un encaisseur Ciment n'a pas besoin de accounting.view. */
+  router.get("/cement/payment-destinations", authenticateToken, cementModuleGuard, perm("view"), async (req,res) => {
+    try {
+      res.json({ banks: await listActiveBanks(pool, companyOf(req)) });
+    } catch (e) {
+      console.error("GET cement payment-destinations:", e);
+      res.status(500).json({ error: "Erreur chargement des banques." });
+    }
+  });
+
   router.get("/cement/invoices/:id", authenticateToken, cementModuleGuard, perm("view"), async (req,res) => {
     try {
       const companyId = companyOf(req);
