@@ -128,24 +128,38 @@ function planOperations(recon, { warehouse = "W-EM2S-A", writeOffs = [] } = {}) 
      refuserait proprement (409) et annulerait tout, mais l'utilisateur ne
      l'apprendrait qu'APRÈS avoir confirmé. */
   const blockingErrors = [];
+  const { computeStockSequence } = require("./stock-sequence");
   for (const it of recon.items) {
-    if (!it.match || it.action === ACTIONS.AMBIGUOUS_PRODUCT) continue;
-    const pre = preAdjustments.find((p) => p.product.id === it.match.product_id);
-    const steps = [];
-    let stock = it.dbStock;
-    if (pre) { stock = pre.counted; steps.push({ step: "AJUSTEMENT_PREALABLE", stock }); }
-    if (it.in > 0) { stock += it.in; steps.push({ step: "ENTREE", stock }); }
-    if (it.out > 0) { stock -= it.out; steps.push({ step: "SORTIE", stock }); }
-    const wo = writeOffs.find((w) => w.product.id === it.match.product_id);
-    if (wo) { stock -= wo.quantity; steps.push({ step: "WRITE_OFF", stock }); }
-    const bad = steps.find((x) => x.stock < 0);
-    if (bad) {
+    /* Les produits NOUVEAUX étaient ici exclus par un `if (!it.match) continue`.
+       Ils échappaient donc entièrement au contrôle : le preview annonçait
+       canExecute alors que l'exécution refusait la sortie. Ils sont désormais
+       simulés comme les autres, en partant d'un stock initial de 0. */
+    if (it.action === ACTIONS.AMBIGUOUS_PRODUCT) continue;
+    const isNew = !it.match;
+    const pid = it.match ? it.match.product_id : null;
+    const wo = writeOffs.find((w) => (pid && w.product_id === pid)
+      || (!pid && require("./excel-inventory-parser").normName(w.product_name) === it.norm));
+
+    const seq = computeStockSequence({
+      isNew,
+      dbStock: it.dbStock || 0,
+      countedQuantity: isNew ? null : it.qty,
+      adjustmentAllowed: it.adjustmentAllowed !== false,
+      inQty: it.in, outQty: it.out,
+      writeOffQty: wo ? wo.quantity : 0,
+    });
+
+    if (seq.failure) {
       blockingErrors.push({
-        product: { id: it.match.product_id, name: it.match.name },
-        dbStock: it.dbStock, counted: it.qty, in: it.in, out: it.out,
-        writeOff: wo ? wo.quantity : 0,
-        failingStep: bad.step, stockAtFailure: bad.stock, steps,
-        message: "Cette opération produirait un stock négatif.",
+        product: { id: pid, name: it.match ? it.match.name : it.desc.trim() },
+        isNewProduct: isNew,
+        dbStock: isNew ? 0 : it.dbStock, counted: isNew ? null : it.qty,
+        in: it.in, out: it.out, writeOff: wo ? wo.quantity : 0,
+        failingStep: seq.failure.step, stockAtFailure: seq.failure.stock,
+        steps: seq.steps, finalStock: seq.finalStock,
+        message: isNew
+          ? "Produit créé par l'import : son stock part de 0, la sortie dépasse les entrées."
+          : "Cette opération produirait un stock négatif.",
       });
     }
   }
