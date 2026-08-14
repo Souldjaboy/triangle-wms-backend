@@ -20,23 +20,35 @@
 
 const { ACTIONS } = require("./reconcile");
 
-/* Nouveaux rebuts constatés dans la feuille WRITE OFF. Les 161 unités
-   historiques déjà enregistrées ne sont JAMAIS recréées : seuls les articles
-   absents de l'historique sont proposés. */
-function planWriteOffs(newWriteOffs, dbProducts, existingWriteOffNames = new Set()) {
+/* Nouveaux rebuts de la feuille WRITE OFF.
+ *
+ * PROTECTION RÉELLE contre la réimportation de l'historique : le parser ne lit
+ * QUE la seconde liste (« LISTE DES WRITE OFF 2 »). La première — les 15
+ * mouvements / 161 unités déjà enregistrés — n'est jamais lue, elle ne peut
+ * donc pas être recréée. S'y ajoute l'idempotence par empreinte du fichier.
+ *
+ * On NE filtre PAS par nom de produit : un article déjà cassé par le passé peut
+ * l'être à nouveau, et écarter la ligne parce que le nom existe dans
+ * l'historique ferait perdre un rebut légitime. L'existence d'un write-off
+ * antérieur est donc une INFORMATION affichée (alreadyExisting), pas un filtre.
+ */
+function planWriteOffs(newWriteOffs, dbProducts, previousWriteOffNames = new Set()) {
   const { normName } = require("./excel-inventory-parser");
-  const out = [];
-  for (const w of newWriteOffs || []) {
+  return (newWriteOffs || []).map((w) => {
     const key = normName(w.desc);
-    if (existingWriteOffNames.has(key)) continue;          // déjà enregistré
     const p = dbProducts.find((x) => normName(x.name) === key);
-    out.push({
-      product: p ? { id: p.product_id, name: p.name } : { id: null, name: w.desc },
-      quantity: w.quantity, reason: "Write-off inventaire Excel",
-      known: Boolean(p),
-    });
-  }
-  return out;
+    return {
+      product: p ? { id: p.product_id, name: p.name } : { id: null, name: w.desc.trim() },
+      product_name: w.desc.trim(),
+      product_id: p ? p.product_id : null,
+      quantity: w.quantity,
+      excelRow: w.excelRow,
+      known: Boolean(p),                       // produit connu en base ?
+      alreadyExisting: previousWriteOffNames.has(key), // déjà cassé par le passé ?
+      dbStock: p ? Number(p.stock || 0) : null,
+      reason: "Write-off inventaire Excel",
+    };
+  });
 }
 
 function planOperations(recon, { warehouse = "W-EM2S-A", writeOffs = [] } = {}) {
@@ -120,6 +132,41 @@ function planOperations(recon, { warehouse = "W-EM2S-A", writeOffs = [] } = {}) 
         dbStock: it.dbStock, counted: it.qty, in: it.in, out: it.out,
         writeOff: wo ? wo.quantity : 0,
         failingStep: bad.step, stockAtFailure: bad.stock, steps,
+        message: "Cette opération produirait un stock négatif.",
+      });
+    }
+  }
+
+  /* Write-off portant sur un produit ABSENT de la feuille de stock : il
+     n'entre pas dans la boucle ci-dessus et échapperait au contrôle. On le
+     simule ici — un rebut sur un stock insuffisant doit bloquer au preview,
+     pas échouer à l'exécution. */
+  for (const w of writeOffs) {
+    if (!w.product_id) {
+      /* Produit ni en base, ni créé par l'import : le rebut serait perdu en
+         silence. On le remonte comme bloquant plutôt que de l'ignorer. */
+      const willBeCreated = newProducts.some(
+        (p) => require("./excel-inventory-parser").normName(p.desc)
+             === require("./excel-inventory-parser").normName(w.product_name)
+      );
+      if (!willBeCreated) {
+        blockingErrors.push({
+          product: { id: null, name: w.product_name },
+          dbStock: null, counted: null, in: 0, out: 0, writeOff: w.quantity,
+          failingStep: "WRITE_OFF_PRODUIT_INCONNU", stockAtFailure: null, steps: [],
+          message: "Write-off sur un produit absent de la base et non créé par l'import : il serait perdu.",
+        });
+      }
+      continue;
+    }
+    if (recon.items.some((i) => i.match && i.match.product_id === w.product_id)) continue;
+    const stock = Number(w.dbStock || 0) - w.quantity;
+    if (stock < 0) {
+      blockingErrors.push({
+        product: { id: w.product_id, name: w.product_name },
+        dbStock: Number(w.dbStock || 0), counted: null, in: 0, out: 0,
+        writeOff: w.quantity, failingStep: "WRITE_OFF", stockAtFailure: stock,
+        steps: [{ step: "WRITE_OFF", stock }],
         message: "Cette opération produirait un stock négatif.",
       });
     }

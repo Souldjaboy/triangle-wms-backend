@@ -62,15 +62,22 @@ module.exports = function createInventoryImportRouter(deps) {
     const db = await loadDbProducts(companyId);
     const recon = reconcile(rows, db);
 
-    /* Rebuts déjà enregistrés : on ne recrée jamais un write-off historique. */
-    const known = new Set(
+    /* Write-off déjà enregistrés — INFORMATION affichée, jamais un filtre.
+       La production les stocke avec type='casse' et status='WRITE OFF' :
+       un simple `type ILIKE '%WRITE%'` n'en voyait AUCUN. */
+    const previous = new Set(
       (await pool.query(
         `SELECT DISTINCT product_name FROM stock_movements
-          WHERE company_id = $1 AND type ILIKE '%WRITE%'`,
+          WHERE company_id = $1
+            AND (
+              UPPER(COALESCE(status, '')) = 'WRITE OFF'
+              OR UPPER(COALESCE(type, '')) LIKE '%WRITE%'
+              OR UPPER(COALESCE(type, '')) LIKE '%CASSE%'
+            )`,
         [companyId]
       )).rows.map((r) => parser.normName(r.product_name))
     );
-    const writeOffs = planWriteOffs(parser.readWriteOffSheet(buffer), db, known);
+    const writeOffs = planWriteOffs(parser.readWriteOffSheet(buffer), db, previous);
     const plan = planOperations(recon, { warehouse, writeOffs });
 
     /* Réceptions containers : rapprochées avec les IN du plan pour prouver
