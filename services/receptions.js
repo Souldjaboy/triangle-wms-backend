@@ -83,9 +83,23 @@ async function createReception(pool, {
   try {
     await client.query("BEGIN");
     const { warehouse } = await ensureWarehouse(client, companyId, warehouseCode);
-    const number = await nextReceptionNumber(client, companyId);
 
-    const reception = (await client.query(
+    /* UN SEUL conteneur = UNE SEULE réception. Si (conteneur, date) existe
+       déjà, on y AJOUTE les lignes au lieu de créer un doublon. */
+    let reception = null;
+    if (containerNumber) {
+      reception = (await client.query(
+        `SELECT * FROM stock_receptions
+          WHERE company_id=$1 AND container_number=$2
+            AND reception_date=COALESCE($3::date, CURRENT_DATE)
+          FOR UPDATE`,
+        [companyId, containerNumber, receptionDate]
+      )).rows[0] || null;
+    }
+    const number = reception ? reception.reception_number
+                             : await nextReceptionNumber(client, companyId);
+
+    if (!reception) reception = (await client.query(
       `INSERT INTO stock_receptions
          (company_id, warehouse_id, warehouse_code, reception_number, container_number,
           reception_date, source, source_file, status, notes, created_by)
@@ -95,22 +109,33 @@ async function createReception(pool, {
        receptionDate, source, sourceFile, RECEPTION_STATUS.PENDING, notes, user?.id || null]
     )).rows[0];
 
-    let n = 0;
+    /* Numérotation reprise après les lignes déjà présentes : ajouter les lignes
+       W-EM2S-C à une réception existante ne doit pas repartir de 1. */
+    let n = Number((await client.query(
+      `SELECT COALESCE(MAX(line_no),0) AS m FROM stock_reception_lines
+        WHERE reception_id=$1 AND company_id=$2`, [reception.id, companyId]
+    )).rows[0].m);
+    const firstLineNo = n + 1;
     for (const l of lines) {
       n += 1;
+      /* Chaque ligne porte SA destination : un conteneur peut être déchargé
+         sur plusieurs entrepôts. L'entrepôt d'en-tête ne sert que de défaut. */
+      const lw = await ensureWarehouse(client, companyId, l.warehouseCode || warehouseCode);
       await client.query(
         `INSERT INTO stock_reception_lines
            (company_id, reception_id, line_no, received_label, product_id, match_status,
-            unit, quantity_received, excel_sheet, excel_row, notes)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+            unit, quantity_received, excel_sheet, excel_row, notes,
+            warehouse_id, warehouse_code)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
         [companyId, reception.id, n, l.label, l.productId || null,
          l.matchStatus || (l.productId ? MATCH_STATUS.MATCHED : MATCH_STATUS.REVIEW),
-         l.unit || "EACH", l.quantity, l.sheet || null, l.excelRow || null, l.notes || null]
+         l.unit || "EACH", l.quantity, l.sheet || null, l.excelRow || null, l.notes || null,
+         lw.warehouse.id, lw.warehouse.code]
       );
     }
 
     await client.query("COMMIT");
-    return { reception, lineCount: n };
+    return { reception, lineCount: n - firstLineNo + 1, totalLines: n };
   } catch (e) {
     await client.query("ROLLBACK").catch(() => {});
     throw e;
@@ -184,7 +209,7 @@ async function putaway(pool, {
     const applied = await stockOps.createEntry(client, {
       companyId, productId: pid, quantity: qty, user,
       reason: `Mise en stock réception ${reception.reception_number}`,
-      destinationWarehouse: reception.warehouse_code,
+      destinationWarehouse: line.warehouse_code || reception.warehouse_code,
       locationCode, locationId,
       sourceReference: reception.reception_number,
     });
@@ -200,7 +225,7 @@ async function putaway(pool, {
           location_code, created_by)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
       [companyId, receptionId, lineId, pid, applied.movement.id, qty,
-       applied.stockBefore, applied.stockAfter, reception.warehouse_code,
+       applied.stockBefore, applied.stockAfter, line.warehouse_code || reception.warehouse_code,
        locationId, locationCode, user?.id || null]
     );
 
