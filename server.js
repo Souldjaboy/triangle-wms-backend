@@ -4041,87 +4041,48 @@ app.put(
       }
       const { final_quantity, correction_note } = req.body || {};
 
-      const movementResult = await pool.query(
-        `SELECT * FROM stock_movements
-       WHERE id=$1 AND company_id=$2`,
-        [id, companyId]
-      );
-
-      const movement = movementResult.rows[0];
-
-      if (!movement)
-        return res.status(404).json({ error: "Mouvement introuvable" });
-
-      if (movement.status !== "En attente") {
-        return res.status(400).json({ error: "Mouvement déjà traité" });
-      }
-
-      const approvedQuantity =
-        final_quantity !== undefined && final_quantity !== null
-          ? Number(final_quantity)
-          : Number(movement.quantity);
-
-      if (movement.type === "Entrée") {
-        await pool.query(
-          `UPDATE products SET stock = stock + $1
-         WHERE reference = $2 AND company_id=$3`,
-          [approvedQuantity, movement.product_reference, companyId]
+      /* Validation déléguée au service PARTAGÉ services/stock-operations.js,
+         désormais commun aux routes manuelles et à l'import d'inventaire.
+         Ce bloc appliquait auparavant le stock hors transaction, plafonnait les
+         sorties par GREATEST(stock-q,0) — ce qui faisait disparaître le surplus
+         sans trace — et validait en masse toutes les lignes partageant une
+         product_reference. Les trois comportements sont supprimés. */
+      const stockOps = require("./services/stock-operations");
+      const vClient = await pool.connect();
+      let movement, updateResult;
+      try {
+        await vClient.query("BEGIN");
+        const pre = await vClient.query(
+          `SELECT * FROM stock_movements WHERE id=$1 AND company_id=$2`, [id, companyId]
         );
+        movement = pre.rows[0];
+        if (!movement) { await vClient.query("ROLLBACK"); vClient.release();
+          return res.status(404).json({ error: "Mouvement introuvable" }); }
+
+        const applied = await stockOps.validateMovement(vClient, {
+          companyId, movementId: id, user: { id: req.user.id, name: req.user.email, role: req.user.role },
+          finalQuantity: final_quantity !== undefined && final_quantity !== null ? Number(final_quantity) : null,
+        });
+
+        if (correction_note) {
+          await vClient.query(
+            `UPDATE stock_movements SET correction_note=$1, modified_by=$2, modified_at=CURRENT_TIMESTAMP
+              WHERE id=$3 AND company_id=$4`,
+            [correction_note, req.user.id, id, companyId]
+          );
+        }
+        await vClient.query("COMMIT");
+        updateResult = { rows: [applied.movement] };
+      } catch (e) {
+        await vClient.query("ROLLBACK").catch(() => {});
+        vClient.release();
+        if (e && e.httpStatus) {
+          return res.status(e.httpStatus).json({ error: e.message, code: e.code, ...e.details });
+        }
+        throw e;
       }
-
-      if (movement.type === "Sortie") {
-        await pool.query(
-          `UPDATE products SET stock = GREATEST(stock - $1, 0)
-         WHERE reference = $2 AND company_id=$3`,
-          [approvedQuantity, movement.product_reference, companyId]
-        );
-      }
-
-      if (movement.type === "Transfert") {
-        await pool.query(
-          `UPDATE products SET warehouse = $1
-         WHERE reference = $2 AND company_id=$3`,
-          [movement.destination_warehouse || "", movement.product_reference, companyId]
-        );
-      }
-
-      if (movement.type === "Inventaire") {
-        await pool.query(
-          `UPDATE products SET stock = $1
-         WHERE reference = $2 AND company_id=$3`,
-          [approvedQuantity, movement.product_reference, companyId]
-        );
-
-        await pool.query(
-          `UPDATE inventory_history
-         SET status='Validé'
-         WHERE product_reference=$1 AND status='En attente'
-         AND company_id=$2`,
-          [movement.product_reference, companyId]
-        );
-      }
-
-      const updated = await pool.query(
-        `UPDATE stock_movements
-       SET status='Validé',
-           approval_status='Validé',
-           final_quantity=$1,
-           validated_by=$2,
-           validated_at=CURRENT_TIMESTAMP,
-           modified_by=CASE WHEN $3::boolean THEN $2 ELSE modified_by END,
-           modified_at=CASE WHEN $3::boolean THEN CURRENT_TIMESTAMP ELSE modified_at END,
-           correction_note=$4
-       WHERE id=$5 AND company_id=$6
-       RETURNING *`,
-        [
-          approvedQuantity,
-          req.user.id,
-          approvedQuantity !== Number(movement.quantity),
-          correction_note || "",
-          id,
-          companyId
-        ]
-      );
+      vClient.release();
+      const approvedQuantity = Number(updateResult.rows[0].final_quantity);
 
       await logActivity(
         "Administrateur",
