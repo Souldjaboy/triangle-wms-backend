@@ -88,6 +88,7 @@ module.exports = function createInventoryImportRouter(deps) {
           documents: plan.documents,
           preAdjustments: plan.preAdjustments, entries: plan.entries, exits: plan.exits,
           writeOffs: plan.writeOffs, transfers: plan.transfers || [],
+          blockingErrors: plan.blockingErrors,
           newProducts: plan.newProducts, blocked: plan.blocked,
           /* Ce que l'utilisateur doit vérifier AVANT de valider : ces cas ne
              sont jamais appliqués automatiquement. */
@@ -120,6 +121,15 @@ module.exports = function createInventoryImportRouter(deps) {
         }
         const warehouse = req.body?.warehouse || "W-EM2S-A";
         const { recon, plan } = await analyse(companyId, req.file.buffer, warehouse);
+        /* Double barrière : le frontend désactive déjà la confirmation, mais un
+           appel direct à l'API ne doit pas pouvoir contourner le contrôle. */
+        if (plan.blockingErrors.length > 0) {
+          return res.status(409).json({
+            error: `${plan.blockingErrors.length} produit(s) produiraient un stock négatif. Import refusé.`,
+            code: "BLOCKING_STOCK_ERROR",
+            blockingErrors: plan.blockingErrors.slice(0, 20),
+          });
+        }
         const result = await executeImport(pool, {
           companyId, plan, recon, warehouse, hash,
           fileName: req.file.originalname,
