@@ -32,14 +32,27 @@ const { ACTIONS } = require("./reconcile");
  * l'historique ferait perdre un rebut légitime. L'existence d'un write-off
  * antérieur est donc une INFORMATION affichée (alreadyExisting), pas un filtre.
  */
+/* Libellés abrégés de la feuille WRITE OFF, rattachés à une fiche existante par
+   DÉCISION HUMAINE tracée. « LAVABO » seul est ambigu — la base contient
+   LAVABO 6050, LAVABO SIMPLE et VIENJIC LAVABO ; le responsable du fichier a
+   confirmé qu'il s'agit de LAVABO 6050. Ce mapping ne vaut QUE pour la feuille
+   WRITE OFF et ne crée jamais de fiche produit. */
+const WRITE_OFF_ALIASES = new Map([
+  ["LAVABO", "LAVABO 6050"],
+]);
+
 function planWriteOffs(newWriteOffs, dbProducts, previousWriteOffNames = new Set()) {
   const { normName } = require("./excel-inventory-parser");
   return (newWriteOffs || []).map((w) => {
-    const key = normName(w.desc);
+    const raw = normName(w.desc);
+    const aliased = WRITE_OFF_ALIASES.get(raw);
+    const key = aliased ? normName(aliased) : raw;
     const p = dbProducts.find((x) => normName(x.name) === key);
     return {
       product: p ? { id: p.product_id, name: p.name } : { id: null, name: w.desc.trim() },
-      product_name: w.desc.trim(),
+      product_name: p ? p.name : w.desc.trim(),
+      excelLabel: w.desc.trim(),
+      resolvedByAlias: Boolean(aliased),
       product_id: p ? p.product_id : null,
       quantity: w.quantity,
       excelRow: w.excelRow,
@@ -210,4 +223,4 @@ function planOperations(recon, { warehouse = "W-EM2S-A", writeOffs = [] } = {}) 
   };
 }
 
-module.exports = { planOperations, planWriteOffs };
+module.exports = { planOperations, planWriteOffs, WRITE_OFF_ALIASES };
