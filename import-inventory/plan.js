@@ -20,7 +20,26 @@
 
 const { ACTIONS } = require("./reconcile");
 
-function planOperations(recon, { warehouse = "W-EM2S-A" } = {}) {
+/* Nouveaux rebuts constatés dans la feuille WRITE OFF. Les 161 unités
+   historiques déjà enregistrées ne sont JAMAIS recréées : seuls les articles
+   absents de l'historique sont proposés. */
+function planWriteOffs(newWriteOffs, dbProducts, existingWriteOffNames = new Set()) {
+  const { normName } = require("./excel-inventory-parser");
+  const out = [];
+  for (const w of newWriteOffs || []) {
+    const key = normName(w.desc);
+    if (existingWriteOffNames.has(key)) continue;          // déjà enregistré
+    const p = dbProducts.find((x) => normName(x.name) === key);
+    out.push({
+      product: p ? { id: p.product_id, name: p.name } : { id: null, name: w.desc },
+      quantity: w.quantity, reason: "Write-off inventaire Excel",
+      known: Boolean(p),
+    });
+  }
+  return out;
+}
+
+function planOperations(recon, { warehouse = "W-EM2S-A", writeOffs = [] } = {}) {
   const entries = [], exits = [], adjustments = [], newProducts = [], blocked = [];
   /* AJUSTEMENTS PRÉALABLES : quand la sortie du fichier dépasse ce que la base
      connaît, la sortie est impossible telle quelle. Le comptage physique fait
@@ -92,20 +111,23 @@ function planOperations(recon, { warehouse = "W-EM2S-A" } = {}) {
       goodsIssueNotes: exits.length ? 1 : 0,
       inventories: 1,
       priorAdjustments: preAdjustments.length,
+      writeOffs: writeOffs.length,
       inventoryAdjustments: adjustments.length,
       newProducts: newProducts.length,
     },
-    preAdjustments, entries, exits, adjustments, newProducts, blocked,
+    preAdjustments, entries, exits, adjustments, newProducts, blocked, writeOffs,
     totals: {
       warehouse, stockBefore,
       totalPriorAdjustments: totalPre, totalIn, totalOut, totalAdjustments: totalAdj,
+      totalWriteOff: writeOffs.reduce((s, w) => s + w.quantity, 0),
       /* Équation vérifiable : les ajustements préalables s'appliquent AVANT
          les mouvements, les ajustements finaux après. */
-      stockAfter: stockBefore + totalPre + totalIn - totalOut + totalAdj,
+      stockAfter: stockBefore + totalPre + totalIn - totalOut
+        - writeOffs.reduce((s, w) => s + w.quantity, 0) + totalAdj,
       untouchedDbOnly: recon.totals.dbOnly.length,
       untouchedDbOnlyStock: recon.totals.dbOnly.reduce((s, i) => s + i.dbStock, 0),
     },
   };
 }
 
-module.exports = { planOperations };
+module.exports = { planOperations, planWriteOffs };
