@@ -85,6 +85,84 @@ module.exports = function createStockReceptionsRouter(deps) {
     return groups;
   }
 
+  /* Déclaré AVANT /stock/receptions/:id, sinon "dashboard" serait pris pour un
+     identifiant. */
+  router.get("/stock/receptions/dashboard", authenticateToken, canView, async (req, res) => {
+    try {
+      res.json(await R.receptionDashboard(pool, companyOf(req)));
+    } catch (e) {
+      console.error("receptions dashboard:", e);
+      res.status(500).json({ error: "Erreur chargement des indicateurs." });
+    }
+  });
+
+  // ---------------- ENTREPÔTS ----------------
+  router.get("/stock/warehouses/summary", authenticateToken, canView, async (req, res) => {
+    try {
+      res.json(await R.warehouseSummary(pool, companyOf(req)));
+    } catch (e) {
+      console.error("warehouses summary:", e);
+      res.status(500).json({ error: "Erreur chargement des entrepôts." });
+    }
+  });
+
+  // ---------------- AIDE AU RAPPROCHEMENT ----------------
+  router.get("/stock/receptions/lines/:lineId/suggestions", authenticateToken, canView,
+    async (req, res) => {
+      try {
+        const companyId = companyOf(req);
+        const line = (await pool.query(
+          `SELECT id, received_label, unit, product_id, match_status
+             FROM stock_reception_lines WHERE id=$1 AND company_id=$2`,
+          [req.params.lineId, companyId]
+        )).rows[0];
+        if (!line) return res.status(404).json({ error: "Ligne introuvable." });
+        const out = await R.suggestProducts(
+          pool, companyId, req.query.q || line.received_label,
+          Math.min(Number(req.query.limit) || 3, 20)
+        );
+        res.json({ line, ...out });
+      } catch (e) {
+        console.error("line suggestions:", e);
+        res.status(500).json({ error: "Erreur de recherche de produits." });
+      }
+    });
+
+  /* Association confirmée par l'utilisateur. Rien n'est appliqué sur la seule
+     foi d'un score de similarité. */
+  router.patch("/stock/receptions/lines/:lineId", authenticateToken, canCreate, async (req, res) => {
+    try {
+      const b = req.body || {};
+      if (!b.productId) return res.status(400).json({ error: "Produit requis." });
+      const out = await R.confirmLineProduct(pool, {
+        companyId: companyOf(req), lineId: Number(req.params.lineId),
+        productId: Number(b.productId), applyToIdentical: Boolean(b.applyToIdentical),
+        receptionId: b.receptionId ? Number(b.receptionId) : null,
+      });
+      res.json({ success: true, ...out });
+    } catch (e) {
+      console.error("line confirm:", e);
+      res.status(e.httpStatus || 500).json({ error: e.message || "Erreur d'association.", code: e.code });
+    }
+  });
+
+  /* Création de fiche : uniquement sur action explicite, jamais à la consultation. */
+  router.post("/stock/receptions/lines/:lineId/product", authenticateToken, canCreate,
+    async (req, res) => {
+      try {
+        const b = req.body || {};
+        const out = await R.createProductForLine(pool, {
+          companyId: companyOf(req), lineId: Number(req.params.lineId),
+          name: b.name, unit: b.unit, category: b.category, reference: b.reference,
+          user: userOf(req),
+        });
+        res.status(201).json({ success: true, ...out, stockImpact: 0 });
+      } catch (e) {
+        console.error("line create product:", e);
+        res.status(e.httpStatus || 500).json({ error: e.message || "Erreur de création.", code: e.code, details: e.details });
+      }
+    });
+
   // ---------------- LISTE ----------------
   router.get("/stock/receptions", authenticateToken, canView, async (req, res) => {
     try {
@@ -117,7 +195,13 @@ module.exports = function createStockReceptionsRouter(deps) {
     try {
       const companyId = companyOf(req);
       const reception = (await pool.query(
-        `SELECT r.*, u.fullname AS created_by_name FROM stock_receptions r
+        /* Les entrepôts desservis viennent des LIGNES : un conteneur peut être
+           déchargé sur plusieurs entrepôts, l'en-tête ne porte que le défaut. */
+        `SELECT r.*, u.fullname AS created_by_name,
+                (SELECT STRING_AGG(DISTINCT l.warehouse_code, ', ')
+                   FROM stock_reception_lines l
+                  WHERE l.reception_id=r.id AND l.company_id=r.company_id) AS warehouses
+           FROM stock_receptions r
            LEFT JOIN users u ON u.id=r.created_by
           WHERE r.id=$1 AND r.company_id=$2`,
         [req.params.id, companyId]
@@ -149,10 +233,15 @@ module.exports = function createStockReceptionsRouter(deps) {
     try {
       const companyId = companyOf(req);
       const { rows } = await pool.query(
-        `SELECT pa.*, p.name AS product_name, u.fullname AS created_by_name
+        `SELECT pa.*, p.name AS product_name, p.reference AS product_reference,
+                u.fullname AS created_by_name,
+                l.received_label, l.unit, l.line_no,
+                r.reception_number, r.container_number, r.reception_date
            FROM stock_putaways pa
            LEFT JOIN products p ON p.id=pa.product_id
            LEFT JOIN users u ON u.id=pa.created_by
+           LEFT JOIN stock_reception_lines l ON l.id=pa.reception_line_id
+           LEFT JOIN stock_receptions r ON r.id=pa.reception_id
           WHERE pa.reception_id=$1 AND pa.company_id=$2
           ORDER BY pa.id`,
         [req.params.id, companyId]
@@ -284,6 +373,33 @@ module.exports = function createStockReceptionsRouter(deps) {
       console.error("reception putaway:", e);
       res.status(e.httpStatus || 500).json({ error: e.message || "Erreur de mise en stock.", code: e.code });
     }
+  });
+
+  /* Mise en stock de plusieurs lignes. Chaque ligne reste une transaction
+     indépendante : une ligne en échec n'annule pas celles déjà rangées, et le
+     détail de l'échec est renvoyé ligne par ligne plutôt que masqué. */
+  router.post("/stock/receptions/:id/putaway-bulk", authenticateToken, canApply, async (req, res) => {
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (!items.length) return res.status(400).json({ error: "Aucune ligne sélectionnée." });
+    const done = [], failed = [];
+    for (const it of items) {
+      try {
+        const out = await R.putaway(pool, {
+          companyId: companyOf(req), receptionId: Number(req.params.id),
+          lineId: Number(it.lineId), quantity: Number(it.quantity),
+          productId: it.productId ? Number(it.productId) : null,
+          locationCode: it.locationCode || null, locationId: it.locationId || null,
+          user: userOf(req),
+        });
+        done.push({ lineId: Number(it.lineId), ...out });
+      } catch (e) {
+        failed.push({ lineId: Number(it.lineId), error: e.message, code: e.code || "ERROR" });
+      }
+    }
+    res.status(failed.length && !done.length ? 409 : 201).json({
+      success: !failed.length, done, failed,
+      quantityPutaway: done.reduce((s, d) => s + Number(d.movement?.quantity || 0), 0),
+    });
   });
 
   // ---------------- RAPPORT CSV ----------------

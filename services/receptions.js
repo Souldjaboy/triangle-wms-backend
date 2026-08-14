@@ -13,6 +13,7 @@
  */
 
 const stockOps = require("./stock-operations");
+const { normName, similarity } = require("../import-inventory/excel-inventory-parser");
 
 const RECEPTION_STATUS = {
   PENDING: "RECEIVED_PENDING_PUTAWAY",
@@ -280,7 +281,236 @@ async function receptionTotals(runner, companyId, receptionId) {
   return rows[0];
 }
 
+/**
+ * AIDE AU RAPPROCHEMENT — propose, ne décide jamais.
+ *
+ * Les scores servent à ordonner des propositions à l'écran. Aucune association
+ * n'est appliquée automatiquement, quel que soit le score : c'est l'utilisateur
+ * qui confirme. Deux produits ne sont jamais fusionnés par similarité.
+ */
+async function suggestProducts(runner, companyId, label, limit = 3) {
+  const norm = normName(label);
+  const { rows } = await runner.query(
+    `SELECT id, name, reference, stock, unit, category, warehouse
+       FROM products WHERE company_id=$1 AND COALESCE(is_active,TRUE)=TRUE`,
+    [companyId]
+  );
+  const scored = rows.map((p) => {
+    const pn = normName(p.name);
+    let score = similarity(norm, pn);
+    // Un libellé entièrement contenu dans l'autre est un indice fort mais non décisif.
+    if (score < 1 && (pn.includes(norm) || norm.includes(pn))) {
+      score = Math.max(score, 0.85);
+    }
+    return { ...p, score: Math.round(score * 100), exact: pn === norm };
+  });
+  const exact = scored.filter((s) => s.exact);
+  return {
+    normalizedLabel: norm,
+    /* Plusieurs correspondances exactes = ambiguïté : on l'affiche au lieu de
+       trancher. */
+    exactCount: exact.length,
+    suggestions: scored.sort((a, b) => b.score - a.score || a.name.localeCompare(b.name))
+      .slice(0, limit)
+      .map(({ exact: _e, ...s }) => s),
+  };
+}
+
+/** Référence produit — même convention que le moteur d'import (`IMP-…`). */
+function productReferenceFor(label) {
+  return `IMP-${String(label).toUpperCase().replace(/[^A-Z0-9]+/g, "-").slice(0, 40)}`;
+}
+
+/**
+ * Confirme le produit d'une ligne. `applyToIdentical` n'étend la confirmation
+ * qu'aux lignes dont le libellé normalisé est STRICTEMENT identique — jamais
+ * entre deux libellés différents, si proches soient-ils.
+ */
+async function confirmLineProduct(pool, {
+  companyId, lineId, productId, applyToIdentical = false, receptionId = null,
+}) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const line = (await client.query(
+      `SELECT * FROM stock_reception_lines WHERE id=$1 AND company_id=$2 FOR UPDATE`,
+      [lineId, companyId]
+    )).rows[0];
+    if (!line) throw new ReceptionError("Ligne de réception introuvable.", "LINE_NOT_FOUND", 404);
+
+    const product = (await client.query(
+      `SELECT id, name FROM products WHERE id=$1 AND company_id=$2`, [productId, companyId]
+    )).rows[0];
+    if (!product) throw new ReceptionError("Produit introuvable.", "PRODUCT_NOT_FOUND", 404);
+
+    /* Une ligne déjà rangée garde son produit : changer la cible après coup
+       rendrait le mouvement de stock incohérent. */
+    if (Number(line.quantity_putaway) > 0 && Number(line.product_id) !== Number(productId)) {
+      throw new ReceptionError(
+        "Cette ligne est déjà partiellement rangée : son produit ne peut plus être changé.",
+        "ALREADY_PUTAWAY_LOCKED", 409
+      );
+    }
+
+    const applied = [];
+    const target = applyToIdentical
+      ? (await client.query(
+          `SELECT l.id, l.received_label, l.quantity_putaway
+             FROM stock_reception_lines l
+            WHERE l.company_id=$1 AND l.quantity_putaway=0
+              AND ($2::int IS NULL OR l.reception_id=$2)
+            FOR UPDATE`,
+          [companyId, receptionId]
+        )).rows.filter((l) => normName(l.received_label) === normName(line.received_label))
+      : [{ id: line.id }];
+
+    for (const t of target) {
+      await client.query(
+        `UPDATE stock_reception_lines
+            SET product_id=$1, match_status=$2, updated_at=NOW()
+          WHERE id=$3 AND company_id=$4`,
+        [productId, MATCH_STATUS.MATCHED, t.id, companyId]
+      );
+      applied.push(t.id);
+    }
+    await client.query("COMMIT");
+    return { product, lineIds: applied, count: applied.length };
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw e;
+  } finally { client.release(); }
+}
+
+/**
+ * Crée la fiche produit d'une ligne inconnue, puis l'associe. Stock initial 0 :
+ * la marchandise n'entre en stock qu'à la mise en stock, jamais à la création.
+ */
+async function createProductForLine(pool, {
+  companyId, lineId, name = null, unit = null, category = null, reference = null, user,
+}) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const line = (await client.query(
+      `SELECT * FROM stock_reception_lines WHERE id=$1 AND company_id=$2 FOR UPDATE`,
+      [lineId, companyId]
+    )).rows[0];
+    if (!line) throw new ReceptionError("Ligne de réception introuvable.", "LINE_NOT_FOUND", 404);
+    if (line.product_id) {
+      throw new ReceptionError("Cette ligne a déjà un produit associé.", "ALREADY_MATCHED", 409);
+    }
+
+    const label = String(name || line.received_label).trim();
+    if (!label) throw new ReceptionError("Nom de produit requis.", "NAME_REQUIRED", 400);
+
+    /* On ne crée jamais un doublon d'une fiche existante : si le nom normalisé
+       existe déjà, c'est une association, pas une création. */
+    const clash = (await client.query(
+      `SELECT id, name FROM products WHERE company_id=$1 AND COALESCE(is_active,TRUE)=TRUE`,
+      [companyId]
+    )).rows.filter((p) => normName(p.name) === normName(label));
+    if (clash.length) {
+      throw new ReceptionError(
+        `Un produit portant ce nom existe déjà (« ${clash[0].name} »). Associez-le au lieu d'en créer un second.`,
+        "PRODUCT_EXISTS", 409, { existing: clash }
+      );
+    }
+
+    const { rows } = await client.query(
+      `INSERT INTO products (company_id, name, reference, stock, unit, category, warehouse,
+                             is_active, created_at, updated_at)
+       VALUES ($1,$2,$3,0,$4,$5,$6,TRUE,NOW(),NOW()) RETURNING id, name, reference, unit, stock`,
+      [companyId, label, reference || productReferenceFor(label),
+       unit || line.unit || "EACH", category || "", line.warehouse_code || ""]
+    );
+    const product = rows[0];
+
+    await client.query(
+      `UPDATE stock_reception_lines
+          SET product_id=$1, match_status=$2, updated_at=NOW()
+        WHERE id=$3 AND company_id=$4`,
+      [product.id, MATCH_STATUS.MATCHED, lineId, companyId]
+    );
+    await client.query("COMMIT");
+    return { product, createdBy: user?.id || null };
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw e;
+  } finally { client.release(); }
+}
+
+/**
+ * Situation par entrepôt. Le stock disponible et la quantité en attente de
+ * rangement sont deux colonnes DISTINCTES : on ne les additionne jamais, sans
+ * quoi une marchandise encore sur le quai serait comptée comme disponible.
+ */
+async function warehouseSummary(runner, companyId) {
+  const { rows } = await runner.query(
+    `WITH pending AS (
+       SELECT l.warehouse_code AS code,
+              COALESCE(SUM(l.quantity_received - l.quantity_putaway),0)::numeric AS qty,
+              COUNT(DISTINCT l.reception_id) FILTER (
+                WHERE l.quantity_received > l.quantity_putaway)::int AS receptions
+         FROM stock_reception_lines l
+         JOIN stock_receptions r ON r.id=l.reception_id AND r.company_id=l.company_id
+        WHERE l.company_id=$1 AND r.status <> 'CANCELLED'
+        GROUP BY l.warehouse_code
+     ), putaway AS (
+       SELECT warehouse_code AS code,
+              COALESCE(SUM(quantity),0)::numeric AS qty
+         FROM stock_putaways WHERE company_id=$1 GROUP BY warehouse_code
+     ), stocked AS (
+       SELECT warehouse AS code, COALESCE(SUM(stock),0)::numeric AS qty,
+              COUNT(*)::int AS products
+         FROM products
+        WHERE company_id=$1 AND COALESCE(is_active,TRUE)=TRUE
+        GROUP BY warehouse
+     )
+     SELECT w.id, w.code, w.name, w.status,
+            COALESCE(s.qty,0)::numeric      AS stock_available,
+            COALESCE(s.products,0)::int     AS product_count,
+            COALESCE(pw.qty,0)::numeric     AS quantity_putaway,
+            COALESCE(p.qty,0)::numeric      AS quantity_pending,
+            COALESCE(p.receptions,0)::int   AS receptions_pending
+       FROM warehouses w
+       LEFT JOIN pending  p  ON UPPER(p.code)  = UPPER(w.code)
+       LEFT JOIN putaway  pw ON UPPER(pw.code) = UPPER(w.code)
+       LEFT JOIN stocked  s  ON UPPER(s.code)  = UPPER(w.code)
+      WHERE w.company_id=$1
+      ORDER BY w.code`,
+    [companyId]
+  );
+  return rows;
+}
+
+/** Indicateurs de tableau de bord — disponible et en attente restent séparés. */
+async function receptionDashboard(runner, companyId) {
+  const { rows } = await runner.query(
+    `SELECT
+       (SELECT COALESCE(SUM(stock),0)::numeric FROM products
+         WHERE company_id=$1 AND COALESCE(is_active,TRUE)=TRUE)          AS stock_available,
+       (SELECT COUNT(*)::int FROM stock_receptions
+         WHERE company_id=$1 AND status='RECEIVED_PENDING_PUTAWAY')      AS receptions_pending,
+       (SELECT COUNT(*)::int FROM stock_receptions
+         WHERE company_id=$1 AND status='PARTIALLY_PUTAWAY')             AS receptions_partial,
+       (SELECT COUNT(*)::int FROM stock_receptions
+         WHERE company_id=$1 AND status='PUTAWAY_COMPLETED')             AS receptions_completed,
+       (SELECT COALESCE(SUM(l.quantity_received - l.quantity_putaway),0)::numeric
+          FROM stock_reception_lines l
+          JOIN stock_receptions r ON r.id=l.reception_id AND r.company_id=l.company_id
+         WHERE l.company_id=$1 AND r.status <> 'CANCELLED')              AS quantity_pending,
+       (SELECT COUNT(*)::int FROM stock_reception_lines l
+          JOIN stock_receptions r ON r.id=l.reception_id AND r.company_id=l.company_id
+         WHERE l.company_id=$1 AND l.match_status='TO_REVIEW'
+           AND r.status <> 'CANCELLED')                                  AS lines_to_review`,
+    [companyId]
+  );
+  return rows[0];
+}
+
 module.exports = {
   RECEPTION_STATUS, STATUS_FR, MATCH_STATUS, ReceptionError,
   ensureWarehouse, createReception, putaway, receptionTotals, nextReceptionNumber,
+  suggestProducts, confirmLineProduct, createProductForLine, productReferenceFor,
+  warehouseSummary, receptionDashboard,
 };
