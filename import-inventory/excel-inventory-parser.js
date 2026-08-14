@@ -113,36 +113,88 @@ function readWriteOffSheet(src){
   return out;
 }
 
-/* Feuilles de réception W-EM2S-A / B / C. Le numéro de container et la date
-   figurent sur une ligne d'en-tête et valent pour les lignes qui suivent —
-   on les propage jusqu'au prochain en-tête. W-EM2S-B ne contient que des
-   en-têtes répétés : elle produit donc zéro réception, ce qui est correct. */
+/* Numéro de conteneur : 4 lettres, 5 à 7 chiffres, un chiffre de contrôle.
+   Séparateurs observés dans les fichiers réels : « : », « - », espace, et des
+   espaces parasites autour du « / ». */
+const CONTAINER_RE = /\b([A-Z]{4})\s*[:\-]?\s*(\d{5,7})\s*[\/\-]\s*(\d)\b/;
+function parseContainer(value){
+  if(value==null) return null;
+  const raw=String(value).trim();
+  const m=raw.match(CONTAINER_RE);
+  if(!m) return null;
+  return { raw, normalized:`${m[1].toUpperCase()} ${m[2]}/${m[3]}` };
+}
+/* Date d'en-tête : « DATE: 22/06/2026 », « DATE 22/6/2026 »… */
+function parseHeaderDate(value){
+  if(value==null) return null;
+  const t=String(value).replace(/^\s*DATE\s*:?\s*/i,"").trim();
+  const m=t.match(/^(\d{1,2})\s*\/\s*(\d{1,2})\s*\/\s*(\d{4})/);
+  if(!m) return null;
+  return `${m[3]}-${String(m[2]).padStart(2,"0")}-${String(m[1]).padStart(2,"0")}`;
+}
+
+/* Feuilles de réception W-EM2S-A / B / C.
+ *
+ * STRUCTURE RÉELLE, constatée dans le fichier — contre-intuitive :
+ *   L2  CONTAINER NUMBER | DATE: 22/06/2026 | ITEMS DESCRIPTION | UNITY | QTY
+ *   L3..L7   lignes produits
+ *   L11 MSNU: 5745901/ 6      <- le NUMÉRO arrive APRÈS les produits
+ *   L23 CONTAINER NUMBER | DATE: 17/07/2026 | ...   <- bloc suivant
+ *
+ * Le numéro ne peut donc pas être propagé vers le bas depuis l'en-tête : il
+ * faut délimiter le bloc (d'un en-tête au suivant), y chercher le numéro où
+ * qu'il soit, puis l'attribuer à toutes les lignes de CE bloc — jamais à celles
+ * d'un bloc antérieur.
+ *
+ * Un bloc sans numéro exploitable laisse container_number à NULL et marque ses
+ * lignes TO_REVIEW_CONTAINER : on n'invente jamais un numéro.
+ */
 function readReceptionSheets(src, sheetNames=["W-EM2S-A","W-EM2S-B","W-EM2S-C"]){
   const wb=openWorkbook(src); const out=[];
+  const isHeader=(r)=>r && r[0]!=null && /CONT[AE]INER\s*NUMBER/i.test(String(r[0]));
+
   for(const name of sheetNames){
     const ws=wb.Sheets[name]; if(!ws) continue;
     const rows=XLSX.utils.sheet_to_json(ws,{header:1,defval:null,raw:true});
-    let container=null, date=null;
-    for(let i=0;i<rows.length;i++){
-      const r=rows[i]||[];
-      const c0=r[0]!=null?String(r[0]).trim():"";
-      const c2=r[2]!=null?String(r[2]).trim():"";
-      if(/CONTAINER NUMBER/i.test(c0)||/^DATE/i.test(c2)){
-        // Ligne d'en-tête : mémorise container et date pour les lignes suivantes.
-        const mC=c0.match(/[A-Z]{3,4}\s*:?\s*[\d\/ ]{5,}/i); if(mC) container=mC[0].trim();
-        const mD=c2.replace(/^DATE\s*:?\s*/i,"").trim(); if(mD) date=mD;
-        continue;
+
+    // 1re passe : bornes des blocs.
+    const starts=[];
+    rows.forEach((r,i)=>{ if(isHeader(r)) starts.push(i); });
+
+    for(let b=0;b<starts.length;b++){
+      const from=starts[b];
+      const to=(b+1<starts.length?starts[b+1]:rows.length);
+      const header=rows[from]||[];
+      const date=parseHeaderDate(header[2]);
+
+      // 2e passe : le numéro, n'importe où DANS le bloc.
+      let container=null;
+      for(let i=from;i<to && !container;i++){
+        const r=rows[i]||[];
+        for(const cell of r){ const c=parseContainer(cell); if(c){ container=c; break; } }
       }
-      if(/RECEIVED ITEMS/i.test(c0)) continue;
-      const desc=r[4]!=null?String(r[4]).trim():"";
-      if(!desc||/ITEMS? DESCRIPTION/i.test(desc)) continue;
-      const q=parseQty(r[8]);
-      if(!(q.n>0)) continue;
-      out.push({sheet:name,warehouse:name,container,date,desc,norm:normName(desc),
-                unit:r[7]!=null?String(r[7]).trim():"EA",quantity:q.n,excelRow:i+1});
+
+      // 3e passe : les lignes produits du bloc.
+      for(let i=from+1;i<to;i++){
+        const r=rows[i]||[]; if(isHeader(r)) continue;
+        const desc=r[4]!=null?String(r[4]).trim():"";
+        if(!desc||/ITEMS? DESCRIPTION|RECEIVED ITEMS/i.test(desc)) continue;
+        if(parseContainer(desc)) continue;              // ligne de numéro, pas un produit
+        const q=parseQty(r[8]);
+        if(!(q.n>0)) continue;
+        out.push({
+          sheet:name, warehouse:name, block:b+1,
+          container:container?container.normalized:null,
+          containerRaw:container?container.raw:null,
+          date, desc, norm:normName(desc),
+          unit:r[7]!=null?String(r[7]).trim():"EA",
+          quantity:q.n, excelRow:i+1,
+          status:container?null:"TO_REVIEW_CONTAINER",
+        });
+      }
     }
   }
   return out;
 }
 
-module.exports={normName,parseQty,similarity,readCsv,readStockSheet,readWriteOffSheet,readReceptionSheets,openWorkbook,XLSX};
+module.exports={normName,parseQty,similarity,readCsv,readStockSheet,readWriteOffSheet,readReceptionSheets,parseContainer,openWorkbook,XLSX};
