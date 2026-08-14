@@ -32,13 +32,13 @@ const { ACTIONS } = require("./reconcile");
  * l'historique ferait perdre un rebut légitime. L'existence d'un write-off
  * antérieur est donc une INFORMATION affichée (alreadyExisting), pas un filtre.
  */
-/* Libellés abrégés de la feuille WRITE OFF, rattachés à une fiche existante par
-   DÉCISION HUMAINE tracée. « LAVABO » seul est ambigu — la base contient
-   LAVABO 6050, LAVABO SIMPLE et VIENJIC LAVABO ; le responsable du fichier a
-   confirmé qu'il s'agit de LAVABO 6050. Ce mapping ne vaut QUE pour la feuille
-   WRITE OFF et ne crée jamais de fiche produit. */
+/* Libellés abrégés de la feuille WRITE OFF, rattachés à une fiche par DÉCISION
+   HUMAINE tracée — jamais par déduction du moteur.
+   « LAVABO » : le responsable avait d'abord indiqué LAVABO 6050, puis corrigé —
+   il s'agit d'UNDERCOUNTER BASIN/BC-8322, autrefois saisi « SANITARY WAR ».
+   LAVABO 6050 et LAVABO SIMPLE restent donc à 0 avec leur seul historique. */
 const WRITE_OFF_ALIASES = new Map([
-  ["LAVABO", "LAVABO 6050"],
+  ["LAVABO", "UNDERCOUNTER BASIN/BC-8322"],
 ]);
 
 function planWriteOffs(newWriteOffs, dbProducts, previousWriteOffNames = new Set()) {

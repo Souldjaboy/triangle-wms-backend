@@ -26,6 +26,10 @@ const VALIDATED_ALIASES = new Map([
   ["PROFESSIONNAL SOUND SYSTEME", "PROFESSIONAL SOUND SYSTHEME"],
   ["TOURNIQUE D'ENTREE", "TOURNIQUET D'ENTREE"],
   ["TOURNIAUET D'ENTREE", "TOURNIQUET D'ENTREE"],
+  /* Ancien libellé du même article, confirmé par le responsable du fichier.
+     Il n'apparaît plus dans le classeur actuel ; l'alias couvre les fichiers
+     antérieurs et garantit qu'une seule fiche sera créée. */
+  ["SANITARY WAR", "UNDERCOUNTER BASIN/BC-8322"],
 ]);
 
 const ACTIONS = {
