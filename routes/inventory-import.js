@@ -23,6 +23,7 @@ const parser = require("../import-inventory/excel-inventory-parser");
 const { reconcile } = require("../import-inventory/reconcile");
 const { planOperations, planWriteOffs } = require("../import-inventory/plan");
 const { executeImport, rollbackImport, fileHash } = require("../import-inventory/execute");
+const { reconcileReceptions, detectTransfers } = require("../import-inventory/receptions");
 
 module.exports = function createInventoryImportRouter(deps) {
   const { pool, authenticateToken, getEffectiveCompanyId, requirePermission, upload } = deps;
@@ -37,11 +38,19 @@ module.exports = function createInventoryImportRouter(deps) {
   /** Produits de l'entreprise active, au format attendu par le réconciliateur. */
   async function loadDbProducts(companyId) {
     const { rows } = await pool.query(
-      `SELECT id AS product_id, reference, name, stock, unit, warehouse,
-              location_id, location_code
-         FROM products
-        WHERE company_id = $1 AND COALESCE(is_active, TRUE) = TRUE
-        ORDER BY name`,
+      /* Les composantes d'emplacement (rayon, case, niveau, bin) vivent dans
+         `locations`, pas dans `products` : sans cette jointure la détection de
+         transfert n'aurait rien à comparer. LEFT JOIN — un produit sans
+         emplacement connu reste listé, il ne produira simplement aucun
+         transfert. */
+      `SELECT p.id AS product_id, p.reference, p.name, p.stock, p.unit, p.warehouse,
+              p.location_id, p.location_code,
+              l.rayon_code, l.case_code, l.level_code, l.bin_code, l.warehouse_code
+         FROM products p
+         LEFT JOIN locations l
+           ON l.id = p.location_id AND l.company_id = p.company_id
+        WHERE p.company_id = $1 AND COALESCE(p.is_active, TRUE) = TRUE
+        ORDER BY p.name`,
       [companyId]
     );
     return rows;
@@ -63,7 +72,19 @@ module.exports = function createInventoryImportRouter(deps) {
     );
     const writeOffs = planWriteOffs(parser.readWriteOffSheet(buffer), db, known);
     const plan = planOperations(recon, { warehouse, writeOffs });
-    return { recon, plan, rowsRead: rows.length };
+
+    /* Réceptions containers : rapprochées avec les IN du plan pour prouver
+       qu'aucun stock n'est compté deux fois. */
+    const receptions = reconcileReceptions(
+      parser.readReceptionSheets(buffer), plan.entries
+    );
+    /* Transferts : produits dont SEUL l'emplacement change. */
+    const transfers = detectTransfers(recon.items, { warehouse: warehouse || "W-EM2S-A" });
+    plan.transfers = transfers;
+    plan.documents.receptions = receptions.totals.total;
+    plan.documents.transfers = transfers.length;
+
+    return { recon, plan, receptions, rowsRead: rows.length };
   }
 
   // ---------------- PREVIEW — n'écrit rien ----------------
@@ -72,7 +93,7 @@ module.exports = function createInventoryImportRouter(deps) {
       try {
         if (!req.file) return res.status(400).json({ error: "Aucun fichier reçu." });
         const companyId = companyOf(req);
-        const { recon, plan, rowsRead } = await analyse(companyId, req.file.buffer, req.body?.warehouse);
+        const { recon, plan, receptions, rowsRead } = await analyse(companyId, req.file.buffer, req.body?.warehouse);
         const hash = fileHash(req.file.buffer);
 
         const already = (await pool.query(
@@ -88,6 +109,7 @@ module.exports = function createInventoryImportRouter(deps) {
           documents: plan.documents,
           preAdjustments: plan.preAdjustments, entries: plan.entries, exits: plan.exits,
           writeOffs: plan.writeOffs, transfers: plan.transfers || [],
+          receptions: { totals: receptions.totals, items: receptions.items.slice(0, 200) },
           blockingErrors: plan.blockingErrors,
           newProducts: plan.newProducts, blocked: plan.blocked,
           /* Ce que l'utilisateur doit vérifier AVANT de valider : ces cas ne

@@ -113,4 +113,36 @@ function readWriteOffSheet(src){
   return out;
 }
 
-module.exports={normName,parseQty,similarity,readCsv,readStockSheet,readWriteOffSheet,openWorkbook,XLSX};
+/* Feuilles de réception W-EM2S-A / B / C. Le numéro de container et la date
+   figurent sur une ligne d'en-tête et valent pour les lignes qui suivent —
+   on les propage jusqu'au prochain en-tête. W-EM2S-B ne contient que des
+   en-têtes répétés : elle produit donc zéro réception, ce qui est correct. */
+function readReceptionSheets(src, sheetNames=["W-EM2S-A","W-EM2S-B","W-EM2S-C"]){
+  const wb=openWorkbook(src); const out=[];
+  for(const name of sheetNames){
+    const ws=wb.Sheets[name]; if(!ws) continue;
+    const rows=XLSX.utils.sheet_to_json(ws,{header:1,defval:null,raw:true});
+    let container=null, date=null;
+    for(let i=0;i<rows.length;i++){
+      const r=rows[i]||[];
+      const c0=r[0]!=null?String(r[0]).trim():"";
+      const c2=r[2]!=null?String(r[2]).trim():"";
+      if(/CONTAINER NUMBER/i.test(c0)||/^DATE/i.test(c2)){
+        // Ligne d'en-tête : mémorise container et date pour les lignes suivantes.
+        const mC=c0.match(/[A-Z]{3,4}\s*:?\s*[\d\/ ]{5,}/i); if(mC) container=mC[0].trim();
+        const mD=c2.replace(/^DATE\s*:?\s*/i,"").trim(); if(mD) date=mD;
+        continue;
+      }
+      if(/RECEIVED ITEMS/i.test(c0)) continue;
+      const desc=r[4]!=null?String(r[4]).trim():"";
+      if(!desc||/ITEMS? DESCRIPTION/i.test(desc)) continue;
+      const q=parseQty(r[8]);
+      if(!(q.n>0)) continue;
+      out.push({sheet:name,warehouse:name,container,date,desc,norm:normName(desc),
+                unit:r[7]!=null?String(r[7]).trim():"EA",quantity:q.n,excelRow:i+1});
+    }
+  }
+  return out;
+}
+
+module.exports={normName,parseQty,similarity,readCsv,readStockSheet,readWriteOffSheet,readReceptionSheets,openWorkbook,XLSX};
