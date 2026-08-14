@@ -17456,6 +17456,15 @@ const inventoryImportUpload = multer({
     cb(ok ? null : new Error("Format non supporté (.xlsx, .xls ou .csv attendu)."), ok);
   },
 });
+const createStockReceptionsRouter = require("./routes/stock-receptions");
+app.use(
+  "/",
+  createStockReceptionsRouter({
+    pool, authenticateToken, getEffectiveCompanyId, requirePermission,
+    upload: inventoryImportUpload,
+  })
+);
+
 const createInventoryImportRouter = require("./routes/inventory-import");
 app.use(
   "/",
