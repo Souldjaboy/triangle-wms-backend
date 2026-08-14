@@ -67,8 +67,12 @@ function readCsv(p){
   const H=split(lines[0]);
   return lines.slice(1).map(l=>{const v=split(l);const o={};H.forEach((h,i)=>o[h.trim()]=v[i]!==undefined?v[i].trim():"");return o;});
 }
-function readStockSheet(xlsxPath){
-  const wb=XLSX.readFile(xlsxPath);
+/* Accepte un chemin OU un Buffer : l'upload HTTP fournit un Buffer. */
+function openWorkbook(src){
+  return Buffer.isBuffer(src) ? XLSX.read(src,{type:"buffer"}) : XLSX.readFile(src);
+}
+function readStockSheet(src){
+  const wb=openWorkbook(src);
   const rows=XLSX.utils.sheet_to_json(wb.Sheets["LISTE DES STOCK"],{header:1,defval:null,raw:true});
   let h=-1; rows.forEach((r,i)=>{if(h<0&&r.some(c=>String(c||"").toUpperCase().includes("ITEM DESCRIPTION")))h=i;});
   const H=rows[h].map(c=>String(c||"").toUpperCase().trim());
@@ -91,4 +95,22 @@ function readStockSheet(xlsxPath){
   }
   return out;
 }
-module.exports={normName,parseQty,similarity,readCsv,readStockSheet,XLSX};
+/* Feuille WRITE OFF : deux listes côte à côte. Seule la seconde (« LISTE DES
+   WRITE OFF 2 ») contient les NOUVEAUX rebuts ; la première est l'historique
+   déjà enregistré et ne doit jamais être réimportée. */
+function readWriteOffSheet(src){
+  const wb=openWorkbook(src);
+  const ws=wb.Sheets["WRITE OFF"]; if(!ws) return [];
+  const rows=XLSX.utils.sheet_to_json(ws,{header:1,defval:null,raw:true});
+  const out=[];
+  for(let i=2;i<rows.length;i++){
+    const r=rows[i]||[];
+    const d=r[7]!=null?String(r[7]).trim():"";
+    if(!d||/^LISTE|^ITEM/i.test(d)) continue;
+    const q=parseQty(r[10]);
+    if(q.n>0) out.push({desc:d,quantity:q.n,excelRow:i+1});
+  }
+  return out;
+}
+
+module.exports={normName,parseQty,similarity,readCsv,readStockSheet,readWriteOffSheet,openWorkbook,XLSX};

@@ -4109,7 +4109,7 @@ app.put(
         });
       }
 
-      res.json(updated.rows[0]);
+      res.json(updateResult.rows[0]);
     } catch (error) {
       console.error(error);
       res.status(500).json({ error: "Erreur validation mouvement" });
@@ -17443,6 +17443,28 @@ app.use(
     isSuperAdminUser,
     requirePermission: importRolePermission,
     accounting: { nextAccountingNumber, createAccountingEntry },
+  })
+);
+
+/* Import d'inventaire Excel : fichier gardé en mémoire, jamais écrit sur disque
+   — il ne sert qu'à l'analyse et son empreinte SHA-256 assure l'idempotence. */
+const inventoryImportUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const ok = /\.(xlsx|xls|csv)$/i.test(file.originalname || "");
+    cb(ok ? null : new Error("Format non supporté (.xlsx, .xls ou .csv attendu)."), ok);
+  },
+});
+const createInventoryImportRouter = require("./routes/inventory-import");
+app.use(
+  "/",
+  createInventoryImportRouter({
+    pool,
+    authenticateToken,
+    getEffectiveCompanyId,
+    requirePermission,
+    upload: inventoryImportUpload,
   })
 );
 
