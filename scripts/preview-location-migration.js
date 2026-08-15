@@ -35,17 +35,12 @@ const ACTIONS = {
 
 const norm = (s) => String(s || "").toUpperCase().replace(/\s+/g, " ").trim();
 
-/* Un emplacement de rebut n'est pas un bac physique, et un bin « non précisé »
-   ne localise rien : aucun des deux ne peut recevoir automatiquement du stock.
-   Les produits concernés partent en TO_REVIEW_LOCATION. */
-const WRITE_OFF_RE = /\bWRITE[\s_-]*OFF\b|\bREBUT\b|\bCASSE\b/i;
-const NON_PRECISE_RE = /NON[\s_-]*PRECISE|NON[\s_-]*PRÉCIS|\bN\/?A\b|\bINCONNU\b|\bDIVERS\b/i;
-const isPhysicalBin = (l) => {
-  const parts = [l.warehouse_code, l.row_code, l.loc_code, l.lvl_code, l.bin_code];
-  if (parts.some((c) => WRITE_OFF_RE.test(String(c || "")))) return false;
-  const bin = String(l.bin_code || "").trim();
-  return Boolean(bin) && !NON_PRECISE_RE.test(bin);
-};
+/* Règle partagée : rebut, bin non précisé, plage « BIN1-2 » et composantes
+   générées ne sont pas des bacs. Les produits concernés partent en
+   TO_REVIEW_LOCATION plutôt que d'être migrés automatiquement. */
+const rules = require("../services/location-rules");
+const { WRITE_OFF_RE } = rules;
+const isPhysicalBin = (l) => rules.isPhysicalBin(l);
 
 async function main() {
   const companyId = Number(arg("company"));
@@ -145,11 +140,7 @@ async function main() {
       const l0 = liste[0].loc;
       action = ACTIONS.TO_REVIEW_LOCATION;
       confiance = 0;
-      motif = WRITE_OFF_RE.test(`${l0.warehouse_code} ${l0.row_code} ${l0.loc_code} ${l0.lvl_code} ${l0.bin_code}`)
-        ? "emplacement de rebut (WRITE OFF) : ce n'est pas un bac physique"
-        : !String(l0.bin_code || "").trim()
-          ? "emplacement sans BIN : destination physique incomplète"
-          : `bin « ${l0.bin_code} » non précisé : ne localise aucun contenant`;
+      motif = rules.MOTIF_FR[rules.rejectionReason(l0)] || "emplacement non exploitable";
     } else if (liste.length > 1) {
       action = ACTIONS.TO_REVIEW_LOCATION;
       confiance = 0;

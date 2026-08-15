@@ -33,15 +33,12 @@ class LocationStockError extends Error {
 
 const num = (v) => Number(v || 0);
 
-/* Un emplacement de rebut est un ÉTAT, pas un contenant ; un bin « non
-   précisé » n'est pas un contenant non plus. Ni l'un ni l'autre ne peut
-   recevoir de stock ni être proposé comme destination. */
-const WRITE_OFF_RE = /\bWRITE[\s_-]*OFF\b|\bREBUT\b|\bCASSE\b/i;
-const NON_PRECISE_RE = /NON[\s_-]*PRECISE|NON[\s_-]*PRÉCIS|\bN\/?A\b|\bINCONNU\b|\bDIVERS\b/i;
-const isWriteOffLocation = (l) =>
-  [l.warehouse_code, l.rayon_code, l.zone, l.case_code, l.rayon,
-   l.level_code, l.etagere, l.bin_code, l.emplacement_code]
-    .some((c) => WRITE_OFF_RE.test(String(c || "")));
+/* « Qu'est-ce qu'un vrai bac ? » vit dans services/location-rules.js, partagé
+   par le moteur, les previews et les migrations : une seule définition, donc
+   aucun écran ne peut autoriser ce qu'un autre refuse. */
+const rules = require("./location-rules");
+const { WRITE_OFF_RE, NON_PRECISE_RE } = rules;
+const isWriteOffLocation = (l) => rules.isWriteOff(l);
 
 /* ------------------------------------------------------------------ lecture */
 
@@ -133,12 +130,15 @@ async function lockLocation(client, companyId, locationId) {
       "WRITE_OFF_NOT_A_LOCATION", 409, { locationId }
     );
   }
-  /* Un bin « non précisé » ne désigne aucun contenant : y entasser plusieurs
-     produits ferait croire à une localisation qui n'existe pas. */
-  if (NON_PRECISE_RE.test(String(loc.bin_code).trim())) {
+  /* Bin non précisé, plage « BIN1-2 » ou composantes générées : aucun de ces
+     emplacements ne désigne un contenant. Y ranger du stock ferait croire à
+     une localisation qui n'existe pas. */
+  const motif = rules.rejectionReason(loc);
+  if (motif) {
     throw new LocationStockError(
-      `Le bin « ${loc.bin_code} » n'est pas précisé : localisez la marchandise avant de la ranger.`,
-      "BIN_NOT_SPECIFIED", 409, { locationId }
+      `L'emplacement « ${loc.full_code || loc.emplacement_code || loc.id} » n'est pas un bac exploitable : ${rules.MOTIF_FR[motif]}.`,
+      motif === "LEGACY_PLACEHOLDER" ? "LEGACY_PLACEHOLDER" : "BIN_NOT_SPECIFIED",
+      409, { locationId, motif }
     );
   }
   return loc;
