@@ -273,6 +273,11 @@ async function main() {
   }
 
   // ------------------------------------------------ contrôle final exigé (§14)
+  /* §13 — simulation : on retire du décompte les groupes que la consolidation
+     ferait disparaître (CONSOLIDATE), ceux exclus comme rebut et ceux dont le
+     bin n'est pas précisé. Ce qui reste est ce qui bloquerait ENCORE 061. */
+  const simuler = process.argv.includes("--simulate-consolidation");
+
   const [neg] = (await pool.query(
     `SELECT COUNT(*)::int AS n FROM products
       WHERE company_id = $1 AND COALESCE(is_active,TRUE) = TRUE AND stock < 0`, [companyId]
@@ -301,6 +306,39 @@ async function main() {
     )).rows.map((r) => r.full_code)
   );
 
+  /* Un groupe disparaît par consolidation dès lors que toutes ses lignes
+     désignent le même bac : c'est le cas CONSOLIDATE du preview dédié. */
+  let bloquantsApres = bloquants.size;
+  if (simuler) {
+    const restants = (await pool.query(
+      `WITH codes AS (
+         SELECT id, warehouse_id, bin_code,
+                UPPER(TRIM(COALESCE(NULLIF(rayon_code,''), zone, '')))  AS r,
+                UPPER(TRIM(COALESCE(NULLIF(case_code,''),  rayon, ''))) AS c,
+                UPPER(TRIM(COALESCE(NULLIF(level_code,''), etagere,''))) AS l,
+                ARRAY_TO_STRING(ARRAY[
+                  NULLIF(TRIM(COALESCE(warehouse_code,'')),''),
+                  NULLIF(TRIM(COALESCE(NULLIF(rayon_code,''), zone)),''),
+                  NULLIF(TRIM(COALESCE(NULLIF(case_code,''),  rayon)),''),
+                  NULLIF(TRIM(COALESCE(NULLIF(level_code,''), etagere)),''),
+                  NULLIF(TRIM(COALESCE(bin_code,'')),'')
+                ], '-') AS full_code
+           FROM locations WHERE company_id = $1
+       )
+       SELECT full_code FROM codes
+        WHERE COALESCE(TRIM(bin_code),'') <> ''
+          AND bin_code !~* '(WRITE[[:space:]_-]*OFF|REBUT|CASSE|NON[[:space:]_-]*PRECISE|NON[[:space:]_-]*PRÉCIS|INCONNU|DIVERS)'
+          AND full_code !~* '(WRITE[[:space:]_-]*OFF|REBUT)'
+        GROUP BY full_code
+       HAVING COUNT(*) > 1
+          /* La consolidation ne résout que les groupes homogènes : même
+             entrepôt, mêmes composantes. Un groupe hétérogène resterait. */
+          AND (COUNT(DISTINCT warehouse_id) > 1 OR COUNT(DISTINCT r) > 1
+               OR COUNT(DISTINCT c) > 1 OR COUNT(DISTINCT l) > 1)`, [companyId]
+    )).rows;
+    bloquantsApres = restants.length;
+  }
+
   const unites = (a) => somme(par(a));
   console.log(`\n${"═".repeat(74)}`);
   console.log("CONTRÔLE AVANT MIGRATION");
@@ -310,16 +348,20 @@ async function main() {
   console.log(`  différence                  ${n(0)}`);
   console.log(`  stock négatif               ${n(neg.n)}`);
   console.log(`  doublons physiques bloquants ${n(bloquants.size)}   (rebuts et bins non précisés exclus)`);
+  if (simuler) {
+    console.log(`  ── APRÈS CONSOLIDATION SIMULÉE ──`);
+    console.log(`  doublons restants           ${n(bloquantsApres)}`);
+  }
   console.log("  ─────────────────────────────────────────────");
   console.log(`  AUTO_MIGRATABLE             ${String(n(auto.length)).padStart(5)} produits   ${String(n(unites(ACTIONS.AUTO_MATCH))).padStart(9)} unités`);
   console.log(`  TO_REVIEW_LOCATION          ${String(n(par(ACTIONS.TO_REVIEW_LOCATION).length)).padStart(5)} produits   ${String(n(unites(ACTIONS.TO_REVIEW_LOCATION))).padStart(9)} unités`);
   console.log(`  AMBIGUOUS_LOCATION          ${String(n(par(ACTIONS.AMBIGUOUS_LOCATION).length)).padStart(5)} produits   ${String(n(unites(ACTIONS.AMBIGUOUS_LOCATION))).padStart(9)} unités`);
   console.log(`  NO_LOCATION                 ${String(n(par(ACTIONS.NO_LOCATION).length)).padStart(5)} produits   ${String(n(unites(ACTIONS.NO_LOCATION))).padStart(9)} unités`);
   console.log(`  ZERO_STOCK                  ${String(n(par(ACTIONS.ZERO_STOCK).length)).padStart(5)} produits   ${String(n(unites(ACTIONS.ZERO_STOCK))).padStart(9)} unités`);
-  const feuVert = neg.n === 0 && bloquants.size === 0;
+  const feuVert = neg.n === 0 && (simuler ? bloquantsApres : bloquants.size) === 0;
   console.log(`\n  ${feuVert ? "FEU VERT" : "BLOQUÉ"} : ` + (feuVert
     ? "aucun stock négatif, aucun doublon bloquant — 061 peut être exécutée."
-    : `${neg.n} stock(s) négatif(s) et ${bloquants.size} doublon(s) à traiter AVANT 061.`));
+    : `${neg.n} stock(s) négatif(s) et ${simuler ? bloquantsApres : bloquants.size} doublon(s) à traiter AVANT 061.`));
 
   console.log("\n" + "═".repeat(74));
   console.log("Aucune balance créée. Aucun stock modifié. Aucune migration exécutée.");
