@@ -96,8 +96,21 @@ node scripts/preview-location-consolidation.js --company="$COMPANY" \
 
 # ── 4. EXÉCUTION ────────────────────────────────────────────────────────────
 echo
-echo "### 4/5 — EXÉCUTION DE 061a ###"
+echo "### 4/5 — ESSAI À BLANC (aucune écriture) ###"
 echo "La migration refuse d'agir si elle ne trouve pas exactement $EXPECTED groupe(s)."
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -v dry_run=true \
+     -v company_id="$COMPANY" -v expected_groups="$EXPECTED" \
+     -f sql/061a_prepare_physical_locations.sql
+
+if [ "${DRY_RUN:-}" = "1" ]; then
+  echo
+  echo "DRY_RUN=1 : essai à blanc uniquement, la base est inchangée."
+  echo "Relancez sans DRY_RUN pour appliquer réellement."
+  exit 0
+fi
+
+echo
+echo "### 4bis/5 — EXÉCUTION RÉELLE DE 061a ###"
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
      -v company_id="$COMPANY" -v expected_groups="$EXPECTED" \
      -f sql/061a_prepare_physical_locations.sql

@@ -29,6 +29,14 @@
 
 \set ON_ERROR_STOP on
 
+/* Essai à blanc : tout est exécuté et contrôlé, puis ANNULÉ. Permet de voir
+   les groupes dérivés et le résultat des contrôles sans rien écrire.
+   Activé par  -v dry_run=true  ; absent, la migration s'applique. */
+\if :{?dry_run}
+\else
+  \set dry_run false
+\endif
+
 BEGIN;
 
 -- ═════════════════════════════════════════════════════════════════════════
@@ -357,4 +365,10 @@ BEGIN
     ap.stock_total, ap.produits, ap.negatifs;
 END $$;
 
-COMMIT;
+\if :dry_run
+  \echo ''
+  \echo '*** ESSAI À BLANC — tout est annulé, la base est inchangée. ***'
+  ROLLBACK;
+\else
+  COMMIT;
+\endif
