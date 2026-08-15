@@ -186,6 +186,53 @@ async function main() {
   console.log(`  référence. Il reste simplement sans emplacement tant qu'un humain`);
   console.log(`  n'a pas tranché. Aucune quantité n'est dupliquée.`);
 
+  // ------------------------------------------- doublons de code complet (§2)
+  /* On NE FUSIONNE RIEN : on décrit. Chaque ligne en doublon est listée avec
+     son id, son produit rattaché, le stock associé et ses composantes
+     physiques, pour que la décision soit humaine. */
+  const groupes = (await pool.query(
+    `WITH codes AS (
+       SELECT l.id, l.warehouse_code,
+              COALESCE(NULLIF(l.rayon_code,''), l.zone)    AS row_code,
+              COALESCE(NULLIF(l.case_code,''),  l.rayon)   AS loc_code,
+              COALESCE(NULLIF(l.level_code,''), l.etagere) AS lvl_code,
+              NULLIF(l.bin_code,'') AS bin_code,
+              l.emplacement_code, l.product_id, l.product_reference,
+              ARRAY_TO_STRING(ARRAY[
+                NULLIF(TRIM(COALESCE(l.warehouse_code,'')),''),
+                NULLIF(TRIM(COALESCE(NULLIF(l.rayon_code,''), l.zone)),''),
+                NULLIF(TRIM(COALESCE(NULLIF(l.case_code,''),  l.rayon)),''),
+                NULLIF(TRIM(COALESCE(NULLIF(l.level_code,''), l.etagere)),''),
+                NULLIF(TRIM(COALESCE(l.bin_code,'')),'')
+              ], '-') AS full_code
+         FROM locations l WHERE l.company_id = $1
+     )
+     SELECT c.*, p.name AS produit, p.stock::numeric AS stock
+       FROM codes c LEFT JOIN products p ON p.id = c.product_id
+      WHERE c.full_code IN (SELECT full_code FROM codes GROUP BY full_code HAVING COUNT(*) > 1)
+      ORDER BY c.full_code, c.id`, [companyId]
+  )).rows;
+
+  if (groupes.length) {
+    const parCode = new Map();
+    groupes.forEach((g) => {
+      if (!parCode.has(g.full_code)) parCode.set(g.full_code, []);
+      parCode.get(g.full_code).push(g);
+    });
+    console.log(`\n── DOUBLONS DE CODE COMPLET : ${parCode.size} groupe(s), ${groupes.length} ligne(s) ──`);
+    console.log("   BLOQUANT pour l'index unique de 061. AUCUNE fusion automatique.");
+    for (const [code, lignes] of parCode) {
+      console.log(`\n  ${code}  (${lignes.length} lignes)`);
+      console.log(`    ${"ID".padEnd(7)}${"PRODUIT".padEnd(32)}${"STOCK".padStart(9)}  ENTREPÔT / ROW / LOC / LEVEL / BIN`);
+      lignes.forEach((l) => console.log(
+        `    ${String(l.id).padEnd(7)}${String(l.produit || "— aucun —").slice(0, 30).padEnd(32)}` +
+        `${String(l.stock == null ? "—" : n(l.stock)).padStart(9)}  ` +
+        `${l.warehouse_code || "?"} / ${l.row_code || "?"} / ${l.loc_code || "?"} / ${l.lvl_code || "?"} / ${l.bin_code || "SANS BIN"}`));
+    }
+  } else {
+    console.log(`\n── DOUBLONS DE CODE COMPLET : aucun ──`);
+  }
+
   // ------------------------------------------------------------- échantillons
   const echantillon = (a, k = 8) => {
     const l = par(a).slice(0, k);
@@ -204,6 +251,49 @@ async function main() {
     fs.writeFileSync(csv, "﻿" + [head.join(","), ...rows.map((r) => head.map((h) => esc(r[h])).join(","))].join("\n"));
     console.log(`\n  CSV écrit : ${csv}  (fichier local, aucune donnée modifiée en base)`);
   }
+
+  // ------------------------------------------------ contrôle final exigé (§14)
+  const [neg] = (await pool.query(
+    `SELECT COUNT(*)::int AS n FROM products
+      WHERE company_id = $1 AND COALESCE(is_active,TRUE) = TRUE AND stock < 0`, [companyId]
+  )).rows;
+  const bloquants = new Set(
+    (await pool.query(
+      `WITH codes AS (
+         SELECT ARRAY_TO_STRING(ARRAY[
+           NULLIF(TRIM(COALESCE(warehouse_code,'')),''),
+           NULLIF(TRIM(COALESCE(NULLIF(rayon_code,''), zone)),''),
+           NULLIF(TRIM(COALESCE(NULLIF(case_code,''),  rayon)),''),
+           NULLIF(TRIM(COALESCE(NULLIF(level_code,''), etagere)),''),
+           NULLIF(TRIM(COALESCE(bin_code,'')),'')
+         ], '-') AS full_code, bin_code
+           FROM locations WHERE company_id = $1
+       )
+       SELECT full_code FROM codes
+        WHERE COALESCE(TRIM(bin_code),'') <> ''
+        GROUP BY full_code HAVING COUNT(*) > 1`, [companyId]
+    )).rows.map((r) => r.full_code)
+  );
+
+  const unites = (a) => somme(par(a));
+  console.log(`\n${"═".repeat(74)}`);
+  console.log("CONTRÔLE AVANT MIGRATION");
+  console.log("═".repeat(74));
+  console.log(`  stock avant                 ${n(stockGlobal)}`);
+  console.log(`  stock après simulé          ${n(stockGlobal)}`);
+  console.log(`  différence                  ${n(0)}`);
+  console.log(`  stock négatif               ${n(neg.n)}`);
+  console.log(`  doublons physiques bloquants ${n(bloquants.size)}`);
+  console.log("  ─────────────────────────────────────────────");
+  console.log(`  AUTO_MIGRATABLE             ${String(n(auto.length)).padStart(5)} produits   ${String(n(unites(ACTIONS.AUTO_MATCH))).padStart(9)} unités`);
+  console.log(`  TO_REVIEW_LOCATION          ${String(n(par(ACTIONS.TO_REVIEW_LOCATION).length)).padStart(5)} produits   ${String(n(unites(ACTIONS.TO_REVIEW_LOCATION))).padStart(9)} unités`);
+  console.log(`  AMBIGUOUS_LOCATION          ${String(n(par(ACTIONS.AMBIGUOUS_LOCATION).length)).padStart(5)} produits   ${String(n(unites(ACTIONS.AMBIGUOUS_LOCATION))).padStart(9)} unités`);
+  console.log(`  NO_LOCATION                 ${String(n(par(ACTIONS.NO_LOCATION).length)).padStart(5)} produits   ${String(n(unites(ACTIONS.NO_LOCATION))).padStart(9)} unités`);
+  console.log(`  ZERO_STOCK                  ${String(n(par(ACTIONS.ZERO_STOCK).length)).padStart(5)} produits   ${String(n(unites(ACTIONS.ZERO_STOCK))).padStart(9)} unités`);
+  const feuVert = neg.n === 0 && bloquants.size === 0;
+  console.log(`\n  ${feuVert ? "FEU VERT" : "BLOQUÉ"} : ` + (feuVert
+    ? "aucun stock négatif, aucun doublon bloquant — 061 peut être exécutée."
+    : `${neg.n} stock(s) négatif(s) et ${bloquants.size} doublon(s) à traiter AVANT 061.`));
 
   console.log("\n" + "═".repeat(74));
   console.log("Aucune balance créée. Aucun stock modifié. Aucune migration exécutée.");

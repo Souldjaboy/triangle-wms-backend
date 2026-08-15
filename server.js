@@ -20,6 +20,7 @@ const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
 const nodemailer = require("nodemailer");
+const stockLocations = require("./services/stock-locations");
 require("dotenv").config();
 
 let webPush = null;
@@ -6082,10 +6083,15 @@ app.post("/pos/sales/:id/cancel", authenticateToken, async (req, res) => {
     const itemsResult = await client.query("SELECT * FROM sale_items WHERE sale_id=$1", [sale.id]);
 
     for (const item of itemsResult.rows) {
-      await client.query("UPDATE products SET stock = stock + $1 WHERE id=$2", [
-        item.quantity,
-        item.product_id
-      ]);
+      /* Passe par le garde-fou partagé : filtre company_id (absent ici
+         auparavant) et refuse de remonter un stock global sans emplacement
+         dès que le produit est géré par bin. */
+      await stockLocations.adjustGlobalStock(client, {
+        companyId, productId: item.product_id, delta: Number(item.quantity || 0),
+        user: { id: req.user.id, name: req.user.email, role: req.user.role },
+        reason: `Annulation vente ${sale.id}`, type: "Entrée",
+        locationId: item.location_id || null, origin: "annulation de vente",
+      });
 
       if (item.batch_id) {
         await client.query(
@@ -11186,10 +11192,14 @@ app.post("/marketplace/orders/:id/receive", authenticateToken, async (req, res) 
           [companyId, productRef, productName, Number(item.unit_price || 0)]
         );
       }
-      await client.query(
-        "UPDATE products SET stock=COALESCE(stock,0)+$1, updated_at=CURRENT_TIMESTAMP WHERE id=$2",
-        [Number(item.quantity || 0), product.rows[0].id]
-      );
+      /* Même garde-fou : company_id appliqué, et emplacement exigé si le
+         produit est réparti par bin. */
+      await stockLocations.adjustGlobalStock(client, {
+        companyId, productId: product.rows[0].id, delta: Number(item.quantity || 0),
+        user: { id: req.user?.id, name: req.user?.email, role: req.user?.role },
+        reason: "Réception achat marketplace", type: "Entrée",
+        origin: "achat marketplace",
+      });
       await client.query(
         `INSERT INTO stock_movements
          (type, product_reference, product_name, quantity, source_warehouse,

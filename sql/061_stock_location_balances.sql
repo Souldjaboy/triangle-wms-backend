@@ -79,20 +79,36 @@ CREATE INDEX IF NOT EXISTS stock_movements_dst_loc_idx
    existant qui reste affiché tel quel. */
 ALTER TABLE locations
   ADD COLUMN IF NOT EXISTS full_code TEXT,
-  /* Un emplacement vidé reste en base et redevient disponible : ces deux
-     colonnes tracent le passage à vide sans jamais supprimer la ligne. */
-  ADD COLUMN IF NOT EXISTS emptied_at TIMESTAMP,
-  ADD COLUMN IF NOT EXISTS is_active  BOOLEAN DEFAULT TRUE;
+  /* Un emplacement vidé reste en base et redevient immédiatement disponible :
+     ces colonnes tracent le passage à vide sans JAMAIS supprimer la ligne.
+     occupancy_status : EMPTY | OCCUPIED | INACTIVE. Aucune capacité n'est
+     inventée — le système n'en possède pas — donc pas de PARTIELLEMENT_OCCUPE. */
+  ADD COLUMN IF NOT EXISTS emptied_at        TIMESTAMP,
+  ADD COLUMN IF NOT EXISTS is_active         BOOLEAN DEFAULT TRUE,
+  ADD COLUMN IF NOT EXISTS occupancy_status  TEXT DEFAULT 'EMPTY';
+
+/* Un produit n'est soumis à l'invariant « stock = somme des balances » qu'une
+   fois SA répartition entièrement établie. Tant que ce drapeau est faux, le
+   produit vit sur products.stock seul, sans contrainte de balances : c'est ce
+   qui permet de migrer produit par produit sans jamais bloquer les autres. */
+ALTER TABLE products
+  ADD COLUMN IF NOT EXISTS location_managed BOOLEAN DEFAULT FALSE;
 
 /* Renseigné pour les lignes existantes, jamais écrasé ensuite. */
+/* Le BIN est OBLIGATOIRE : sans lui l'emplacement ne désigne pas un contenant
+   physique. Un emplacement sans bin ne reçoit donc PAS de full_code — il reste
+   à compléter à la main et ne peut porter aucune balance. */
 UPDATE locations
-   SET full_code = NULLIF(ARRAY_TO_STRING(ARRAY[
-         NULLIF(TRIM(COALESCE(warehouse_code, '')), ''),
-         NULLIF(TRIM(COALESCE(NULLIF(rayon_code, ''), zone)),    ''),
-         NULLIF(TRIM(COALESCE(NULLIF(case_code, ''),  rayon)),   ''),
-         NULLIF(TRIM(COALESCE(NULLIF(level_code, ''), etagere)), ''),
-         NULLIF(TRIM(COALESCE(bin_code, '')), '')
-       ], '-'), '')
+   SET full_code = CASE
+     WHEN NULLIF(TRIM(COALESCE(bin_code, '')), '') IS NULL THEN NULL
+     ELSE NULLIF(ARRAY_TO_STRING(ARRAY[
+       NULLIF(TRIM(COALESCE(warehouse_code, '')), ''),
+       NULLIF(TRIM(COALESCE(NULLIF(rayon_code, ''), zone)),    ''),
+       NULLIF(TRIM(COALESCE(NULLIF(case_code, ''),  rayon)),   ''),
+       NULLIF(TRIM(COALESCE(NULLIF(level_code, ''), etagere)), ''),
+       TRIM(bin_code)
+     ], '-'), '')
+   END
  WHERE full_code IS NULL;
 
 /* Unicité du bin physique. Index partiel : les lignes historiques dont le

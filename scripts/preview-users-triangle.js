@@ -29,9 +29,9 @@ const CIBLES = [
   { badge: "TRIANGLE-EMP-27", email: "awadiarra@triangletli.com",    role: null,          verifier: true },
   { badge: "TRIANGLE-EMP-25", email: "mohdiallo@triangletli.com",    role: null,          verifier: true },
   { badge: "TRIANGLE-EMP-23", email: "amazerbo@triangletli.com",     role: null,          verifier: true },
-  /* Rôle cible proposé mais NON appliqué : il attend une confirmation
-     explicite d'identité (B5). */
-  { badge: "TRIANGLE-EMP-24", email: null, role: "super_admin", verifier: false, confirmation: true },
+  /* Décision confirmée par le propriétaire : comptable -> super_admin.
+     Le script ne l'APPLIQUE toujours pas — il ne fait que la présenter. */
+  { badge: "TRIANGLE-EMP-24", email: null, role: "super_admin", verifier: true },
   /* Retrait d'accès Triangle, jamais suppression : l'historique reste (B6). */
   { badge: "TRIANGLE-EMP-22", email: null, role: null, verifier: false, retirer: true },
 ];

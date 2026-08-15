@@ -1,5 +1,7 @@
 "use strict";
 
+const stockLocations = require("../services/stock-locations");
+
 /**
  * Workflows stock MULTI-PRODUITS (PHASES 3-10) — Triangle WMS.
  *
@@ -364,7 +366,14 @@ module.exports = function createStockWorkflowRouter(deps) {
           [movementType, product.reference, product.name, qty, cur.source_warehouse, cur.target_warehouse,
            `Demande ${cur.reference}${line.observation ? " — " + line.observation : ""}`, companyId, req.user.id, product.id]
         );
-        await client.query(`UPDATE products SET stock = stock + $1, updated_at=NOW() WHERE id=$2 AND company_id=$3`, [delta, product.id, companyId]);
+        /* Garde-fou partagé : dès que le produit est réparti par bin, un
+           mouvement sans emplacement est refusé au lieu de désynchroniser. */
+        await stockLocations.adjustGlobalStock(client, {
+          companyId, productId: product.id, delta,
+          user: { id: req.user.id, name: req.user.email, role: req.user.role },
+          reason: `Demande ${cur.reference}`, type: movementType,
+          locationId: line.location_id || null, origin: "confirmation de demande",
+        });
         await client.query(`UPDATE stock_request_lines SET quantity_received = quantity_received + $2, movement_id=$3 WHERE id=$1`, [line.id, qty, mv.rows[0].id]);
         results.push({ line_no: line.line_no, product: product.name, quantity: qty, delta, movement_id: mv.rows[0].id, stock_before: current, stock_after: current + delta });
         totalMoved++;
