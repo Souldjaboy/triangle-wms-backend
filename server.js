@@ -17475,6 +17475,15 @@ app.use(
   })
 );
 
+/* Stock par emplacement : répartition manuelle, entrée / sortie / transfert
+   au bac près. La règle « qu'est-ce qu'un vrai bac » est partagée avec le
+   moteur via services/location-rules.js. */
+const createStockLocationsRouter = require("./routes/stock-locations");
+app.use(
+  "/",
+  createStockLocationsRouter({ pool, authenticateToken, getEffectiveCompanyId, requirePermission })
+);
+
 const createInventoryImportRouter = require("./routes/inventory-import");
 app.use(
   "/",
