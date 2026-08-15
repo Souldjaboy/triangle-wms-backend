@@ -69,6 +69,44 @@ locations_fusionnees() {
     echo 0
   fi
 }
+# Les colonnes d'emplacement de stock_movements varient selon les migrations
+# déjà passées : source_location_id et destination_location_id n'existent
+# qu'à partir de 061. On DÉCOUVRE donc celles réellement présentes plutôt que
+# de les supposer — c'est ce qui faisait planter le contrôle APRÈS.
+# Les colonnes homonymes référençant une autre table sont exclues.
+colonnes_emplacement() {
+  q "SELECT c.table_name||'.'||c.column_name
+       FROM information_schema.columns c
+       JOIN information_schema.tables t
+         ON t.table_name=c.table_name AND t.table_schema=c.table_schema
+      WHERE c.table_schema='public' AND t.table_type='BASE TABLE'
+        AND c.column_name ~ '(^|_)location_id\$'
+        AND c.table_name <> 'locations'
+        AND NOT EXISTS (
+          SELECT 1 FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+              ON kcu.constraint_name=tc.constraint_name
+            JOIN information_schema.constraint_column_usage ccu
+              ON ccu.constraint_name=tc.constraint_name
+           WHERE tc.constraint_type='FOREIGN KEY'
+             AND tc.table_name=c.table_name AND kcu.column_name=c.column_name
+             AND ccu.table_name <> 'locations')
+      ORDER BY 1"
+}
+# Total des références pointant encore vers un emplacement fusionné.
+references_orphelines() {
+  has_col locations merged_into_location_id || { echo 0; return; }
+  local total=0 tc col n
+  while IFS= read -r tc; do
+    [ -z "$tc" ] && continue
+    col="${tc#*.}"
+    n=$(q "SELECT COUNT(*) FROM \"${tc%%.*}\" x
+             JOIN locations l ON l.id = x.\"$col\"
+            WHERE l.merged_into_location_id IS NOT NULL")
+    total=$((total + ${n:-0}))
+  done <<< "$(colonnes_emplacement)"
+  echo "$total"
+}
 
 exec > >(tee -a "$LOG") 2>&1
 
@@ -150,7 +188,7 @@ L_APRES=$(q "SELECT COUNT(*) FROM locations WHERE company_id=$COMPANY")
 A_APRES=$(locations_actives)
 FUSIONNES=$(locations_fusionnees)
 CANONIQUES=$(q "SELECT COUNT(DISTINCT merged_into_location_id) FROM locations WHERE company_id=$COMPANY AND merged_into_location_id IS NOT NULL")
-ORPHELINES=$(q "SELECT COUNT(*) FROM stock_movements m JOIN locations l ON l.id IN (m.location_id, m.source_location_id, m.destination_location_id) WHERE l.merged_into_location_id IS NOT NULL AND m.company_id=$COMPANY")
+ORPHELINES=$(references_orphelines)
 PROD_ORPH=$(q "SELECT COUNT(*) FROM products p JOIN locations l ON l.id=p.location_id WHERE l.merged_into_location_id IS NOT NULL AND p.company_id=$COMPANY")
 RESTANTS=$(q "WITH c AS (SELECT ARRAY_TO_STRING(ARRAY[NULLIF(TRIM(COALESCE(warehouse_code,'')),''),NULLIF(TRIM(COALESCE(NULLIF(rayon_code,''),zone)),''),NULLIF(TRIM(COALESCE(NULLIF(case_code,''),rayon)),''),NULLIF(TRIM(COALESCE(NULLIF(level_code,''),etagere)),''),NULLIF(TRIM(COALESCE(bin_code,'')),'')],'-') fc, bin_code FROM locations WHERE company_id=$COMPANY AND merged_into_location_id IS NULL) SELECT COUNT(*) FROM (SELECT fc FROM c WHERE COALESCE(TRIM(bin_code),'')<>'' AND bin_code !~* '(WRITE[[:space:]_-]*OFF|REBUT|CASSE|NON[[:space:]_-]*PRECISE|NON[[:space:]_-]*PRÉCIS|INCONNU|DIVERS)' AND fc !~* '(WRITE[[:space:]_-]*OFF|REBUT)' AND TRIM(bin_code) !~* '^(BIN[[:space:]]*)?[0-9]+[[:space:]]*[-/][[:space:]]*[0-9]+\$' GROUP BY fc HAVING COUNT(*)>1) t")
 
@@ -164,7 +202,7 @@ printf "  %-34s %-14s %-14s %s\n" "stock négatif"          "$N_AVANT" "$N_APRES
 printf "  %-34s %-14s %-14s %s\n" "lignes locations"       "$L_AVANT" "$L_APRES" "$(verdict x "$L_AVANT" "$L_APRES")"
 printf "  %-34s %-14s %-14s %s\n" "emplacements actifs"    "$A_AVANT" "$A_APRES" "réduits de $((A_AVANT-A_APRES))"
 printf "  %-34s %-14s %-14s %s\n" "doublons désactivés"    "0" "$FUSIONNES" "vers $CANONIQUES canonique(s)"
-printf "  %-34s %-14s %-14s %s\n" "réfs mouvements orphelines" "—" "$ORPHELINES" "$(verdict x "0" "$ORPHELINES")"
+printf "  %-34s %-14s %-14s %s\n" "références orphelines (toutes tables)" "—" "$ORPHELINES" "$(verdict x "0" "$ORPHELINES")"
 printf "  %-34s %-14s %-14s %s\n" "produits orphelins"     "—" "$PROD_ORPH" "$(verdict x "0" "$PROD_ORPH")"
 printf "  %-34s %-14s %-14s %s\n" "doublons physiques restants" "—" "$RESTANTS" "$(verdict x "0" "$RESTANTS")"
 

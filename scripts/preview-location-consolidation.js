@@ -143,6 +143,35 @@ async function main() {
   if (exclues.length) console.log(`  Exclues : ${exclues.join(", ")}`);
 
   /* ------------------------------------------------- groupes de doublons */
+  /* Après 061a, les doublons portent merged_into_location_id et is_active =
+     FALSE. Les laisser candidats ferait réapparaître les groupes DÉJÀ traités
+     comme s'il restait du travail. On les écarte donc — et on les récapitule
+     séparément. Les colonnes n'existent qu'après 061a : on les détecte. */
+  const hasCol = async (table, col) => (await pool.query(
+    `SELECT COUNT(*)::int AS n FROM information_schema.columns
+      WHERE table_schema='public' AND table_name=$1 AND column_name=$2`, [table, col]
+  )).rows[0].n > 0;
+  const aFusion = await hasCol("locations", "merged_into_location_id");
+  const aActif  = await hasCol("locations", "is_active");
+
+  const filtreVivant = [
+    aFusion ? "AND l.merged_into_location_id IS NULL" : "",
+    aActif  ? "AND COALESCE(l.is_active, TRUE) = TRUE" : "",
+  ].join(" ");
+
+  /* Récapitulatif des groupes DÉJÀ consolidés — lecture seule, informatif. */
+  const dejaConsolides = aFusion ? (await pool.query(
+    `SELECT c.id AS canonical_id,
+            COALESCE(c.full_code, c.emplacement_code) AS code,
+            ARRAY_AGG(d.id ORDER BY d.id) AS doublons,
+            MAX(d.merged_at) AS le
+       FROM locations d
+       JOIN locations c ON c.id = d.merged_into_location_id
+      WHERE d.company_id = $1 AND d.merged_into_location_id IS NOT NULL
+      GROUP BY c.id, COALESCE(c.full_code, c.emplacement_code)
+      ORDER BY c.id`, [companyId]
+  )).rows : [];
+
   const lignes = (await pool.query(
     `WITH codes AS (
        SELECT l.id, l.company_id, l.warehouse_id, l.warehouse_code, l.zone, l.rayon,
@@ -157,7 +186,7 @@ async function main() {
                 NULLIF(TRIM(COALESCE(NULLIF(l.level_code,''), l.etagere)),''),
                 NULLIF(TRIM(COALESCE(l.bin_code,'')),'')
               ], '-') AS full_code
-         FROM locations l WHERE l.company_id = $1
+         FROM locations l WHERE l.company_id = $1 ${filtreVivant}
      )
      SELECT c.id, c.warehouse_id, c.warehouse_code, c.row_code, c.loc_code,
             c.lvl_code, c.bin_code, c.emplacement_code, c.full_code,
@@ -199,9 +228,30 @@ async function main() {
     groupes.get(l.full_code).push(l);
   });
 
+  if (aFusion) {
+    console.log("\n" + "═".repeat(80));
+    console.log(`GROUPES DÉJÀ CONSOLIDÉS : ${dejaConsolides.length}`);
+    console.log("═".repeat(80));
+    if (!dejaConsolides.length) {
+      console.log("  aucun — 061a n'a pas encore été appliquée sur cette entreprise.");
+    } else {
+      let totalDoublons = 0;
+      dejaConsolides.forEach((g) => {
+        totalDoublons += g.doublons.length;
+        console.log(`  ${String(g.canonical_id).padEnd(7)} ${String(g.code || "—").padEnd(40)} ` +
+          `<- ${g.doublons.join(", ")}`);
+      });
+      console.log(`\n  ${totalDoublons} emplacement(s) rattaché(s). Ils ne sont plus candidats :`);
+      console.log("  un groupe déjà traité ne doit pas réapparaître comme travail à faire.");
+    }
+  }
+
   console.log("\n" + "═".repeat(80));
-  console.log(`§3 — PLAN DE CONSOLIDATION : ${groupes.size} groupe(s)`);
+  console.log(`§3 — GROUPES ENCORE EN DOUBLON : ${groupes.size}`);
   console.log("═".repeat(80));
+  if (!groupes.size) {
+    console.log("\n  Aucun doublon restant parmi les emplacements vivants.");
+  }
 
   const exportRows = [];
   const parDecision = {};
@@ -294,7 +344,15 @@ async function main() {
   Object.entries(parDecision).sort((a, b) => b[1] - a[1])
     .forEach(([d, k]) => console.log(`  ${d.padEnd(30)} ${String(k).padStart(3)} groupe(s)`));
   const consolidables = parDecision[DECISION.CONSOLIDATE] || 0;
-  console.log(`\n  Consolidables sans ambiguïté : ${consolidables}`);
+  const nonPhysiques = (parDecision[DECISION.LOCATION_UNRESOLVED] || 0)
+                     + (parDecision[DECISION.WRITE_OFF_EXCLUDE] || 0);
+  const ambigus = (parDecision[DECISION.TO_REVIEW_BIN_STRUCTURE] || 0)
+                + (parDecision[DECISION.LEGACY_PLACEHOLDER] || 0)
+                + (parDecision[DECISION.TO_REVIEW] || 0);
+  console.log(`\n  déjà consolidés (hors candidature)   ${String(dejaConsolides.length).padStart(3)} groupe(s)`);
+  console.log(`  encore consolidables                 ${String(consolidables).padStart(3)} groupe(s)`);
+  console.log(`  non physiques (rebut / non précisé)  ${String(nonPhysiques).padStart(3)} groupe(s)`);
+  console.log(`  ambiguïtés réellement bloquantes     ${String(ambigus).padStart(3)} groupe(s)`);
   console.log(`  Restant bloquants après consolidation : ${groupes.size - consolidables
     - (parDecision[DECISION.WRITE_OFF_EXCLUDE] || 0)
     - (parDecision[DECISION.LOCATION_UNRESOLVED] || 0)}`);
