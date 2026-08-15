@@ -32,6 +32,11 @@ const MATCH_STATUS = {
   NEW: "CREATE_NEW_PRODUCT",
   REVIEW: "TO_REVIEW",
 };
+/* La provenance est tracée, mais elle ne change RIEN au workflow : une
+   réception saisie à la main et une réception importée suivent le même
+   parcours et produisent le même bon de réception. */
+const SOURCE = { MANUAL: "MANUAL", EXCEL: "EXCEL_IMPORT" };
+const SOURCE_FR = { MANUAL: "Saisie manuelle", EXCEL_IMPORT: "Import Excel" };
 
 class ReceptionError extends Error {
   constructor(message, code, httpStatus = 409, details = {}) {
@@ -78,6 +83,7 @@ async function nextReceptionNumber(client, companyId) {
 async function createReception(pool, {
   companyId, warehouseCode, containerNumber = null, receptionDate = null,
   source = null, sourceFile = null, notes = null, lines = [], user,
+  supplierName = null, supplierReference = null, carrier = null,
 }) {
   if (!lines.length) throw new ReceptionError("Aucune ligne à réceptionner.", "NO_LINES", 400);
   const client = await pool.connect();
@@ -97,17 +103,27 @@ async function createReception(pool, {
         [companyId, containerNumber, receptionDate]
       )).rows[0] || null;
     }
+    const merged = Boolean(reception);
+    if (merged && reception.status === RECEPTION_STATUS.CANCELLED) {
+      throw new ReceptionError(
+        `Le conteneur ${containerNumber} a déjà une réception annulée à cette date (${reception.reception_number}). Corrigez la date ou le conteneur.`,
+        "RECEPTION_CANCELLED", 409
+      );
+    }
+    /* Le numéro Triangle est TOUJOURS généré ici : il n'est jamais saisi. */
     const number = reception ? reception.reception_number
                              : await nextReceptionNumber(client, companyId);
 
     if (!reception) reception = (await client.query(
       `INSERT INTO stock_receptions
          (company_id, warehouse_id, warehouse_code, reception_number, container_number,
-          reception_date, source, source_file, status, notes, created_by)
-       VALUES ($1,$2,$3,$4,$5,COALESCE($6::date,CURRENT_DATE),$7,$8,$9,$10,$11)
+          reception_date, source, source_file, status, notes, created_by,
+          supplier_name, supplier_reference, carrier)
+       VALUES ($1,$2,$3,$4,$5,COALESCE($6::date,CURRENT_DATE),$7,$8,$9,$10,$11,$12,$13,$14)
        RETURNING *`,
       [companyId, warehouse.id, warehouse.code, number, containerNumber,
-       receptionDate, source, sourceFile, RECEPTION_STATUS.PENDING, notes, user?.id || null]
+       receptionDate, source, sourceFile, RECEPTION_STATUS.PENDING, notes, user?.id || null,
+       supplierName, supplierReference, carrier]
     )).rows[0];
 
     /* Numérotation reprise après les lignes déjà présentes : ajouter les lignes
@@ -136,7 +152,10 @@ async function createReception(pool, {
     }
 
     await client.query("COMMIT");
-    return { reception, lineCount: n - firstLineNo + 1, totalLines: n };
+    /* `merged` dit à l'appelant que les lignes ont rejoint une réception
+       existante : l'écran doit l'annoncer plutôt que de laisser croire à une
+       nouvelle réception. */
+    return { reception, lineCount: n - firstLineNo + 1, totalLines: n, merged };
   } catch (e) {
     await client.query("ROLLBACK").catch(() => {});
     throw e;
@@ -240,20 +259,8 @@ async function putaway(pool, {
       [newPutaway, pid, MATCH_STATUS.MATCHED, lineId, companyId]
     );
 
-    /* Statut de la réception recalculé depuis les lignes — jamais incrémenté. */
-    const agg = (await client.query(
-      `SELECT COALESCE(SUM(quantity_received),0) AS recv,
-              COALESCE(SUM(quantity_putaway),0)  AS put
-         FROM stock_reception_lines WHERE reception_id=$1 AND company_id=$2`,
-      [receptionId, companyId]
-    )).rows[0];
-    const status = Number(agg.put) <= 0 ? RECEPTION_STATUS.PENDING
-      : Number(agg.put) >= Number(agg.recv) ? RECEPTION_STATUS.COMPLETED
-      : RECEPTION_STATUS.PARTIAL;
-    await client.query(
-      `UPDATE stock_receptions SET status=$1, updated_at=NOW() WHERE id=$2 AND company_id=$3`,
-      [status, receptionId, companyId]
-    );
+    // Statut recalculé depuis les lignes — jamais incrémenté.
+    const status = await refreshStatus(client, companyId, receptionId);
 
     await client.query("COMMIT");
     return {
@@ -279,6 +286,302 @@ async function receptionTotals(runner, companyId, receptionId) {
     [companyId, receptionId]
   );
   return rows[0];
+}
+
+/* Charge une réception verrouillée, avec le total déjà rangé : toutes les
+   corrections ci-dessous en dépendent. */
+async function lockReception(client, companyId, receptionId) {
+  const reception = (await client.query(
+    `SELECT * FROM stock_receptions WHERE id=$1 AND company_id=$2 FOR UPDATE`,
+    [receptionId, companyId]
+  )).rows[0];
+  if (!reception) throw new ReceptionError("Réception introuvable.", "NOT_FOUND", 404);
+  if (reception.status === RECEPTION_STATUS.CANCELLED) {
+    throw new ReceptionError("Réception annulée : elle n'est plus modifiable.", "CANCELLED", 409);
+  }
+  const putaway = Number((await client.query(
+    `SELECT COALESCE(SUM(quantity_putaway),0) AS q FROM stock_reception_lines
+      WHERE reception_id=$1 AND company_id=$2`, [receptionId, companyId]
+  )).rows[0].q);
+  return { reception, putaway };
+}
+
+/** Recalcule le statut depuis les lignes — jamais incrémenté à la main. */
+async function refreshStatus(client, companyId, receptionId) {
+  const agg = (await client.query(
+    `SELECT COALESCE(SUM(quantity_received),0) AS recv,
+            COALESCE(SUM(quantity_putaway),0)  AS put
+       FROM stock_reception_lines WHERE reception_id=$1 AND company_id=$2`,
+    [receptionId, companyId]
+  )).rows[0];
+  const status = Number(agg.put) <= 0 ? RECEPTION_STATUS.PENDING
+    : Number(agg.put) >= Number(agg.recv) ? RECEPTION_STATUS.COMPLETED
+    : RECEPTION_STATUS.PARTIAL;
+  await client.query(
+    `UPDATE stock_receptions SET status=$1, updated_at=NOW() WHERE id=$2 AND company_id=$3`,
+    [status, receptionId, companyId]
+  );
+  return status;
+}
+
+/**
+ * Corrige l'en-tête d'une réception.
+ *
+ * Fournisseur, BL, transporteur et notes restent corrigibles à tout moment :
+ * ils n'ont aucun effet sur le stock. Le conteneur et la date, eux, sont figés
+ * dès qu'une ligne est rangée — ils figurent sur les bons de mise en stock déjà
+ * émis, qu'une correction rétroactive rendrait faux.
+ */
+async function updateReception(pool, { companyId, receptionId, patch = {}, user }) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { reception, putaway } = await lockReception(client, companyId, receptionId);
+
+    const touchesIdentity = ["containerNumber", "receptionDate"].some((k) => k in patch);
+    if (touchesIdentity && putaway > 0) {
+      throw new ReceptionError(
+        `Conteneur et date figés : ${putaway} unité(s) de cette réception sont déjà rangées et figurent sur des bons de mise en stock émis.`,
+        "PUTAWAY_LOCKED", 409, { putaway }
+      );
+    }
+
+    const map = {
+      containerNumber: "container_number", receptionDate: "reception_date",
+      supplierName: "supplier_name", supplierReference: "supplier_reference",
+      carrier: "carrier", notes: "notes",
+    };
+    const sets = [], vals = [];
+    for (const [key, col] of Object.entries(map)) {
+      if (!(key in patch)) continue;
+      vals.push(patch[key] === "" ? null : patch[key]);
+      sets.push(`${col}=$${vals.length}${col === "reception_date" ? "::date" : ""}`);
+    }
+    if (!sets.length) {
+      await client.query("ROLLBACK");
+      return { reception, changed: 0 };
+    }
+    vals.push(user?.id || null); sets.push(`updated_by=$${vals.length}`);
+    vals.push(receptionId, companyId);
+    let updated;
+    try {
+      updated = (await client.query(
+        `UPDATE stock_receptions SET ${sets.join(", ")}, updated_at=NOW()
+          WHERE id=$${vals.length - 1} AND company_id=$${vals.length} RETURNING *`,
+        vals
+      )).rows[0];
+    } catch (e) {
+      /* L'index unique (entreprise, conteneur, date) protège contre le doublon :
+         on traduit l'erreur SQL en message métier au lieu d'un 500. */
+      if (e.code === "23505") {
+        throw new ReceptionError(
+          "Une autre réception existe déjà pour ce conteneur à cette date.",
+          "DUPLICATE_CONTAINER", 409
+        );
+      }
+      throw e;
+    }
+    await client.query("COMMIT");
+    return { reception: updated, changed: sets.length - 1 };
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw e;
+  } finally { client.release(); }
+}
+
+/** Ajoute des lignes à une réception existante, sans toucher au stock. */
+async function addReceptionLines(pool, { companyId, receptionId, lines = [], user }) {
+  if (!lines.length) throw new ReceptionError("Aucune ligne à ajouter.", "NO_LINES", 400);
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { reception } = await lockReception(client, companyId, receptionId);
+
+    let n = Number((await client.query(
+      `SELECT COALESCE(MAX(line_no),0) AS m FROM stock_reception_lines
+        WHERE reception_id=$1 AND company_id=$2`, [receptionId, companyId]
+    )).rows[0].m);
+    const added = [];
+    for (const l of lines) {
+      const qty = Number(l.quantity);
+      if (!(qty > 0)) throw new ReceptionError("Quantité invalide.", "INVALID_QUANTITY", 400);
+      if (!String(l.label || "").trim()) {
+        throw new ReceptionError("Désignation reçue obligatoire.", "LABEL_REQUIRED", 400);
+      }
+      n += 1;
+      const lw = await ensureWarehouse(client, companyId, l.warehouseCode || reception.warehouse_code);
+      const row = (await client.query(
+        `INSERT INTO stock_reception_lines
+           (company_id, reception_id, line_no, received_label, product_id, match_status,
+            unit, quantity_received, supplier_reference, notes, warehouse_id, warehouse_code,
+            updated_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+        [companyId, receptionId, n, String(l.label).trim(), l.productId || null,
+         l.productId ? MATCH_STATUS.MATCHED : MATCH_STATUS.REVIEW,
+         l.unit || "EACH", qty, l.supplierReference || null, l.notes || null,
+         lw.warehouse.id, lw.warehouse.code, user?.id || null]
+      )).rows[0];
+      added.push(row);
+    }
+    const status = await refreshStatus(client, companyId, receptionId);
+    await client.query("COMMIT");
+    return { added, status, stockImpact: 0 };
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw e;
+  } finally { client.release(); }
+}
+
+/**
+ * Corrige une ligne. Dès qu'une partie est rangée, les champs à effet stock —
+ * produit, quantité reçue, unité, entrepôt — sont refusés : le mouvement déjà
+ * passé ne correspondrait plus à la ligne qui l'a produit. Les notes et la
+ * référence fournisseur restent corrigibles.
+ */
+const STOCK_IMPACT_FIELDS = ["productId", "quantity", "unit", "warehouseCode"];
+
+async function updateReceptionLine(pool, { companyId, receptionId, lineId, patch = {}, user }) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await lockReception(client, companyId, receptionId);
+    const line = (await client.query(
+      `SELECT * FROM stock_reception_lines
+        WHERE id=$1 AND reception_id=$2 AND company_id=$3 FOR UPDATE`,
+      [lineId, receptionId, companyId]
+    )).rows[0];
+    if (!line) throw new ReceptionError("Ligne introuvable.", "LINE_NOT_FOUND", 404);
+
+    const already = Number(line.quantity_putaway);
+    const touched = STOCK_IMPACT_FIELDS.filter((k) => k in patch);
+    if (already > 0 && touched.length) {
+      throw new ReceptionError(
+        `Ligne déjà rangée (${already}/${Number(line.quantity_received)}) : produit, quantité, unité et entrepôt ne sont plus modifiables. Passez par un mouvement de correction.`,
+        "LINE_PUTAWAY_LOCKED", 409, { putaway: already, fields: touched }
+      );
+    }
+
+    const sets = [], vals = [];
+    const push = (col, v, cast = "") => { vals.push(v); sets.push(`${col}=$${vals.length}${cast}`); };
+    if ("label" in patch) {
+      if (!String(patch.label || "").trim()) {
+        throw new ReceptionError("Désignation reçue obligatoire.", "LABEL_REQUIRED", 400);
+      }
+      push("received_label", String(patch.label).trim());
+    }
+    if ("quantity" in patch) {
+      const q = Number(patch.quantity);
+      if (!(q > 0)) throw new ReceptionError("Quantité invalide.", "INVALID_QUANTITY", 400);
+      /* Garde-fou applicatif doublé du CHECK en base : jamais moins que rangé. */
+      if (q < already) {
+        throw new ReceptionError(
+          `Quantité reçue (${q}) inférieure à la quantité déjà rangée (${already}).`,
+          "BELOW_PUTAWAY", 409
+        );
+      }
+      push("quantity_received", q);
+    }
+    if ("unit" in patch) push("unit", patch.unit || "EACH");
+    if ("notes" in patch) push("notes", patch.notes || null);
+    if ("supplierReference" in patch) push("supplier_reference", patch.supplierReference || null);
+    if ("productId" in patch) {
+      const pid = patch.productId ? Number(patch.productId) : null;
+      if (pid) {
+        const ok = (await client.query(
+          `SELECT id FROM products WHERE id=$1 AND company_id=$2`, [pid, companyId]
+        )).rows[0];
+        if (!ok) throw new ReceptionError("Produit introuvable.", "PRODUCT_NOT_FOUND", 404);
+      }
+      push("product_id", pid);
+      /* Retirer le produit d'une ligne la ramène à TO_REVIEW : elle redevient
+         non rangeable, ce qui est exactement l'effet voulu. */
+      push("match_status", pid ? MATCH_STATUS.MATCHED : MATCH_STATUS.REVIEW);
+    }
+    if ("warehouseCode" in patch) {
+      const lw = await ensureWarehouse(client, companyId, patch.warehouseCode);
+      push("warehouse_id", lw.warehouse.id);
+      push("warehouse_code", lw.warehouse.code);
+    }
+    if (!sets.length) {
+      await client.query("ROLLBACK");
+      return { line, changed: 0 };
+    }
+    push("updated_by", user?.id || null);
+    vals.push(lineId, companyId);
+    const updated = (await client.query(
+      `UPDATE stock_reception_lines SET ${sets.join(", ")}, updated_at=NOW()
+        WHERE id=$${vals.length - 1} AND company_id=$${vals.length} RETURNING *`,
+      vals
+    )).rows[0];
+    const status = await refreshStatus(client, companyId, receptionId);
+    await client.query("COMMIT");
+    return { line: updated, status, changed: sets.length - 1, stockImpact: 0 };
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw e;
+  } finally { client.release(); }
+}
+
+/** Supprime une ligne non rangée. Une ligne rangée n'est jamais supprimée. */
+async function deleteReceptionLine(pool, { companyId, receptionId, lineId }) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await lockReception(client, companyId, receptionId);
+    const line = (await client.query(
+      `SELECT * FROM stock_reception_lines
+        WHERE id=$1 AND reception_id=$2 AND company_id=$3 FOR UPDATE`,
+      [lineId, receptionId, companyId]
+    )).rows[0];
+    if (!line) throw new ReceptionError("Ligne introuvable.", "LINE_NOT_FOUND", 404);
+    if (Number(line.quantity_putaway) > 0) {
+      throw new ReceptionError(
+        `Ligne déjà rangée (${Number(line.quantity_putaway)}) : elle ne peut pas être supprimée. Passez par un mouvement de correction.`,
+        "LINE_PUTAWAY_LOCKED", 409
+      );
+    }
+    await client.query(
+      `DELETE FROM stock_reception_lines WHERE id=$1 AND company_id=$2`, [lineId, companyId]
+    );
+    const status = await refreshStatus(client, companyId, receptionId);
+    await client.query("COMMIT");
+    return { deleted: lineId, status, stockImpact: 0 };
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw e;
+  } finally { client.release(); }
+}
+
+/**
+ * Annule une réception. Rien n'est supprimé : la réception reste visible avec
+ * son historique. Si une seule unité a été rangée, l'annulation est refusée —
+ * il faudrait alors un mouvement inverse, qui relève du moteur de stock et non
+ * d'un changement de statut.
+ */
+async function cancelReception(pool, { companyId, receptionId, reason = null, user }) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { reception, putaway } = await lockReception(client, companyId, receptionId);
+    if (putaway > 0) {
+      throw new ReceptionError(
+        `Annulation impossible : ${putaway} unité(s) sont déjà en stock. Corrigez-les par un mouvement inverse avant d'annuler.`,
+        "ALREADY_PUTAWAY", 409, { putaway }
+      );
+    }
+    const updated = (await client.query(
+      `UPDATE stock_receptions
+          SET status=$1, cancelled_at=NOW(), cancelled_by=$2, cancel_reason=$3,
+              updated_by=$2, updated_at=NOW()
+        WHERE id=$4 AND company_id=$5 RETURNING *`,
+      [RECEPTION_STATUS.CANCELLED, user?.id || null, reason, receptionId, companyId]
+    )).rows[0];
+    await client.query("COMMIT");
+    return { reception: updated, stockImpact: 0 };
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw e;
+  } finally { client.release(); }
 }
 
 /**
@@ -509,8 +812,10 @@ async function receptionDashboard(runner, companyId) {
 }
 
 module.exports = {
-  RECEPTION_STATUS, STATUS_FR, MATCH_STATUS, ReceptionError,
+  RECEPTION_STATUS, STATUS_FR, MATCH_STATUS, SOURCE, SOURCE_FR, ReceptionError,
   ensureWarehouse, createReception, putaway, receptionTotals, nextReceptionNumber,
   suggestProducts, confirmLineProduct, createProductForLine, productReferenceFor,
   warehouseSummary, receptionDashboard,
+  updateReception, addReceptionLines, updateReceptionLine, deleteReceptionLine,
+  cancelReception, refreshStatus,
 };

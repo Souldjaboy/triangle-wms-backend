@@ -6,14 +6,23 @@
  * Couche HTTP mince : toute la logique vit dans services/receptions.js, qui
  * orchestre lui-même services/stock-operations.js. Rien n'est réécrit ici.
  *
- *   GET  /stock/receptions                 liste
- *   GET  /stock/receptions/:id             détail + lignes
- *   GET  /stock/receptions/:id/putaways    historique des rangements
- *   GET  /stock/receptions/:id/report      rapport CSV
- *   POST /stock/receptions                 création manuelle
- *   POST /stock/receptions/import-preview  analyse Excel — N'ÉCRIT RIEN
- *   POST /stock/receptions/import          création depuis Excel
- *   POST /stock/receptions/:id/putaway     mise en stock d'une ligne
+ *   GET    /stock/receptions                  liste
+ *   GET    /stock/receptions/:id              détail + lignes
+ *   GET    /stock/receptions/:id/putaways     historique des rangements
+ *   GET    /stock/receptions/:id/report       rapport CSV
+ *   POST   /stock/receptions                  saisie manuelle
+ *   PATCH  /stock/receptions/:id              correction de l'en-tête
+ *   POST   /stock/receptions/:id/lines        ajout de lignes
+ *   PATCH  /stock/receptions/:id/lines/:lineId    correction d'une ligne
+ *   DELETE /stock/receptions/:id/lines/:lineId    suppression d'une ligne
+ *   POST   /stock/receptions/:id/cancel       annulation (statut, pas suppression)
+ *   POST   /stock/receptions/import-preview   analyse Excel — N'ÉCRIT RIEN
+ *   POST   /stock/receptions/import           création depuis Excel
+ *   POST   /stock/receptions/:id/putaway      mise en stock d'une ligne
+ *   POST   /stock/receptions/:id/putaway-bulk mise en stock de plusieurs lignes
+ *
+ * Saisie manuelle et import Excel sont deux MOYENS d'alimenter le même modèle :
+ * même service, mêmes tables, même bon de réception. Seule `source` diffère.
  *
  * Une réception ne modifie JAMAIS le stock. Seul /putaway le fait.
  * Isolation : tout est borné à l'entreprise active, 404 hors périmètre.
@@ -183,7 +192,11 @@ module.exports = function createStockReceptionsRouter(deps) {
           ORDER BY r.reception_date DESC, r.id DESC`,
         [companyOf(req)]
       );
-      res.json(rows.map((r) => ({ ...r, status_label: R.STATUS_FR[r.status] || r.status })));
+      res.json(rows.map((r) => ({
+        ...r,
+        status_label: R.STATUS_FR[r.status] || r.status,
+        source_label: R.SOURCE_FR[r.source] || r.source || "—",
+      })));
     } catch (e) {
       console.error("receptions list:", e);
       res.status(500).json({ error: "Erreur chargement des réceptions." });
@@ -219,7 +232,11 @@ module.exports = function createStockReceptionsRouter(deps) {
       )).rows;
 
       res.json({
-        reception: { ...reception, status_label: R.STATUS_FR[reception.status] || reception.status },
+        reception: {
+          ...reception,
+          status_label: R.STATUS_FR[reception.status] || reception.status,
+          source_label: R.SOURCE_FR[reception.source] || reception.source || "—",
+        },
         lines,
         totals: await R.receptionTotals(pool, companyId, req.params.id),
       });
@@ -321,7 +338,7 @@ module.exports = function createStockReceptionsRouter(deps) {
           const out = await R.createReception(pool, {
             companyId, warehouseCode: first.warehouse,
             containerNumber: g.container, receptionDate: g.date,
-            source: "Import Excel", sourceFile: req.file.originalname, user: userOf(req),
+            source: R.SOURCE.EXCEL, sourceFile: req.file.originalname, user: userOf(req),
             lines: g.lines.map((l) => ({
               label: l.desc.trim(), quantity: l.quantity, unit: l.unit,
               warehouseCode: l.warehouse, productId: l.productId,
@@ -340,20 +357,106 @@ module.exports = function createStockReceptionsRouter(deps) {
       }
     });
 
-  // ---------------- CRÉATION MANUELLE ----------------
+  /* ---------------- SAISIE MANUELLE ----------------
+     Même service, même modèle, même bon de réception que l'import Excel :
+     seule `source` diffère. Enregistrer ne crée AUCUN mouvement de stock. */
   router.post("/stock/receptions", authenticateToken, canCreate, async (req, res) => {
     try {
       const b = req.body || {};
+      const lines = Array.isArray(b.lines) ? b.lines : [];
+      if (!lines.length) return res.status(400).json({ error: "Ajoutez au moins un produit reçu." });
+      for (const l of lines) {
+        if (!String(l.label || "").trim()) {
+          return res.status(400).json({ error: "Chaque ligne doit porter une désignation reçue." });
+        }
+        if (!(Number(l.quantity) > 0)) {
+          return res.status(400).json({ error: `Quantité invalide pour « ${l.label} ».` });
+        }
+      }
       const out = await R.createReception(pool, {
-        companyId: companyOf(req), warehouseCode: b.warehouseCode || "W-EM2S-A",
+        companyId: companyOf(req),
+        /* Entrepôt d'en-tête = quai par défaut. La destination réelle est portée
+           par chaque ligne : un conteneur peut alimenter plusieurs entrepôts. */
+        warehouseCode: b.warehouseCode || lines[0].warehouseCode || "W-EM2S-A",
         containerNumber: b.containerNumber || null, receptionDate: b.receptionDate || null,
-        source: b.source || "Saisie manuelle", notes: b.notes || null,
-        lines: b.lines || [], user: userOf(req),
+        source: R.SOURCE.MANUAL, notes: b.notes || null,
+        supplierName: b.supplierName || null, supplierReference: b.supplierReference || null,
+        carrier: b.carrier || null,
+        lines, user: userOf(req),
       });
       res.status(201).json({ success: true, ...out, stockImpact: 0 });
     } catch (e) {
       console.error("reception create:", e);
       res.status(e.httpStatus || 500).json({ error: e.message || "Erreur de création.", code: e.code });
+    }
+  });
+
+  // ---------------- CORRECTION AVANT MISE EN STOCK ----------------
+  router.patch("/stock/receptions/:id", authenticateToken, canCreate, async (req, res) => {
+    try {
+      const out = await R.updateReception(pool, {
+        companyId: companyOf(req), receptionId: Number(req.params.id),
+        patch: req.body || {}, user: userOf(req),
+      });
+      res.json({ success: true, ...out, stockImpact: 0 });
+    } catch (e) {
+      console.error("reception update:", e);
+      res.status(e.httpStatus || 500).json({ error: e.message || "Erreur de correction.", code: e.code, details: e.details });
+    }
+  });
+
+  router.post("/stock/receptions/:id/lines", authenticateToken, canCreate, async (req, res) => {
+    try {
+      const b = req.body || {};
+      const out = await R.addReceptionLines(pool, {
+        companyId: companyOf(req), receptionId: Number(req.params.id),
+        lines: Array.isArray(b.lines) ? b.lines : [b], user: userOf(req),
+      });
+      res.status(201).json({ success: true, ...out });
+    } catch (e) {
+      console.error("reception add lines:", e);
+      res.status(e.httpStatus || 500).json({ error: e.message || "Erreur d'ajout.", code: e.code });
+    }
+  });
+
+  router.patch("/stock/receptions/:id/lines/:lineId", authenticateToken, canCreate, async (req, res) => {
+    try {
+      const out = await R.updateReceptionLine(pool, {
+        companyId: companyOf(req), receptionId: Number(req.params.id),
+        lineId: Number(req.params.lineId), patch: req.body || {}, user: userOf(req),
+      });
+      res.json({ success: true, ...out });
+    } catch (e) {
+      console.error("reception line update:", e);
+      res.status(e.httpStatus || 500).json({ error: e.message || "Erreur de correction.", code: e.code, details: e.details });
+    }
+  });
+
+  router.delete("/stock/receptions/:id/lines/:lineId", authenticateToken, canCreate, async (req, res) => {
+    try {
+      const out = await R.deleteReceptionLine(pool, {
+        companyId: companyOf(req), receptionId: Number(req.params.id),
+        lineId: Number(req.params.lineId),
+      });
+      res.json({ success: true, ...out });
+    } catch (e) {
+      console.error("reception line delete:", e);
+      res.status(e.httpStatus || 500).json({ error: e.message || "Erreur de suppression.", code: e.code });
+    }
+  });
+
+  /* Annulation : changement de statut, jamais de suppression. Refusée dès
+     qu'une unité est en stock. */
+  router.post("/stock/receptions/:id/cancel", authenticateToken, canApply, async (req, res) => {
+    try {
+      const out = await R.cancelReception(pool, {
+        companyId: companyOf(req), receptionId: Number(req.params.id),
+        reason: req.body?.reason || null, user: userOf(req),
+      });
+      res.json({ success: true, ...out });
+    } catch (e) {
+      console.error("reception cancel:", e);
+      res.status(e.httpStatus || 500).json({ error: e.message || "Erreur d'annulation.", code: e.code, details: e.details });
     }
   });
 
