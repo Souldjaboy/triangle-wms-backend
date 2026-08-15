@@ -46,6 +46,30 @@ LOG="$OUT_DIR/061a-$STAMP.log"
 
 q() { psql "$DATABASE_URL" -tAX -c "$1"; }
 
+# `locations.is_active` et les colonnes de fusion n'existent qu'APRÈS le §0 de
+# 061a. Les contrôles AVANT tournent donc sur le schéma de production nu : ils
+# doivent s'y adapter au lieu de supposer un schéma futur.
+#   NB : products.is_active et users.is_active, eux, existent déjà.
+has_col() {
+  [ "$(q "SELECT COUNT(*) FROM information_schema.columns
+           WHERE table_schema='public' AND table_name='$1' AND column_name='$2'")" = "1" ]
+}
+# Emplacements « actifs » : avant 061a aucun n'est fusionné, donc tous le sont.
+locations_actives() {
+  if has_col locations is_active; then
+    q "SELECT COUNT(*) FROM locations WHERE company_id=$COMPANY AND COALESCE(is_active,TRUE)"
+  else
+    q "SELECT COUNT(*) FROM locations WHERE company_id=$COMPANY"
+  fi
+}
+locations_fusionnees() {
+  if has_col locations merged_into_location_id; then
+    q "SELECT COUNT(*) FROM locations WHERE company_id=$COMPANY AND merged_into_location_id IS NOT NULL"
+  else
+    echo 0
+  fi
+}
+
 exec > >(tee -a "$LOG") 2>&1
 
 echo "########################################################################"
@@ -74,11 +98,12 @@ P_AVANT=$(q "SELECT COUNT(*) FROM products WHERE company_id=$COMPANY AND COALESC
 S_AVANT=$(q "SELECT COALESCE(SUM(stock),0) FROM products WHERE company_id=$COMPANY AND COALESCE(is_active,TRUE)")
 N_AVANT=$(q "SELECT COUNT(*) FROM products WHERE company_id=$COMPANY AND stock<0")
 L_AVANT=$(q "SELECT COUNT(*) FROM locations WHERE company_id=$COMPANY")
-A_AVANT=$(q "SELECT COUNT(*) FROM locations WHERE company_id=$COMPANY AND COALESCE(is_active,TRUE)")
+A_AVANT=$(locations_actives)
+F_AVANT=$(locations_fusionnees)
 printf "  produits        %s   (attendu %s)\n" "$P_AVANT" "$ATTENDU_PRODUITS"
 printf "  stock total     %s   (attendu %s)\n" "$S_AVANT" "$ATTENDU_STOCK"
 printf "  stock négatif   %s   (attendu 0)\n" "$N_AVANT"
-printf "  emplacements    %s dont %s actifs\n" "$L_AVANT" "$A_AVANT"
+printf "  emplacements    %s dont %s actifs, %s déjà fusionné(s)\n" "$L_AVANT" "$A_AVANT" "$F_AVANT"
 
 if [ "$P_AVANT" != "$ATTENDU_PRODUITS" ] || [ "$S_AVANT" != "$ATTENDU_STOCK" ] || [ "$N_AVANT" != "0" ]; then
   echo
@@ -122,12 +147,12 @@ P_APRES=$(q "SELECT COUNT(*) FROM products WHERE company_id=$COMPANY AND COALESC
 S_APRES=$(q "SELECT COALESCE(SUM(stock),0) FROM products WHERE company_id=$COMPANY AND COALESCE(is_active,TRUE)")
 N_APRES=$(q "SELECT COUNT(*) FROM products WHERE company_id=$COMPANY AND stock<0")
 L_APRES=$(q "SELECT COUNT(*) FROM locations WHERE company_id=$COMPANY")
-A_APRES=$(q "SELECT COUNT(*) FROM locations WHERE company_id=$COMPANY AND COALESCE(is_active,TRUE)")
-FUSIONNES=$(q "SELECT COUNT(*) FROM locations WHERE company_id=$COMPANY AND merged_into_location_id IS NOT NULL")
+A_APRES=$(locations_actives)
+FUSIONNES=$(locations_fusionnees)
 CANONIQUES=$(q "SELECT COUNT(DISTINCT merged_into_location_id) FROM locations WHERE company_id=$COMPANY AND merged_into_location_id IS NOT NULL")
 ORPHELINES=$(q "SELECT COUNT(*) FROM stock_movements m JOIN locations l ON l.id IN (m.location_id, m.source_location_id, m.destination_location_id) WHERE l.merged_into_location_id IS NOT NULL AND m.company_id=$COMPANY")
 PROD_ORPH=$(q "SELECT COUNT(*) FROM products p JOIN locations l ON l.id=p.location_id WHERE l.merged_into_location_id IS NOT NULL AND p.company_id=$COMPANY")
-RESTANTS=$(q "WITH c AS (SELECT ARRAY_TO_STRING(ARRAY[NULLIF(TRIM(COALESCE(warehouse_code,'')),''),NULLIF(TRIM(COALESCE(NULLIF(rayon_code,''),zone)),''),NULLIF(TRIM(COALESCE(NULLIF(case_code,''),rayon)),''),NULLIF(TRIM(COALESCE(NULLIF(level_code,''),etagere)),''),NULLIF(TRIM(COALESCE(bin_code,'')),'')],'-') fc, bin_code FROM locations WHERE company_id=$COMPANY AND COALESCE(is_active,TRUE)) SELECT COUNT(*) FROM (SELECT fc FROM c WHERE COALESCE(TRIM(bin_code),'')<>'' AND bin_code !~* '(WRITE[[:space:]_-]*OFF|REBUT|CASSE|NON[[:space:]_-]*PRECISE|NON[[:space:]_-]*PRÉCIS|INCONNU|DIVERS)' AND fc !~* '(WRITE[[:space:]_-]*OFF|REBUT)' AND TRIM(bin_code) !~* '^(BIN[[:space:]]*)?[0-9]+[[:space:]]*[-/][[:space:]]*[0-9]+\$' GROUP BY fc HAVING COUNT(*)>1) t")
+RESTANTS=$(q "WITH c AS (SELECT ARRAY_TO_STRING(ARRAY[NULLIF(TRIM(COALESCE(warehouse_code,'')),''),NULLIF(TRIM(COALESCE(NULLIF(rayon_code,''),zone)),''),NULLIF(TRIM(COALESCE(NULLIF(case_code,''),rayon)),''),NULLIF(TRIM(COALESCE(NULLIF(level_code,''),etagere)),''),NULLIF(TRIM(COALESCE(bin_code,'')),'')],'-') fc, bin_code FROM locations WHERE company_id=$COMPANY AND merged_into_location_id IS NULL) SELECT COUNT(*) FROM (SELECT fc FROM c WHERE COALESCE(TRIM(bin_code),'')<>'' AND bin_code !~* '(WRITE[[:space:]_-]*OFF|REBUT|CASSE|NON[[:space:]_-]*PRECISE|NON[[:space:]_-]*PRÉCIS|INCONNU|DIVERS)' AND fc !~* '(WRITE[[:space:]_-]*OFF|REBUT)' AND TRIM(bin_code) !~* '^(BIN[[:space:]]*)?[0-9]+[[:space:]]*[-/][[:space:]]*[0-9]+\$' GROUP BY fc HAVING COUNT(*)>1) t")
 
 echo
 printf "  %-34s %-14s %-14s %s\n" "CONTRÔLE" "AVANT" "APRÈS" "VERDICT"

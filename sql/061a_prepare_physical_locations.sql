@@ -40,6 +40,24 @@
 BEGIN;
 
 -- ═════════════════════════════════════════════════════════════════════════
+-- §0 — COLONNES PROPRES À 061a, AJOUTÉES EN PREMIER.
+--
+-- 061a s'exécute AVANT 061 : sur le schéma de production, `locations` ne
+-- possède PAS encore is_active, occupancy_status, full_code ni les colonnes de
+-- fusion. Elles sont donc créées ici, avant la première lecture — sans quoi
+-- toute la migration échoue sur « column is_active does not exist ».
+--
+-- ADD COLUMN IF NOT EXISTS : 061 les redéclare, sans conflit ni double effet.
+-- ═════════════════════════════════════════════════════════════════════════
+ALTER TABLE locations
+  ADD COLUMN IF NOT EXISTS is_active               BOOLEAN DEFAULT TRUE,
+  ADD COLUMN IF NOT EXISTS occupancy_status        TEXT DEFAULT 'EMPTY',
+  ADD COLUMN IF NOT EXISTS full_code               TEXT,
+  ADD COLUMN IF NOT EXISTS merged_into_location_id INTEGER,
+  ADD COLUMN IF NOT EXISTS merged_at               TIMESTAMP;
+
+
+-- ═════════════════════════════════════════════════════════════════════════
 -- §1 — ÉTAT AVANT. Sert de témoin aux contrôles finaux.
 -- ═════════════════════════════════════════════════════════════════════════
 /* Les variables psql ne s'interpolent PAS à l'intérieur d'un bloc DO $$ … $$ :
@@ -264,14 +282,8 @@ UPDATE inventory_history i
 
 -- ═════════════════════════════════════════════════════════════════════════
 -- §6 — DÉSACTIVATION DES DOUBLONS. Aucune suppression.
+--       Les colonnes utilisées ici ont été créées au §0.
 -- ═════════════════════════════════════════════════════════════════════════
-ALTER TABLE locations
-  ADD COLUMN IF NOT EXISTS is_active               BOOLEAN DEFAULT TRUE,
-  ADD COLUMN IF NOT EXISTS occupancy_status        TEXT DEFAULT 'EMPTY',
-  ADD COLUMN IF NOT EXISTS full_code               TEXT,
-  ADD COLUMN IF NOT EXISTS merged_into_location_id INTEGER,
-  ADD COLUMN IF NOT EXISTS merged_at               TIMESTAMP;
-
 UPDATE locations d
    SET is_active = FALSE,
        occupancy_status = 'INACTIVE',
