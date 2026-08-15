@@ -35,6 +35,18 @@ const ACTIONS = {
 
 const norm = (s) => String(s || "").toUpperCase().replace(/\s+/g, " ").trim();
 
+/* Un emplacement de rebut n'est pas un bac physique, et un bin « non précisé »
+   ne localise rien : aucun des deux ne peut recevoir automatiquement du stock.
+   Les produits concernés partent en TO_REVIEW_LOCATION. */
+const WRITE_OFF_RE = /\bWRITE[\s_-]*OFF\b|\bREBUT\b|\bCASSE\b/i;
+const NON_PRECISE_RE = /NON[\s_-]*PRECISE|NON[\s_-]*PRÉCIS|\bN\/?A\b|\bINCONNU\b|\bDIVERS\b/i;
+const isPhysicalBin = (l) => {
+  const parts = [l.warehouse_code, l.row_code, l.loc_code, l.lvl_code, l.bin_code];
+  if (parts.some((c) => WRITE_OFF_RE.test(String(c || "")))) return false;
+  const bin = String(l.bin_code || "").trim();
+  return Boolean(bin) && !NON_PRECISE_RE.test(bin);
+};
+
 async function main() {
   const companyId = Number(arg("company"));
   if (!companyId) {
@@ -122,14 +134,22 @@ async function main() {
     if (stock <= 0) {
       action = ACTIONS.ZERO_STOCK;
       motif = "stock nul : aucune balance à créer";
-    } else if (liste.length === 1) {
+    } else if (liste.length === 1 && isPhysicalBin(liste[0].loc)) {
       action = ACTIONS.AUTO_MATCH;
       cible = liste[0].loc;
-      /* Confiance maximale seulement si l'emplacement porte un BIN : sans bin,
-         la destination physique n'est pas complète. */
-      confiance = cible.bin_code ? 100 : 70;
-      motif = liste[0].origines.join(" + ") + (cible.bin_code ? "" : " — sans bin");
-      if (!cible.bin_code) action = ACTIONS.AMBIGUOUS_LOCATION;
+      confiance = 100;
+      motif = liste[0].origines.join(" + ");
+    } else if (liste.length === 1) {
+      /* Unique candidat, mais ce n'est pas un bac : rebut, bin vide ou non
+         précisé. On ne migre pas — on renvoie à une décision humaine. */
+      const l0 = liste[0].loc;
+      action = ACTIONS.TO_REVIEW_LOCATION;
+      confiance = 0;
+      motif = WRITE_OFF_RE.test(`${l0.warehouse_code} ${l0.row_code} ${l0.loc_code} ${l0.lvl_code} ${l0.bin_code}`)
+        ? "emplacement de rebut (WRITE OFF) : ce n'est pas un bac physique"
+        : !String(l0.bin_code || "").trim()
+          ? "emplacement sans BIN : destination physique incomplète"
+          : `bin « ${l0.bin_code} » non précisé : ne localise aucun contenant`;
     } else if (liste.length > 1) {
       action = ACTIONS.TO_REVIEW_LOCATION;
       confiance = 0;
@@ -269,8 +289,14 @@ async function main() {
          ], '-') AS full_code, bin_code
            FROM locations WHERE company_id = $1
        )
+       /* Même exclusion que audit-location-duplicates.js : un rebut et un bin
+          non précisé ne sont pas des emplacements physiques, ils sortiront de
+          l'index unique et ne le bloquent donc pas. Les deux scripts doivent
+          annoncer le MÊME nombre. */
        SELECT full_code FROM codes
         WHERE COALESCE(TRIM(bin_code),'') <> ''
+          AND bin_code !~* '(WRITE[[:space:]_-]*OFF|REBUT|CASSE|NON[[:space:]_-]*PRECISE|NON[[:space:]_-]*PRÉCIS|INCONNU|DIVERS)'
+          AND full_code !~* '(WRITE[[:space:]_-]*OFF|REBUT)'
         GROUP BY full_code HAVING COUNT(*) > 1`, [companyId]
     )).rows.map((r) => r.full_code)
   );
@@ -283,7 +309,7 @@ async function main() {
   console.log(`  stock après simulé          ${n(stockGlobal)}`);
   console.log(`  différence                  ${n(0)}`);
   console.log(`  stock négatif               ${n(neg.n)}`);
-  console.log(`  doublons physiques bloquants ${n(bloquants.size)}`);
+  console.log(`  doublons physiques bloquants ${n(bloquants.size)}   (rebuts et bins non précisés exclus)`);
   console.log("  ─────────────────────────────────────────────");
   console.log(`  AUTO_MIGRATABLE             ${String(n(auto.length)).padStart(5)} produits   ${String(n(unites(ACTIONS.AUTO_MATCH))).padStart(9)} unités`);
   console.log(`  TO_REVIEW_LOCATION          ${String(n(par(ACTIONS.TO_REVIEW_LOCATION).length)).padStart(5)} produits   ${String(n(unites(ACTIONS.TO_REVIEW_LOCATION))).padStart(9)} unités`);

@@ -33,6 +33,16 @@ class LocationStockError extends Error {
 
 const num = (v) => Number(v || 0);
 
+/* Un emplacement de rebut est un ÉTAT, pas un contenant ; un bin « non
+   précisé » n'est pas un contenant non plus. Ni l'un ni l'autre ne peut
+   recevoir de stock ni être proposé comme destination. */
+const WRITE_OFF_RE = /\bWRITE[\s_-]*OFF\b|\bREBUT\b|\bCASSE\b/i;
+const NON_PRECISE_RE = /NON[\s_-]*PRECISE|NON[\s_-]*PRÉCIS|\bN\/?A\b|\bINCONNU\b|\bDIVERS\b/i;
+const isWriteOffLocation = (l) =>
+  [l.warehouse_code, l.rayon_code, l.zone, l.case_code, l.rayon,
+   l.level_code, l.etagere, l.bin_code, l.emplacement_code]
+    .some((c) => WRITE_OFF_RE.test(String(c || "")));
+
 /* ------------------------------------------------------------------ lecture */
 
 /** Répartition d'un produit : une ligne par emplacement, avec le disponible. */
@@ -113,6 +123,22 @@ async function lockLocation(client, companyId, locationId) {
     throw new LocationStockError(
       `L'emplacement ${loc.emplacement_code || loc.id} n'a pas de BIN : complétez-le avant d'y ranger du stock.`,
       "LOCATION_WITHOUT_BIN", 409, { locationId }
+    );
+  }
+  /* WRITE OFF n'est pas un bac : c'est un ÉTAT du produit. On ne range rien
+     « dans » une mise au rebut, et un rebut ne libère aucune place physique. */
+  if (isWriteOffLocation(loc)) {
+    throw new LocationStockError(
+      `« ${loc.full_code || loc.emplacement_code} » désigne une mise au rebut, pas un emplacement physique.`,
+      "WRITE_OFF_NOT_A_LOCATION", 409, { locationId }
+    );
+  }
+  /* Un bin « non précisé » ne désigne aucun contenant : y entasser plusieurs
+     produits ferait croire à une localisation qui n'existe pas. */
+  if (NON_PRECISE_RE.test(String(loc.bin_code).trim())) {
+    throw new LocationStockError(
+      `Le bin « ${loc.bin_code} » n'est pas précisé : localisez la marchandise avant de la ranger.`,
+      "BIN_NOT_SPECIFIED", 409, { locationId }
     );
   }
   return loc;
@@ -685,6 +711,10 @@ async function availableLocations(runner, companyId, { warehouseId = null, onlyE
       WHERE l.company_id = $1
         AND COALESCE(l.is_active, TRUE) = TRUE
         AND COALESCE(l.bin_code, '') <> ''
+        /* Ni les rebuts ni les bins non précisés ne sont proposables. */
+        AND l.bin_code !~* '(WRITE[[:space:]_-]*OFF|REBUT|CASSE|NON[[:space:]_-]*PRECISE|NON[[:space:]_-]*PRÉCIS|INCONNU|DIVERS)'
+        AND COALESCE(l.emplacement_code,'') !~* '(WRITE[[:space:]_-]*OFF|REBUT)'
+        AND COALESCE(l.warehouse_code,'') !~* '(WRITE[[:space:]_-]*OFF|REBUT)'
         AND ($2::int IS NULL OR l.warehouse_id = $2)
       GROUP BY l.id
      HAVING ($3::bool = FALSE OR COALESCE(SUM(b.quantity), 0) = 0)
@@ -700,6 +730,7 @@ async function availableLocations(runner, companyId, { warehouseId = null, onlyE
 
 module.exports = {
   OCCUPANCY, RESERVATION, LocationStockError,
+  WRITE_OFF_RE, NON_PRECISE_RE, isWriteOffLocation,
   productBalances, checkIntegrity, assertIntegrity, availableLocations,
   lockLocation, lockBalance,
   entryAtLocation, exitFromLocation, adjustGlobalStock,
