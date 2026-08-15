@@ -331,10 +331,16 @@ async function main() {
           AND full_code !~* '(WRITE[[:space:]_-]*OFF|REBUT)'
         GROUP BY full_code
        HAVING COUNT(*) > 1
-          /* La consolidation ne résout que les groupes homogènes : même
-             entrepôt, mêmes composantes. Un groupe hétérogène resterait. */
+          /* 061a ne consolide QUE les groupes homogènes ET exploitables.
+             Restent donc bloquants : les groupes hétérogènes, les plages
+             « BIN2-3 » et les composantes générées (NOUVEAU / AUTO) — que
+             061a écarte volontairement faute de preuve. Les compter comme
+             résolus ferait croire à un feu vert qui n'existe pas. */
           AND (COUNT(DISTINCT warehouse_id) > 1 OR COUNT(DISTINCT r) > 1
-               OR COUNT(DISTINCT c) > 1 OR COUNT(DISTINCT l) > 1)`, [companyId]
+               OR COUNT(DISTINCT c) > 1 OR COUNT(DISTINCT l) > 1
+               OR BOOL_OR(TRIM(bin_code) ~* '^(BIN[[:space:]]*)?[0-9]+[[:space:]]*[-/][[:space:]]*[0-9]+$')
+               OR BOOL_OR(r ~ '^(NOUVEAU|AUTO|DEFAUT|DEFAULT|TEST|TEMP|X+|-+|0+)$')
+               OR BOOL_OR(c ~ '^(NOUVEAU|AUTO|DEFAUT|DEFAULT|TEST|TEMP|X+|-+|0+)$'))`, [companyId]
     )).rows;
     bloquantsApres = restants.length;
   }
