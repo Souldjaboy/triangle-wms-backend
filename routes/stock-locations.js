@@ -218,12 +218,21 @@ module.exports = function createStockLocationsRouter(deps) {
     } catch (e) { fail(res, e, "Erreur chargement de la répartition."); }
   });
 
+  /* Tris proposés. Sans priorité définie, un produit passe après ceux qui en
+     ont une, mais reste visible — jamais masqué par un tri. */
+  const ORDRE = {
+    priorite: "ORDER BY p.allocation_priority ASC NULLS LAST, p.stock DESC NULLS LAST, p.name",
+    produit:  "ORDER BY p.name",
+    quantite: "ORDER BY p.stock DESC NULLS LAST, p.name",
+    emplacement: "ORDER BY COALESCE(NULLIF(p.location_code,''), 'zzz'), p.name",
+  };
+
   /* Produits dont la répartition physique n'est pas établie. */
   router.get("/stock/allocation/pending", authenticateToken, canView, async (req, res) => {
     try {
       const { rows } = await pool.query(
         `SELECT p.id, p.name, p.reference, p.stock::numeric AS stock, p.unit,
-                p.location_code, p.warehouse,
+                p.location_code, p.warehouse, p.allocation_priority,
                 COALESCE(SUM(b.quantity), 0)::numeric AS reparti
            FROM products p
            LEFT JOIN stock_location_balances b
@@ -231,12 +240,13 @@ module.exports = function createStockLocationsRouter(deps) {
           WHERE p.company_id = $1 AND COALESCE(p.is_active, TRUE) = TRUE
             AND COALESCE(p.location_managed, FALSE) = FALSE
           GROUP BY p.id
-          ORDER BY p.stock DESC NULLS LAST, p.name`,
+          ${ORDRE[req.query.sort] || ORDRE.priorite}`,
         [companyOf(req)]
       );
       const items = rows.map((r) => ({
         ...r, stock: Number(r.stock), reparti: Number(r.reparti),
         aLocaliser: Number(r.stock) - Number(r.reparti),
+        allocation_priority: r.allocation_priority == null ? null : Number(r.allocation_priority),
       }));
       res.json({
         items,
@@ -260,6 +270,93 @@ module.exports = function createStockLocationsRouter(deps) {
       }));
       res.status(201).json({ success: true, ...out });
     } catch (e) { fail(res, e, "Erreur de répartition."); }
+  });
+
+  /* Ordre de rangement. Une priorité n'est qu'un rang d'affichage : cette
+     route ne touche ni stock, ni balance, ni emplacement. */
+  router.patch("/stock/allocation/order", authenticateToken, canCreate, async (req, res) => {
+    try {
+      const ids = Array.isArray(req.body?.order) ? req.body.order.map(Number).filter(Boolean) : [];
+      if (!ids.length) return res.status(400).json({ error: "Ordre vide." });
+      const companyId = companyOf(req);
+      const out = await tx(async (client) => {
+        /* Un seul UPDATE, borné à l'entreprise : un identifiant étranger est
+           simplement ignoré plutôt que d'échouer. */
+        const { rowCount } = await client.query(
+          `UPDATE products p SET allocation_priority = v.rang, updated_at = NOW()
+             FROM (SELECT * FROM UNNEST($1::int[]) WITH ORDINALITY AS t(id, rang)) v
+            WHERE p.id = v.id AND p.company_id = $2`,
+          [ids, companyId]
+        );
+        return { updated: rowCount };
+      });
+      res.json({ success: true, ...out, stockImpact: 0 });
+    } catch (e) { fail(res, e, "Erreur d'enregistrement de l'ordre."); }
+  });
+
+  /* Création d'un produit AVEC sa localisation initiale.
+     La somme des lignes doit être exactement égale au stock initial : aucune
+     balance n'est inventée, aucune quantité n'est répartie d'office. */
+  router.post("/stock/products/with-locations", authenticateToken, canApply, async (req, res) => {
+    try {
+      const b = req.body || {};
+      const companyId = companyOf(req);
+      const nom = String(b.name || "").trim();
+      if (!nom) return res.status(400).json({ error: "Nom du produit obligatoire.", code: "NAME_REQUIRED" });
+      const stock = Number(b.stock || 0);
+      if (stock < 0) return res.status(400).json({ error: "Stock initial négatif.", code: "NEGATIVE_STOCK" });
+      const allocations = Array.isArray(b.allocations) ? b.allocations : [];
+      const somme = allocations.reduce((t, a) => t + Number(a.quantity || 0), 0);
+      if (allocations.length && somme !== stock) {
+        return res.status(409).json({
+          error: `La répartition doit être exactement égale au stock initial : ${stock} attendu(s), ${somme} saisi(s).`,
+          code: "ALLOCATION_SUM_MISMATCH", details: { stock, total: somme, ecart: somme - stock },
+        });
+      }
+
+      const out = await tx(async (client) => {
+        const doublon = (await client.query(
+          `SELECT id FROM products WHERE company_id=$1 AND UPPER(TRIM(name))=UPPER(TRIM($2)) LIMIT 1`,
+          [companyId, nom]
+        )).rows[0];
+        if (doublon) {
+          const e = new Error(`Un produit nommé « ${nom} » existe déjà.`);
+          e.httpStatus = 409; e.code = "PRODUCT_EXISTS"; throw e;
+        }
+        /* Le produit naît à 0 : c'est la répartition qui pose les quantités,
+           via le moteur, de sorte que balances et stock restent cohérents. */
+        const produit = (await client.query(
+          `INSERT INTO products (company_id, name, reference, stock, unit, category,
+                                 is_active, location_managed, created_at, updated_at)
+           VALUES ($1,$2,$3,0,$4,$5,TRUE,FALSE,NOW(),NOW()) RETURNING *`,
+          [companyId, nom, b.reference || null, b.unit || "EACH", b.category || ""]
+        )).rows[0];
+
+        const lignes = [];
+        for (const a of allocations) {
+          const r = await L.entryAtLocation(client, {
+            companyId, productId: produit.id, locationId: Number(a.locationId),
+            quantity: Number(a.quantity), user: userOf(req),
+            reason: `Stock initial — création de ${nom}`, markManaged: true,
+          });
+          lignes.push({ locationId: Number(a.locationId), quantity: Number(a.quantity),
+                        code: r.location.full_code || r.location.emplacement_code });
+        }
+        /* Un stock initial sans emplacement reste possible : il part alors en
+           attente de répartition, jamais dans un bac inventé. */
+        if (!allocations.length && stock > 0) {
+          await client.query(
+            `UPDATE products SET stock=$1, updated_at=NOW() WHERE id=$2 AND company_id=$3`,
+            [stock, produit.id, companyId]
+          );
+        }
+        const final = (await client.query(
+          `SELECT * FROM products WHERE id=$1 AND company_id=$2`, [produit.id, companyId]
+        )).rows[0];
+        return { product: final, lignes, aLocaliser: allocations.length ? 0 : stock };
+      });
+      res.status(201).json({ success: true, ...out });
+    } catch (e) { fail(res, e, "Erreur de création du produit."); }
   });
 
   // ---------------------------------------------------- opérations
