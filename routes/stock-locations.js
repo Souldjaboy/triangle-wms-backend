@@ -368,6 +368,33 @@ module.exports = function createStockLocationsRouter(deps) {
       } catch (e) { fail(res, e, defaut); }
     });
 
+  /* Préparation : le mouvement est créé « En attente », aucun stock n'est
+     appliqué. C'est sa validation qui le fera — bouton Valider existant. */
+  operation("/stock/locations/prepare-entry", canCreate, (client, req) =>
+    L.prepareEntryAtLocation(client, {
+      companyId: companyOf(req), productId: Number(req.body?.productId),
+      locationId: Number(req.body?.locationId), quantity: Number(req.body?.quantity),
+      reason: req.body?.reason || "Entrée préparée", user: userOf(req),
+    }), "Erreur de préparation d'entrée.");
+
+  operation("/stock/locations/prepare-exit", canCreate, (client, req) =>
+    L.prepareExitAtLocation(client, {
+      companyId: companyOf(req), productId: Number(req.body?.productId),
+      locationId: Number(req.body?.locationId), quantity: Number(req.body?.quantity),
+      reason: req.body?.reason || "Sortie préparée", user: userOf(req),
+    }), "Erreur de préparation de sortie.");
+
+  operation("/stock/locations/movements/:id/validate", canApply, (client, req) =>
+    L.validatePreparedMovement(client, {
+      companyId: companyOf(req), movementId: Number(req.params.id), user: userOf(req),
+    }), "Erreur de validation.");
+
+  operation("/stock/locations/movements/:id/cancel", canApply, (client, req) =>
+    L.cancelPreparedMovement(client, {
+      companyId: companyOf(req), movementId: Number(req.params.id),
+      reason: req.body?.reason || null, user: userOf(req),
+    }), "Erreur d'annulation.");
+
   operation("/stock/locations/entry", canApply, (client, req) => L.entryAtLocation(client, {
     companyId: companyOf(req), productId: Number(req.body?.productId),
     locationId: Number(req.body?.locationId), quantity: Number(req.body?.quantity),

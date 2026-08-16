@@ -4049,6 +4049,34 @@ app.put(
          sans trace — et validait en masse toutes les lignes partageant une
          product_reference. Les trois comportements sont supprimés. */
       const stockOps = require("./services/stock-operations");
+      /* Un mouvement préparé au bac près porte un emplacement source ou
+         destination. Sa validation doit passer par le moteur d'emplacement,
+         qui met à jour la balance ET products.stock — le moteur global ne
+         connaît pas les balances et laisserait la répartition incohérente. */
+      {
+        const c = await pool.connect();
+        try {
+          await c.query("BEGIN");
+          const prepare = await stockLocations.preparedMovement(c, companyId, Number(id));
+          if (prepare) {
+            const out = await stockLocations.validatePreparedMovement(c, {
+              companyId, movementId: Number(id),
+              user: { id: req.user.id, name: req.user.email, role: req.user.role },
+            });
+            await c.query("COMMIT");
+            return res.json({
+              message: "Mouvement validé.", movement: out.movement,
+              stock_before: out.stockBefore, stock_after: out.stockAfter,
+              par_emplacement: true,
+            });
+          }
+          await c.query("ROLLBACK");
+        } catch (e) {
+          await c.query("ROLLBACK").catch(() => {});
+          return res.status(e.httpStatus || 500)
+            .json({ error: e.message || "Erreur de validation.", code: e.code });
+        } finally { c.release(); }
+      }
       const vClient = await pool.connect();
       let movement, updateResult;
       try {
@@ -4130,6 +4158,33 @@ app.put("/stock-movements/:id/reject", authenticateToken, async (req, res) => {
     const isSuperAdmin = req.user.is_super_admin === true;
     if (!companyId) {
       return res.status(400).json({ error: "Sélectionnez une entreprise active avant de refuser un mouvement stock." });
+    }
+
+    /* Refuser une sortie préparée au bac près doit LIBÉRER sa réservation :
+       sans cela, la quantité resterait indisponible pour toujours. */
+    {
+      const c = await pool.connect();
+      try {
+        await c.query("BEGIN");
+        const prepare = await stockLocations.preparedMovement(c, companyId, Number(req.params.id));
+        if (prepare) {
+          const out = await stockLocations.cancelPreparedMovement(c, {
+            companyId, movementId: Number(req.params.id),
+            reason: req.body?.rejection_reason || null,
+            user: { id: req.user.id, name: req.user.email, role: req.user.role },
+          });
+          await c.query("COMMIT");
+          return res.json({
+            message: "Mouvement refusé.", movement: out.movement,
+            reservation_liberee: out.released, par_emplacement: true,
+          });
+        }
+        await c.query("ROLLBACK");
+      } catch (e) {
+        await c.query("ROLLBACK").catch(() => {});
+        return res.status(e.httpStatus || 500)
+          .json({ error: e.message || "Erreur de refus.", code: e.code });
+      } finally { c.release(); }
     }
     const { rejection_reason } = req.body || {};
 

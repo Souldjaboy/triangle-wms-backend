@@ -561,6 +561,166 @@ async function transferBetweenLocations(client, {
   };
 }
 
+/* ------------------------------------------- préparation puis validation */
+
+/**
+ * PRÉPARER une entrée dans un bac précis.
+ *
+ * Rien n'est ajouté : le mouvement est créé « En attente », avec sa
+ * destination. C'est sa VALIDATION qui augmentera la balance du bac et
+ * products.stock, dans la même transaction.
+ */
+async function prepareEntryAtLocation(client, {
+  companyId, productId, locationId, quantity, user, reason = "Entrée préparée",
+}) {
+  const q = num(quantity);
+  if (!(q > 0)) throw new LocationStockError("Quantité invalide.", "INVALID_QUANTITY", 400);
+  const product = await lockProduct(client, companyId, productId);
+  const location = await lockLocation(client, companyId, locationId);
+  /* La balance est ouverte à 0 dès maintenant : le bac est ainsi réservé au
+     produit, sans qu'aucune unité n'y soit posée. */
+  await lockBalance(client, companyId, productId, location, { create: true });
+
+  const stock = num(product.stock);
+  const movement = await writeMovement(client, {
+    companyId, product, type: "Entrée", quantity: q,
+    globalBefore: stock, globalAfter: stock,      // strictement inchangé
+    user, reason, status: "En attente",
+    destinationLocation: location,
+  });
+  return { movement, location, stockBefore: stock, stockAfter: stock, stockImpact: 0 };
+}
+
+/**
+ * PRÉPARER une sortie depuis un bac précis.
+ *
+ * La quantité est RÉSERVÉE : elle reste physiquement dans le bac et dans
+ * products.stock, mais cesse d'être disponible. Seule la validation la déduit.
+ */
+async function prepareExitAtLocation(client, {
+  companyId, productId, locationId, quantity, user, reason = "Sortie préparée",
+}) {
+  const q = num(quantity);
+  if (!(q > 0)) throw new LocationStockError("Quantité invalide.", "INVALID_QUANTITY", 400);
+  const product = await lockProduct(client, companyId, productId);
+  const location = await lockLocation(client, companyId, locationId);
+
+  const stock = num(product.stock);
+  const movement = await writeMovement(client, {
+    companyId, product, type: "Sortie", quantity: q,
+    globalBefore: stock, globalAfter: stock,      // strictement inchangé
+    user, reason, status: "En attente",
+    sourceLocation: location,
+  });
+  /* La réservation porte l'identifiant du mouvement : validation et annulation
+     la retrouvent sans ambiguïté. */
+  const res = await reserveAtLocation(client, {
+    companyId, productId, locationId, quantity: q, user, movementId: movement.id,
+  });
+  return {
+    movement, location, reservation: res.reservation,
+    stockBefore: stock, stockAfter: stock, stockImpact: 0,
+    availableAfter: res.availableAfter,
+  };
+}
+
+/** Le mouvement en attente porte-t-il un emplacement ? */
+async function preparedMovement(client, companyId, movementId) {
+  const { rows } = await client.query(
+    `SELECT * FROM stock_movements WHERE id=$1 AND company_id=$2 FOR UPDATE`,
+    [movementId, companyId]
+  );
+  const mv = rows[0];
+  if (!mv) return null;
+  const lieu = mv.destination_location_id || mv.source_location_id || null;
+  if (!lieu) return null;
+  return mv;
+}
+
+/**
+ * VALIDER un mouvement préparé au bac près.
+ *   Entrée  -> la balance de destination et products.stock augmentent ;
+ *   Sortie  -> la réservation est consommée : balance et stock diminuent.
+ */
+async function validatePreparedMovement(client, { companyId, movementId, user }) {
+  const mv = await preparedMovement(client, companyId, movementId);
+  if (!mv) throw new LocationStockError("Mouvement introuvable.", "MOVEMENT_NOT_FOUND", 404);
+  if (mv.status !== "En attente") {
+    throw new LocationStockError(`Mouvement déjà traité (${mv.status}).`, "ALREADY_PROCESSED", 409);
+  }
+  const q = num(mv.final_quantity ?? mv.quantity);
+  let applied;
+
+  if (mv.type === "Sortie") {
+    const res = (await client.query(
+      `SELECT id FROM stock_reservations
+        WHERE company_id=$1 AND movement_id=$2 AND status='ACTIVE' LIMIT 1`,
+      [companyId, movementId]
+    )).rows[0];
+    if (!res) {
+      throw new LocationStockError(
+        "Aucune réservation active pour cette sortie : elle a déjà été libérée.",
+        "RESERVATION_NOT_FOUND", 409
+      );
+    }
+    applied = await consumeReservation(client, {
+      companyId, reservationId: res.id, user,
+      reason: mv.reason || "Sortie validée",
+    });
+  } else {
+    applied = await entryAtLocation(client, {
+      companyId, productId: mv.product_id,
+      locationId: mv.destination_location_id, quantity: q, user,
+      reason: mv.reason || "Entrée validée",
+    });
+  }
+
+  /* Le mouvement préparé est soldé, et pointe vers celui qui a réellement
+     appliqué le stock : la traçabilité reste complète. */
+  const { rows } = await client.query(
+    `UPDATE stock_movements
+        SET status='Validé', approval_status='Approuvé',
+            validated_by=$1, validated_at=NOW(), updated_at=NOW(),
+            stock_before=$2, stock_after=$3
+      WHERE id=$4 AND company_id=$5 RETURNING *`,
+    [user?.id || null, applied.stockBefore, applied.stockAfter, movementId, companyId]
+  );
+  return { movement: rows[0], applied, stockBefore: applied.stockBefore, stockAfter: applied.stockAfter };
+}
+
+/**
+ * ANNULER un mouvement préparé.
+ *   Sortie -> la réservation est libérée, le stock n'a jamais bougé ;
+ *   Entrée -> rien à défaire, aucune unité n'avait été ajoutée.
+ */
+async function cancelPreparedMovement(client, { companyId, movementId, user, reason = null }) {
+  const mv = await preparedMovement(client, companyId, movementId);
+  if (!mv) throw new LocationStockError("Mouvement introuvable.", "MOVEMENT_NOT_FOUND", 404);
+  if (mv.status !== "En attente") {
+    throw new LocationStockError(`Mouvement déjà traité (${mv.status}).`, "ALREADY_PROCESSED", 409);
+  }
+  let libere = 0;
+  if (mv.type === "Sortie") {
+    const res = (await client.query(
+      `SELECT id FROM stock_reservations
+        WHERE company_id=$1 AND movement_id=$2 AND status='ACTIVE'`,
+      [companyId, movementId]
+    )).rows;
+    for (const r of res) {
+      const out = await releaseReservation(client, { companyId, reservationId: r.id, user });
+      libere += num(out.released);
+    }
+  }
+  const { rows } = await client.query(
+    `UPDATE stock_movements
+        SET status='Rejeté', approval_status='Rejeté',
+            rejection_reason=COALESCE($1, rejection_reason), updated_at=NOW()
+      WHERE id=$2 AND company_id=$3 RETURNING *`,
+    [reason, movementId, companyId]
+  );
+  return { movement: rows[0], released: libere, stockImpact: 0 };
+}
+
 /* --------------------------------------------------- répartition manuelle */
 
 /**
@@ -734,6 +894,8 @@ module.exports = {
   productBalances, checkIntegrity, assertIntegrity, availableLocations,
   lockLocation, lockBalance,
   entryAtLocation, exitFromLocation, adjustGlobalStock,
+  prepareEntryAtLocation, prepareExitAtLocation, preparedMovement,
+  validatePreparedMovement, cancelPreparedMovement,
   reserveAtLocation, releaseReservation, consumeReservation,
   transferBetweenLocations, allocateProduct,
 };
