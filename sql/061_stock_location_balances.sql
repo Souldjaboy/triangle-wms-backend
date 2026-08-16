@@ -15,7 +15,24 @@
 -- renommée, aucune donnée n'est déplacée. Le remplissage des balances fait
 -- l'objet d'une migration de données SÉPARÉE, après validation du preview.
 
+/* Essai à blanc : tout est exécuté et contrôlé, puis ANNULÉ.
+     -v dry_run=true    voir sans écrire
+     -v company_id=<ID> -v expected_balances=<N>   depuis le preview */
+\if :{?dry_run}
+\else
+  \set dry_run false
+\endif
+
 BEGIN;
+
+/* Les variables psql ne s'interpolent pas dans un bloc DO $$ … $$. */
+CREATE TEMP TABLE _p061 ON COMMIT DROP AS
+SELECT (:company_id)::int AS company_id, (:expected_balances)::int AS expected_balances;
+
+CREATE TEMP TABLE _avant061 ON COMMIT DROP AS
+SELECT COUNT(*)::int AS produits, COALESCE(SUM(stock),0)::numeric AS stock,
+       COUNT(*) FILTER (WHERE stock < 0)::int AS negatifs
+  FROM products WHERE company_id = (:company_id)::int AND COALESCE(is_active,TRUE) = TRUE;
 
 -- ---------------------------------------------------------------- balances
 CREATE TABLE IF NOT EXISTS stock_location_balances (
@@ -94,27 +111,38 @@ ALTER TABLE locations
 ALTER TABLE products
   ADD COLUMN IF NOT EXISTS location_managed BOOLEAN DEFAULT FALSE;
 
-/* Renseigné pour les lignes existantes, jamais écrasé ensuite. */
-/* Le BIN est OBLIGATOIRE : sans lui l'emplacement ne désigne pas un contenant
-   physique. Un emplacement sans bin ne reçoit donc PAS de full_code — il reste
-   à compléter à la main et ne peut porter aucune balance. */
-UPDATE locations
-   SET full_code = CASE
-     WHEN NULLIF(TRIM(COALESCE(bin_code, '')), '') IS NULL THEN NULL
-     ELSE NULLIF(ARRAY_TO_STRING(ARRAY[
-       NULLIF(TRIM(COALESCE(warehouse_code, '')), ''),
-       NULLIF(TRIM(COALESCE(NULLIF(rayon_code, ''), zone)),    ''),
-       NULLIF(TRIM(COALESCE(NULLIF(case_code, ''),  rayon)),   ''),
-       NULLIF(TRIM(COALESCE(NULLIF(level_code, ''), etagere)), ''),
-       TRIM(bin_code)
-     ], '-'), '')
-   END
- WHERE full_code IS NULL;
+/* full_code n'est attribué qu'aux VRAIS BACS.
+   Règle identique à services/location-rules.js. Sont exclus :
+     - bin absent ;
+     - rebut (WRITE OFF) : un état du produit, pas un contenant ;
+     - bin non précisé (BIN-NON-PRECISE) : ne localise rien ;
+     - plage « BIN1-2 » / « BIN2-3 » : un bac ou deux ? indécidable ;
+     - composantes générées « NOUVEAU / AUTO » : emplacement non prouvé.
+   Sans full_code, ces lignes sortent de l'index unique ci-dessous — c'est ce
+   qui permet à 061 de passer alors que ces groupes restent en doublon. */
+UPDATE locations l
+   SET full_code = NULLIF(ARRAY_TO_STRING(ARRAY[
+         NULLIF(TRIM(COALESCE(l.warehouse_code, '')), ''),
+         NULLIF(TRIM(COALESCE(NULLIF(l.rayon_code, ''), l.zone)),    ''),
+         NULLIF(TRIM(COALESCE(NULLIF(l.case_code, ''),  l.rayon)),   ''),
+         NULLIF(TRIM(COALESCE(NULLIF(l.level_code, ''), l.etagere)), ''),
+         TRIM(l.bin_code)
+       ], '-'), '')
+ WHERE l.full_code IS NULL
+   AND COALESCE(TRIM(l.bin_code), '') <> ''
+   AND l.bin_code                          !~* '(WRITE[[:space:]_-]*OFF|\mREBUT\M|\mCASSE\M)'
+   AND l.bin_code                          !~* '(NON[[:space:]_-]*PRECISE|NON[[:space:]_-]*PRÉCIS|\mINCONNU\M|\mDIVERS\M)'
+   AND TRIM(l.bin_code)                    !~* '^(BIN[[:space:]]*)?[0-9]+[[:space:]]*[-/][[:space:]]*[0-9]+$'
+   AND COALESCE(l.warehouse_code,'')       !~* '(WRITE[[:space:]_-]*OFF|\mREBUT\M)'
+   AND COALESCE(l.emplacement_code,'')     !~* '(WRITE[[:space:]_-]*OFF|\mREBUT\M)'
+   AND UPPER(TRIM(COALESCE(NULLIF(l.rayon_code,''), l.zone,  ''))) !~ '^(NOUVEAU|AUTO|DEFAUT|DEFAULT|TEST|TEMP|X+|-+|0+)$'
+   AND UPPER(TRIM(COALESCE(NULLIF(l.case_code,''),  l.rayon, ''))) !~ '^(NOUVEAU|AUTO|DEFAUT|DEFAULT|TEST|TEMP|X+|-+|0+)$'
+   AND COALESCE(l.merged_into_location_id, 0) = 0;
 
-/* Unicité du bin physique. Index partiel : les lignes historiques dont le
-   full_code n'a pas pu être reconstitué ne bloquent pas la migration.
-   ATTENTION : cet index ÉCHOUERA si la production contient déjà des doublons.
-   Le script preview-location-migration.js les compte AVANT exécution. */
+/* Unicité du bin physique. Index PARTIEL : seules les lignes ayant reçu un
+   full_code ci-dessus y entrent. Les plages, rebuts, bins non précisés et
+   placeholders en sont donc absents et ne peuvent pas le faire échouer,
+   même s'ils restent en doublon entre eux. */
 CREATE UNIQUE INDEX IF NOT EXISTS locations_full_code_uidx
     ON locations (company_id, full_code)
  WHERE full_code IS NOT NULL AND full_code <> '';
@@ -196,4 +224,134 @@ CREATE INDEX IF NOT EXISTS stock_reservations_active_idx
 CREATE INDEX IF NOT EXISTS stock_reservations_movement_idx
     ON stock_reservations (company_id, movement_id) WHERE movement_id IS NOT NULL;
 
-COMMIT;
+-- ═════════════════════════════════════════════════════════════════════════
+-- BALANCES INITIALES — UNIQUEMENT LES PRODUITS AUTO_MATCH.
+--
+-- Un produit ne reçoit une balance automatique que si sa localisation est
+-- CERTAINE : un seul emplacement candidat, et cet emplacement est un vrai bac.
+-- Les TO_REVIEW_LOCATION et NO_LOCATION n'en reçoivent AUCUNE : leur stock
+-- reste sur products.stock, sans emplacement, jusqu'à répartition manuelle.
+--
+-- Les candidats viennent des mêmes quatre sources que le preview :
+-- products.location_id, locations.product_id, products.location_code et
+-- l'historique des mouvements.
+-- ═════════════════════════════════════════════════════════════════════════
+CREATE TEMP TABLE _candidats ON COMMIT DROP AS
+WITH vivants AS (
+  SELECT l.* FROM locations l
+   WHERE l.company_id = (SELECT company_id FROM _p061)
+     AND COALESCE(l.merged_into_location_id, 0) = 0
+), prod AS (
+  SELECT p.id, p.stock::numeric AS stock, p.location_id, p.location_code
+    FROM products p
+   WHERE p.company_id = (SELECT company_id FROM _p061)
+     AND COALESCE(p.is_active, TRUE) = TRUE
+     AND COALESCE(p.location_managed, FALSE) = FALSE
+     AND p.stock > 0
+), liens AS (
+  SELECT p.id AS product_id, l.id AS location_id
+    FROM prod p JOIN vivants l ON l.id = p.location_id
+  UNION
+  SELECT p.id, l.id FROM prod p JOIN vivants l ON l.product_id = p.id
+  UNION
+  SELECT p.id, l.id FROM prod p JOIN vivants l
+    ON COALESCE(p.location_code,'') <> ''
+   AND UPPER(TRIM(COALESCE(l.emplacement_code,''))) = UPPER(TRIM(p.location_code))
+  UNION
+  SELECT p.id, m.location_id
+    FROM prod p JOIN stock_movements m
+      ON m.product_id = p.id AND m.company_id = (SELECT company_id FROM _p061)
+     AND m.location_id IS NOT NULL
+   WHERE EXISTS (SELECT 1 FROM vivants v WHERE v.id = m.location_id)
+)
+SELECT product_id, COUNT(*)::int AS n, MIN(location_id) AS location_id
+  FROM liens GROUP BY product_id;
+
+CREATE TEMP TABLE _auto ON COMMIT DROP AS
+SELECT p.id AS product_id, p.stock::numeric AS stock, c.location_id, l.warehouse_id
+  FROM products p
+  JOIN _candidats c ON c.product_id = p.id AND c.n = 1
+  JOIN locations  l ON l.id = c.location_id
+ WHERE p.company_id = (SELECT company_id FROM _p061)
+   /* un seul candidat ET c'est un vrai bac : full_code a justement été
+      attribué plus haut aux seuls vrais bacs, il sert donc de test. */
+   AND COALESCE(l.full_code, '') <> '';
+
+DO $$
+DECLARE trouve INT; attendu INT; unites NUMERIC;
+BEGIN
+  SELECT COUNT(*), COALESCE(SUM(stock),0) INTO trouve, unites FROM _auto;
+  SELECT expected_balances INTO attendu FROM _p061;
+  RAISE NOTICE '061 : % produit(s) AUTO_MATCH, % unité(s) placées en balance.', trouve, unites;
+  IF attendu IS NOT NULL AND trouve <> attendu THEN
+    RAISE EXCEPTION
+      'Désaccord avec le preview : % balance(s) AUTO_MATCH trouvée(s), % attendue(s). Aucune écriture.',
+      trouve, attendu;
+  END IF;
+END $$;
+
+INSERT INTO stock_location_balances
+  (company_id, product_id, warehouse_id, location_id, quantity, reserved_quantity)
+SELECT (SELECT company_id FROM _p061), a.product_id, a.warehouse_id, a.location_id, a.stock, 0
+  FROM _auto a
+ON CONFLICT (company_id, product_id, warehouse_id, location_id) DO NOTHING;
+
+UPDATE products p SET location_managed = TRUE, updated_at = NOW()
+  FROM _auto a WHERE p.id = a.product_id AND p.company_id = (SELECT company_id FROM _p061);
+
+UPDATE locations l SET occupancy_status = 'OCCUPIED', updated_at = NOW()
+  FROM _auto a WHERE l.id = a.location_id AND l.company_id = (SELECT company_id FROM _p061);
+
+-- ═════════════════════════════════════════════════════════════════════════
+-- CONTRÔLES FINAUX. Toute anomalie annule TOUT.
+-- ═════════════════════════════════════════════════════════════════════════
+DO $$
+DECLARE av RECORD; ap RECORD; cid INT; mauvais INT; ecarts INT;
+BEGIN
+  SELECT company_id INTO cid FROM _p061;
+  SELECT * INTO av FROM _avant061;
+  SELECT COUNT(*)::int AS produits, COALESCE(SUM(stock),0)::numeric AS stock,
+         COUNT(*) FILTER (WHERE stock < 0)::int AS negatifs
+    INTO ap
+    FROM products WHERE company_id = cid AND COALESCE(is_active,TRUE) = TRUE;
+
+  IF av.stock <> ap.stock THEN
+    RAISE EXCEPTION 'Stock modifié : % avant, % après. Annulation.', av.stock, ap.stock;
+  END IF;
+  IF av.produits <> ap.produits THEN
+    RAISE EXCEPTION 'Nombre de produits modifié : % -> %. Annulation.', av.produits, ap.produits;
+  END IF;
+  IF ap.negatifs > 0 THEN
+    RAISE EXCEPTION 'Stock négatif apparu : %. Annulation.', ap.negatifs;
+  END IF;
+
+  /* Aucune balance ne doit pointer vers un emplacement non physique. */
+  SELECT COUNT(*)::int INTO mauvais
+    FROM stock_location_balances b JOIN locations l ON l.id = b.location_id
+   WHERE b.company_id = cid AND COALESCE(l.full_code,'') = '';
+  IF mauvais > 0 THEN
+    RAISE EXCEPTION '% balance(s) sur un emplacement non exploitable. Annulation.', mauvais;
+  END IF;
+
+  /* Pour tout produit désormais géré, stock = somme de ses balances. */
+  SELECT COUNT(*)::int INTO ecarts FROM (
+    SELECT p.id FROM products p
+      LEFT JOIN stock_location_balances b ON b.product_id = p.id AND b.company_id = p.company_id
+     WHERE p.company_id = cid AND COALESCE(p.location_managed, FALSE) = TRUE
+     GROUP BY p.id, p.stock
+    HAVING p.stock::numeric <> COALESCE(SUM(b.quantity), 0)::numeric) t;
+  IF ecarts > 0 THEN
+    RAISE EXCEPTION '% produit(s) avec stock <> somme des balances. Annulation.', ecarts;
+  END IF;
+
+  RAISE NOTICE '061 : contrôles passés — produits %, stock %, négatifs %.',
+    ap.produits, ap.stock, ap.negatifs;
+END $$;
+
+\if :dry_run
+  \echo ''
+  \echo '*** ESSAI À BLANC — tout est annulé, la base est inchangée. ***'
+  ROLLBACK;
+\else
+  COMMIT;
+\endif
