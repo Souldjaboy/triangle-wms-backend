@@ -17552,6 +17552,13 @@ app.use(
   createStockLocationsRouter({ pool, authenticateToken, getEffectiveCompanyId, requirePermission })
 );
 
+/* Impression groupée : lecture seule, aucun document ni stock touché. */
+const createDocumentsPrintRouter = require("./routes/documents-print");
+app.use(
+  "/",
+  createDocumentsPrintRouter({ pool, authenticateToken, getEffectiveCompanyId, requirePermission })
+);
+
 const createInventoryImportRouter = require("./routes/inventory-import");
 app.use(
   "/",
