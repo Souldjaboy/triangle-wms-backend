@@ -20,11 +20,16 @@
 
 const express = require("express");
 
-/* Compte technique de l'import, et identité métier à afficher à sa place. */
+/* Compte technique de l'import, et identité métier à afficher à sa place.
+   « fonction » est le libellé lisible porté sur le bon papier ; « role » est
+   l'identifiant technique du rôle, gardé ici pour que les deux ne divergent
+   pas. Le badge rend le bon opposable : il désigne un agent, pas un compte. */
 const AUTEUR_IMPORT = "diallogcif@gmail.com";
 const AUTEUR_AFFICHE = {
   nom: "Amary Zerbo",
   fonction: "Responsable d'entrepôt",
+  role: "responsable_entrepot",
+  badge: "TRIANGLE-EMP-23",
   email: "amazerbo@trianglelti.com",
 };
 
@@ -169,7 +174,9 @@ module.exports = function createDocumentsPrintRouter(deps) {
             /* L'auteur affiché ; created_by reste tel quel dans la réponse,
                pour que l'écran puisse montrer les deux si besoin. */
             auteur_affiche: substitue ? AUTEUR_AFFICHE : {
-              nom: d.created_by || "", fonction: "", email: "",
+              /* Hors substitution, on n'affiche que ce que la base sait : pas
+                 de fonction ni de badge inventés pour un compte inconnu. */
+              nom: d.created_by || "", fonction: "", role: "", badge: "", email: "",
             },
             auteur_substitue: substitue,
           };
