@@ -17433,7 +17433,20 @@ app.get("/products/search", authenticateToken, async (req, res) => {
       `SELECT COUNT(*)::int AS n FROM products p WHERE ${conds.join(" AND ")}`,
       params.slice(0, params.length - 2)
     );
-    res.json({ items: rows, total: totalRow.rows[0].n, limit, offset, query: q });
+    /* `total` suit la recherche ; `total_active` est le nombre de produits
+       ACTIFS de l'entreprise, indépendant de la recherche, de la pagination et
+       du tri. C'est lui qui alimente le compteur « Produits » — sans quoi
+       l'écran afficherait la taille de la page (50) au lieu du total réel. */
+    const totalActifs = await pool.query(
+      `SELECT COUNT(*)::int AS n FROM products p
+        WHERE p.company_id = $1 AND COALESCE(p.is_active, TRUE) = TRUE`,
+      [companyId]
+    );
+    res.json({
+      items: rows, total: totalRow.rows[0].n,
+      total_active: totalActifs.rows[0].n,
+      limit, offset, query: q,
+    });
   } catch (error) {
     console.error("ERREUR RECHERCHE PRODUITS :", error);
     res.status(500).json({ error: "Erreur recherche produits" });

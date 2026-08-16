@@ -64,6 +64,7 @@ module.exports = function createStockLocationsRouter(deps) {
     AND l.bin_code !~* '${rules.SQL.WRITE_OFF}'
     AND l.bin_code !~* '${rules.SQL.NON_PRECISE}'
     AND TRIM(l.bin_code) !~* '${rules.SQL.RANGE}'
+    AND TRIM(l.bin_code) !~* '${rules.SQL.FULLBIN}'
     AND COALESCE(l.warehouse_code,'')   !~* '${rules.SQL.WRITE_OFF}'
     AND COALESCE(l.emplacement_code,'') !~* '${rules.SQL.WRITE_OFF}'
     AND UPPER(TRIM(COALESCE(NULLIF(l.rayon_code,''), l.zone,  ''))) !~ '${rules.SQL.PLACEHOLDER}'
@@ -270,6 +271,77 @@ module.exports = function createStockLocationsRouter(deps) {
       }));
       res.status(201).json({ success: true, ...out });
     } catch (e) { fail(res, e, "Erreur de répartition."); }
+  });
+
+  /* Suggestion d'emplacement issue de l'HISTORIQUE, pour un produit non encore
+     localisé. Elle propose, elle n'applique rien : la répartition reste un
+     acte humain, via allocateProduct. */
+  router.get("/stock/products/:id/legacy-location", authenticateToken, canView, async (req, res) => {
+    try {
+      const companyId = companyOf(req);
+      const produit = (await pool.query(
+        `SELECT id, name, stock::numeric AS stock, location_id, location_code
+           FROM products WHERE id=$1 AND company_id=$2`, [req.params.id, companyId]
+      )).rows[0];
+      if (!produit) return res.status(404).json({ error: "Produit introuvable." });
+
+      /* Emplacements attestés, doublons de 061a résolus vers leur canonique. */
+      const { rows } = await pool.query(
+        `WITH vivants AS (
+           SELECT l.*, COALESCE(c.id, l.id) AS cible
+             FROM locations l
+             LEFT JOIN locations c ON c.id = l.merged_into_location_id
+            WHERE l.company_id = $1
+         ), pistes AS (
+           SELECT v.cible, 'products.location_id' AS preuve FROM vivants v
+             JOIN products p ON p.id = $2 AND p.location_id = v.id
+           UNION ALL
+           SELECT v.cible, 'locations.product_id' FROM vivants v WHERE v.product_id = $2
+           UNION ALL
+           SELECT v.cible, 'products.location_code' FROM vivants v
+             JOIN products p ON p.id = $2
+            WHERE COALESCE(p.location_code,'') <> ''
+              AND UPPER(TRIM(v.emplacement_code)) = UPPER(TRIM(p.location_code))
+           UNION ALL
+           SELECT v.cible, 'mouvements' FROM vivants v
+             JOIN stock_movements m ON m.location_id = v.id AND m.product_id = $2
+            WHERE m.company_id = $1
+         )
+         SELECT l.id, l.warehouse_code, l.full_code, l.emplacement_code, l.bin_code,
+                COALESCE(NULLIF(l.rayon_code,''), l.zone)    AS row_code,
+                COALESCE(NULLIF(l.case_code,''),  l.rayon)   AS loc_code,
+                COALESCE(NULLIF(l.level_code,''), l.etagere) AS lvl_code,
+                STRING_AGG(DISTINCT pistes.preuve, ' + ') AS preuves
+           FROM pistes JOIN locations l ON l.id = pistes.cible
+          GROUP BY l.id ORDER BY l.id`,
+        [companyId, produit.id]
+      );
+
+      /* Chaque piste est qualifiée par la règle partagée : une plage ou un
+         rebut sont montrés, jamais proposés comme destination. */
+      const pistes = rows.map((l) => {
+        const motif = rules.rejectionReason(l);
+        return {
+          ...l,
+          exploitable: motif === null,
+          motif,
+          motif_fr: motif ? rules.MOTIF_FR[motif] : null,
+        };
+      });
+      const exploitables = pistes.filter((p) => p.exploitable);
+      /* Une suggestion n'est offerte que si l'historique désigne UN seul bac
+         réel : deux pistes incompatibles se tranchent sur le terrain. */
+      const suggestion = exploitables.length === 1 ? exploitables[0] : null;
+
+      res.json({
+        product: produit, pistes, suggestion,
+        classification: !pistes.length ? "NO_LOCATION_HISTORY"
+          : suggestion ? "LEGACY_EXACT_LOCATION"
+          : exploitables.length > 1 ? "CONFLICTING_HISTORY"
+          : pistes[0].motif || "LEGACY_PARTIAL_LOCATION",
+        stockImpact: 0,
+      });
+    } catch (e) { fail(res, e, "Erreur de recherche d'emplacement historique."); }
   });
 
   /* Ordre de rangement. Une priorité n'est qu'un rang d'affichage : cette
