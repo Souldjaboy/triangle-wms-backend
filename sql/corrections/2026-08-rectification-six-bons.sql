@@ -222,41 +222,124 @@ DECLARE
   mvt          record;
   doc_id       integer;
   emplacement  integer;
+  par_balance  integer;
+  par_code     integer;
+  n_corresp    integer;
+  base_balances numeric;
   ecart        numeric;
   qte_avant    numeric;
   qte_apres    numeric;
   total_bal    numeric;
 BEGIN
   FOR r IN SELECT * FROM rectifications LOOP
+    emplacement := NULL; par_balance := NULL; par_code := NULL;
     SELECT d.id INTO doc_id FROM documents d
      WHERE d.document_number = r.numero_document AND d.company_id = 1;
     SELECT * INTO mvt  FROM stock_movements WHERE id = (SELECT stock_movement_id FROM documents WHERE id = doc_id);
     SELECT * INTO prod FROM products
      WHERE company_id = 1 AND upper(trim(reference)) = upper(trim(r.reference_produit));
 
-    ecart := r.stock_apres - COALESCE(prod.stock, 0);
-
     -- ── Produit géré par emplacement : la balance fait foi ──
     IF COALESCE(prod.location_managed, false) THEN
 
-      -- L'emplacement du mouvement lui-même, jamais un emplacement choisi.
+      -- L'écart se mesure depuis la SOMME DES BALANCES, et non depuis
+      -- products.stock. C'est la somme des balances qui doit valoir le stock
+      -- final ; partir du stock produit laisserait subsister une dérive
+      -- antérieure entre les deux.
+      SELECT COALESCE(sum(quantity), 0) INTO base_balances
+        FROM stock_location_balances WHERE company_id = 1 AND product_id = prod.id;
+      ecart := r.stock_apres - base_balances;
+
+      -- ── Résolution de l'emplacement, du plus sûr au plus interprétatif ──
+      -- 1. l'emplacement porté par le mouvement
       emplacement := COALESCE(mvt.source_location_id, mvt.destination_location_id);
 
-      IF emplacement IS NULL AND NULLIF(trim(COALESCE(mvt.location_code, '')), '') IS NOT NULL THEN
-        SELECT id INTO emplacement FROM locations
-         WHERE company_id = 1
-           AND upper(trim(COALESCE(full_code, ''))) = upper(trim(mvt.location_code))
-           AND COALESCE(merged_into_location_id, 0) = 0
-         LIMIT 1;
-      END IF;
-
-      -- Aucun emplacement inventé : sans repère certain, on annule tout.
+      -- 2. la balance existante du produit, si elle est unique : un produit
+      --    qui n'occupe qu'un seul bac désigne ce bac sans ambiguïté.
       IF emplacement IS NULL THEN
-        RAISE EXCEPTION
-          'Produit % (%) est géré par emplacement mais le mouvement % ne désigne aucun emplacement identifiable (code « % »). Rectification annulée.',
-          prod.id, r.reference_produit, mvt.id, COALESCE(mvt.location_code, '—');
+        SELECT count(*) INTO n_corresp FROM stock_location_balances
+         WHERE company_id = 1 AND product_id = prod.id;
+        IF n_corresp = 1 THEN
+          SELECT location_id INTO par_balance FROM stock_location_balances
+           WHERE company_id = 1 AND product_id = prod.id;
+        ELSIF n_corresp > 1 THEN
+          RAISE NOTICE '    produit % : % balances existantes, aucune ne s''impose', prod.id, n_corresp;
+        END IF;
       END IF;
 
+      -- 3. le code historique du mouvement, séparateurs normalisés.
+      --    « W/EM2S-A-M-M3-L2-BIN1 » et « W-EM2S-A-M-M3-L2-BIN1 » désignent le
+      --    même bac : full_code assemble warehouse-rayon-case-level-bin avec
+      --    des tirets, mais les saisies anciennes emploient aussi « / ». On
+      --    compare donc sur les seuls caractères alphanumériques. Deux bacs
+      --    réellement distincts (BIN1 et BIN2) restent distincts.
+      IF emplacement IS NULL
+         AND NULLIF(trim(COALESCE(mvt.location_code, '')), '') IS NOT NULL THEN
+        SELECT count(*) INTO n_corresp FROM locations
+         WHERE company_id = 1
+           AND COALESCE(merged_into_location_id, 0) = 0
+           AND regexp_replace(upper(COALESCE(full_code, '')),        '[^A-Z0-9]', '', 'g')
+             = regexp_replace(upper(mvt.location_code),              '[^A-Z0-9]', '', 'g')
+           AND regexp_replace(upper(COALESCE(full_code, '')),        '[^A-Z0-9]', '', 'g') <> '';
+
+        IF n_corresp > 1 THEN
+          RAISE EXCEPTION
+            'Mouvement % : le code « % » correspond à % emplacements après normalisation. Ambiguïté — rectification annulée.',
+            mvt.id, mvt.location_code, n_corresp;
+        ELSIF n_corresp = 1 THEN
+          SELECT id INTO par_code FROM locations
+           WHERE company_id = 1
+             AND COALESCE(merged_into_location_id, 0) = 0
+             AND regexp_replace(upper(COALESCE(full_code, '')), '[^A-Z0-9]', '', 'g')
+               = regexp_replace(upper(mvt.location_code),       '[^A-Z0-9]', '', 'g');
+        ELSE
+          -- Dernier recours : le code historique conservé sur l'emplacement.
+          SELECT count(*) INTO n_corresp FROM locations
+           WHERE company_id = 1
+             AND COALESCE(merged_into_location_id, 0) = 0
+             AND regexp_replace(upper(COALESCE(emplacement_code, '')), '[^A-Z0-9]', '', 'g')
+               = regexp_replace(upper(mvt.location_code),              '[^A-Z0-9]', '', 'g')
+             AND regexp_replace(upper(COALESCE(emplacement_code, '')), '[^A-Z0-9]', '', 'g') <> '';
+          IF n_corresp > 1 THEN
+            RAISE EXCEPTION
+              'Mouvement % : le code « % » correspond à % emplacements par emplacement_code. Ambiguïté — rectification annulée.',
+              mvt.id, mvt.location_code, n_corresp;
+          ELSIF n_corresp = 1 THEN
+            SELECT id INTO par_code FROM locations
+             WHERE company_id = 1
+               AND COALESCE(merged_into_location_id, 0) = 0
+               AND regexp_replace(upper(COALESCE(emplacement_code, '')), '[^A-Z0-9]', '', 'g')
+                 = regexp_replace(upper(mvt.location_code),              '[^A-Z0-9]', '', 'g');
+          END IF;
+        END IF;
+      END IF;
+
+      -- Deux pistes qui se contredisent valent une absence de piste.
+      IF par_balance IS NOT NULL AND par_code IS NOT NULL AND par_balance <> par_code THEN
+        RAISE EXCEPTION
+          'Produit % : la balance existante désigne l''emplacement % et le code « % » l''emplacement %. Contradiction — rectification annulée.',
+          prod.id, par_balance, mvt.location_code, par_code;
+      END IF;
+      IF emplacement IS NULL THEN emplacement := COALESCE(par_balance, par_code); END IF;
+
+      -- Aucun emplacement inventé. Mais si la somme des balances vaut déjà le
+      -- stock visé, il n'y a rien à déplacer : exiger un emplacement pour ne
+      -- rien y écrire bloquerait la correction sans rien protéger.
+      IF emplacement IS NULL AND ecart <> 0 THEN
+        RAISE EXCEPTION
+          'Produit % (%) est géré par emplacement et demande un écart de %, mais le mouvement % ne désigne aucun emplacement identifiable (code « % »). Rectification annulée.',
+          prod.id, r.reference_produit, ecart, mvt.id, COALESCE(mvt.location_code, '—');
+      END IF;
+
+      IF emplacement IS NULL THEN
+        RAISE NOTICE '    produit % : balances déjà à % — aucun mouvement de balance nécessaire',
+          prod.id, base_balances;
+      END IF;
+    ELSE
+      ecart := r.stock_apres - COALESCE(prod.stock, 0);
+    END IF;
+
+    IF COALESCE(prod.location_managed, false) AND emplacement IS NOT NULL THEN
       SELECT quantity INTO qte_avant FROM stock_location_balances
        WHERE company_id = 1 AND product_id = prod.id AND location_id = emplacement;
 

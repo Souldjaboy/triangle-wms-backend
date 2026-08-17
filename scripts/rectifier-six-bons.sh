@@ -222,9 +222,27 @@ if [ "$EXECUTER" -eq 1 ]; then
   APRES_CSV="$DOSSIER_SAUVEGARDE/triangle-stocks-apres-$HORODATAGE.csv"
   psql "$DATABASE_URL" -tAX -F',' -c \
     "SELECT id, stock FROM products WHERE company_id = $SOCIETE ORDER BY id" > "$APRES_CSV"
-  MODIFIES="$(diff <(sort "$AVANT_CSV") <(sort "$APRES_CSV") | grep -c '^>' || true)"
-  verifier "produits dont le stock a changé" "$MODIFIES" "6"
-  if [ "$MODIFIES" != "6" ]; then
+  # On n'attend PAS six changements : deux des six produits sont déjà au bon
+  # stock (leur bon portait une quantité fausse sans que le stock le soit).
+  # Ce qui compte est qu'aucun produit HORS des six ne bouge.
+  ATTENDUS="$(q "SELECT string_agg(p.id::text, ' ' ORDER BY p.id) FROM products p
+                  WHERE p.company_id = $SOCIETE AND upper(trim(p.reference)) IN
+                        ('IMP-CHAISE-DE-VESTIAIRE','IMP-CONTROLEUR-VOLUME-DE-VENTILO',
+                         'IMP-ACCESSOIRE-D-ECRAN','IMP-UNDERCOUNTER-BASIN-BC-8322',
+                         'IMP-ACCESOIRE-POUR-CONTROLEUR-VOLUME','IMP-TOURNIQUET-D-ENTREE')")"
+  CHANGES="$(diff <(sort "$AVANT_CSV") <(sort "$APRES_CSV") | grep '^>' | sed 's/^> //' | cut -d, -f1 | sort -n | tr '\n' ' ' || true)"
+  info "produits dont le stock a changé : ${CHANGES:-aucun}"
+  info "périmètre autorisé              : $ATTENDUS"
+
+  HORS_PERIMETRE=""
+  for id in $CHANGES; do
+    case " $ATTENDUS " in
+      *" $id "*) ;;
+      *) HORS_PERIMETRE="$HORS_PERIMETRE $id" ;;
+    esac
+  done
+  verifier "produits modifiés hors des six" "${HORS_PERIMETRE:-aucun}" "aucun"
+  if [ -n "$HORS_PERIMETRE" ]; then
     alerte "détail des écarts :"
     diff <(sort "$AVANT_CSV") <(sort "$APRES_CSV") | head -20 | sed 's/^/       /'
   fi
