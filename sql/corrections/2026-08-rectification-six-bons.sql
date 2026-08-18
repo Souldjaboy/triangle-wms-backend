@@ -66,6 +66,54 @@ SELECT r.numero_document,
 CREATE TEMP TABLE stock_global_avant AS
 SELECT COALESCE(sum(stock), 0) AS total FROM products WHERE company_id = 1;
 
+-- ─────────────────────────────────────────────────────────────────────────
+-- COHÉRENCE STOCK / BALANCES, MESURÉE AVANT TOUTE ÉCRITURE.
+--
+-- Le parc porte des dérives antérieures, sans rapport avec ces six bons.
+-- Exiger que TOUT soit cohérent ferait échouer une rectification qui n'en est
+-- pas la cause. On mesure donc l'état de départ, et l'on n'exigera pas la
+-- perfection mais la non-dégradation : rien ne devient incohérent, rien ne
+-- s'aggrave, et ce qui est déjà tordu le reste à l'identique.
+-- ─────────────────────────────────────────────────────────────────────────
+CREATE TEMP TABLE coherence_avant AS
+SELECT p.id                                        AS produit_id,
+       p.reference,
+       p.name                                      AS nom,
+       COALESCE(p.stock, 0)                        AS stock,
+       COALESCE(b.total, 0)                        AS total_balances,
+       COALESCE(p.stock, 0) - COALESCE(b.total, 0) AS ecart
+  FROM products p
+  LEFT JOIN (SELECT product_id, sum(quantity) AS total
+               FROM stock_location_balances WHERE company_id = 1
+              GROUP BY product_id) b ON b.product_id = p.id
+ WHERE p.company_id = 1 AND COALESCE(p.location_managed, false);
+
+-- Photographie complète : sert à prouver qu'aucun produit hors des six ne
+-- bouge, ni en stock ni en balance.
+CREATE TEMP TABLE stocks_avant_tous AS
+SELECT id AS produit_id, COALESCE(stock, 0) AS stock FROM products WHERE company_id = 1;
+
+CREATE TEMP TABLE balances_avant_toutes AS
+SELECT product_id, location_id, quantity
+  FROM stock_location_balances WHERE company_id = 1;
+
+-- Ce qui est déjà en anomalie, nommément, pour traitement séparé.
+DO $BLOC$
+DECLARE a record; n integer;
+BEGIN
+  SELECT count(*) INTO n FROM coherence_avant WHERE ecart <> 0;
+  IF n = 0 THEN
+    RAISE NOTICE 'Cohérence stock/balances : aucune anomalie préexistante.';
+  ELSE
+    RAISE NOTICE '% produit(s) déjà en écart AVANT cette rectification —', n;
+    RAISE NOTICE 'à traiter séparément, ils ne sont pas corrigés ici :';
+    FOR a IN SELECT * FROM coherence_avant WHERE ecart <> 0 ORDER BY produit_id LOOP
+      RAISE NOTICE '   produit % (%) « % » : stock %, balances %, écart %',
+        a.produit_id, a.reference, a.nom, a.stock, a.total_balances, a.ecart;
+    END LOOP;
+  END IF;
+END $BLOC$;
+
 -- ═════════════════════════════════════════════════════════════════════════
 -- 1. VÉRIFICATIONS D'IDENTITÉ — avant toute écriture
 -- ═════════════════════════════════════════════════════════════════════════
@@ -398,6 +446,7 @@ DO $$
 DECLARE
   n         integer;
   attendu   record;
+  anomalie  record;
   reel      numeric;
 BEGIN
   -- Les six stocks visés, au chiffre près.
@@ -426,16 +475,94 @@ BEGIN
   SELECT count(*) INTO n FROM stock_location_balances WHERE company_id = 1 AND quantity < 0;
   IF n > 0 THEN RAISE EXCEPTION 'Contrôle final — % balance(s) négative(s).', n; END IF;
 
-  -- L'invariant sur TOUS les produits gérés par emplacement, pas seulement les six.
-  SELECT count(*) INTO n
+  -- ── Cohérence : on exige la non-dégradation, pas la perfection ──
+  CREATE TEMP TABLE coherence_apres AS
+  SELECT p.id                                        AS produit_id,
+         COALESCE(p.stock, 0)                        AS stock,
+         COALESCE(b.total, 0)                        AS total_balances,
+         COALESCE(p.stock, 0) - COALESCE(b.total, 0) AS ecart
     FROM products p
     LEFT JOIN (SELECT product_id, sum(quantity) AS total
-                 FROM stock_location_balances WHERE company_id = 1 GROUP BY product_id) b
-      ON b.product_id = p.id
-   WHERE p.company_id = 1 AND COALESCE(p.location_managed, false)
-     AND COALESCE(b.total, 0) <> COALESCE(p.stock, 0);
+                 FROM stock_location_balances WHERE company_id = 1
+                GROUP BY product_id) b ON b.product_id = p.id
+   WHERE p.company_id = 1 AND COALESCE(p.location_managed, false);
+
+  -- a) rien de sain ne devient malade
+  FOR anomalie IN
+    SELECT av.produit_id, av.reference, av.nom, ap.stock, ap.total_balances, ap.ecart
+      FROM coherence_avant av JOIN coherence_apres ap USING (produit_id)
+     WHERE av.ecart = 0 AND ap.ecart <> 0
+  LOOP
+    RAISE EXCEPTION
+      'Contrôle final — produit % (%) « % » était cohérent et ne l''est plus : stock %, balances %, écart %. Rectification annulée.',
+      anomalie.produit_id, anomalie.reference, anomalie.nom,
+      anomalie.stock, anomalie.total_balances, anomalie.ecart;
+  END LOOP;
+
+  -- b) aucune dérive existante ne s'aggrave
+  FOR anomalie IN
+    SELECT av.produit_id, av.reference, av.nom, av.ecart AS avant, ap.ecart AS apres
+      FROM coherence_avant av JOIN coherence_apres ap USING (produit_id)
+     WHERE abs(ap.ecart) > abs(av.ecart)
+  LOOP
+    RAISE EXCEPTION
+      'Contrôle final — produit % (%) « % » : écart aggravé de % à %. Rectification annulée.',
+      anomalie.produit_id, anomalie.reference, anomalie.nom, anomalie.avant, anomalie.apres;
+  END LOOP;
+
+  -- c) hors des six, une dérive existante doit rester rigoureusement la même
+  FOR anomalie IN
+    SELECT av.produit_id, av.reference, av.nom, av.ecart AS avant, ap.ecart AS apres
+      FROM coherence_avant av JOIN coherence_apres ap USING (produit_id)
+     WHERE av.ecart <> ap.ecart
+       AND av.produit_id NOT IN (SELECT produit_id FROM etat_avant)
+  LOOP
+    RAISE EXCEPTION
+      'Contrôle final — produit % (%) « % » est hors périmètre et son écart a changé de % à %. Rectification annulée.',
+      anomalie.produit_id, anomalie.reference, anomalie.nom, anomalie.avant, anomalie.apres;
+  END LOOP;
+
+  -- d) les six corrigés, s'ils sont localisés, doivent être exactement à zéro
+  FOR anomalie IN
+    SELECT ap.produit_id, ap.stock, ap.total_balances, ap.ecart
+      FROM coherence_apres ap
+     WHERE ap.produit_id IN (SELECT produit_id FROM etat_avant) AND ap.ecart <> 0
+  LOOP
+    RAISE EXCEPTION
+      'Contrôle final — produit corrigé % : stock % et balances % ne concordent pas (écart %). Rectification annulée.',
+      anomalie.produit_id, anomalie.stock, anomalie.total_balances, anomalie.ecart;
+  END LOOP;
+
+  -- e) aucun produit hors des six ne change de stock
+  FOR anomalie IN
+    SELECT p.id AS produit_id, p.reference, p.name AS nom, s.stock AS avant, p.stock AS apres
+      FROM products p JOIN stocks_avant_tous s ON s.produit_id = p.id
+     WHERE p.company_id = 1
+       AND COALESCE(p.stock, 0) <> s.stock
+       AND p.id NOT IN (SELECT produit_id FROM etat_avant)
+  LOOP
+    RAISE EXCEPTION
+      'Contrôle final — produit % (%) « % » est hors périmètre et son stock a changé de % à %. Rectification annulée.',
+      anomalie.produit_id, anomalie.reference, anomalie.nom, anomalie.avant, anomalie.apres;
+  END LOOP;
+
+  -- f) aucune balance hors des six ne change, ni n'apparaît, ni ne disparaît
+  SELECT count(*) INTO n FROM (
+    SELECT product_id, location_id, quantity FROM stock_location_balances WHERE company_id = 1
+    EXCEPT
+    SELECT product_id, location_id, quantity FROM balances_avant_toutes
+    UNION
+    SELECT product_id, location_id, quantity FROM balances_avant_toutes
+    EXCEPT
+    SELECT product_id, location_id, quantity FROM stock_location_balances WHERE company_id = 1
+  ) diff WHERE diff.product_id NOT IN (SELECT produit_id FROM etat_avant);
   IF n > 0 THEN
-    RAISE EXCEPTION 'Contrôle final — % produit(s) géré(s) par emplacement en écart entre stock et balances.', n;
+    RAISE EXCEPTION 'Contrôle final — % balance(s) modifiée(s) hors des six produits. Rectification annulée.', n;
+  END IF;
+
+  SELECT count(*) INTO n FROM coherence_apres WHERE ecart <> 0;
+  IF n > 0 THEN
+    RAISE NOTICE '% anomalie(s) préexistante(s) subsistent, inchangées et hors de cette mission.', n;
   END IF;
 
   -- Aucune réservation orpheline.
@@ -465,6 +592,16 @@ SELECT a.numero_document                              AS bon,
        CASE WHEN a.gere_par_emplacement THEN 'oui' ELSE 'non' END AS par_emplacement
   FROM etat_avant a JOIN rectifications r USING (numero_document)
  ORDER BY a.numero_document;
+
+\echo ''
+\echo '── ANOMALIES PRÉEXISTANTES — HORS DE CETTE MISSION, NON CORRIGÉES ──'
+SELECT av.produit_id, av.reference, left(av.nom, 34) AS nom,
+       av.stock AS stock_avant, av.total_balances AS balances_avant, av.ecart AS ecart_avant,
+       ap.stock AS stock_apres, ap.total_balances AS balances_apres, ap.ecart AS ecart_apres,
+       CASE WHEN av.ecart = ap.ecart THEN 'inchangé' ELSE 'MODIFIÉ' END AS evolution
+  FROM coherence_avant av JOIN coherence_apres ap USING (produit_id)
+ WHERE av.ecart <> 0 OR ap.ecart <> 0
+ ORDER BY av.produit_id;
 
 \echo ''
 \echo '── STOCK GLOBAL TRIANGLE ──'
