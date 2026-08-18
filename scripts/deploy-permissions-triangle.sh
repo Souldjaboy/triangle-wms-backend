@@ -14,8 +14,8 @@
 #
 set -euo pipefail
 B=/var/www/triangle-wms/backend; F=/var/www/triangle-wms/frontend
-SHA_B=8d0dba96e3e776d108800f31c753b78d22af88f5
-SHA_F=5c7c41c489cf841eccd192504ea77bc0e01894b9
+REQUIRED_BACKEND_COMMIT=8d0dba96e3e776d108800f31c753b78d22af88f5
+REQUIRED_FRONTEND_COMMIT=5c7c41c489cf841eccd192504ea77bc0e01894b9
 SHA_MIG=08c5f03f59a222faceacaf312cc4356f5e53e0bc2f9acb0c58784d424865287b
 ok(){ echo "  ✓ $1"; }; ko(){ echo "  ✗ ARRÊT : $1" >&2; exit 1; }
 
@@ -28,11 +28,15 @@ for R in "$B" "$F"; do
 done
 ETAT=/var/backups/triangle/.sha-avant-deploiement
 mkdir -p /var/backups/triangle
-HEAD_B=$(git -C "$B" rev-parse HEAD)
-if [ -n "${OLD_BACKEND_SHA:-}" ]; then :
-elif [ "$HEAD_B" != "$SHA_B" ]; then OLD_BACKEND_SHA="$HEAD_B"; printf '%s' "$HEAD_B" > "$ETAT"
+DEPART_B=$(git -C "$B" rev-parse HEAD)
+if [ -n "${OLD_BACKEND_SHA:-}" ]; then printf '%s' "$OLD_BACKEND_SHA" > "$ETAT"
 elif [ -s "$ETAT" ]; then OLD_BACKEND_SHA=$(cat "$ETAT")
-else OLD_BACKEND_SHA="${SHA_B}^"; echo "  ! SHA d'avant déploiement inconnu : rollback proposé sur ${SHA_B}^"; fi
+elif ! git -C "$B" merge-base --is-ancestor "$REQUIRED_BACKEND_COMMIT" "$DEPART_B" 2>/dev/null; then
+  OLD_BACKEND_SHA="$DEPART_B"; printf '%s' "$DEPART_B" > "$ETAT"
+else
+  OLD_BACKEND_SHA="${REQUIRED_BACKEND_COMMIT}^"
+  echo "  ! SHA d'avant déploiement inconnu : rollback proposé sur ${REQUIRED_BACKEND_COMMIT}^"
+fi
 OLD_FRONTEND_SHA=$(git -C "$F" rev-parse HEAD)
 echo "  HEAD backend  avant : $OLD_BACKEND_SHA"
 echo "  HEAD frontend avant : $OLD_FRONTEND_SHA"
@@ -44,11 +48,18 @@ echo "$N" | grep -qi triangle || ko "la société 1 n'est pas Triangle"
 ok "base Triangle confirmée"
 
 echo "══ COMMIT BACKEND"
+# Ce qui compte n'est pas que HEAD soit EXACTEMENT le commit du module, mais
+# qu'il le CONTIENNE : un correctif publié depuis reste un déploiement valide,
+# alors qu'exiger l'égalité refuserait tout descendant légitime.
 git -C "$B" fetch origin --quiet
-git -C "$B" cat-file -e "${SHA_B}^{commit}" 2>/dev/null || ko "commit $SHA_B absent"
-git -C "$B" merge --ff-only "$SHA_B" >/dev/null || ko "avance impossible sur $B"
-[ "$(git -C "$B" rev-parse HEAD)" = "$SHA_B" ] || ko "backend HEAD ≠ $SHA_B"
-ok "backend HEAD = $SHA_B"
+git -C "$B" cat-file -e "${REQUIRED_BACKEND_COMMIT}^{commit}" 2>/dev/null \
+  || ko "commit fonctionnel $REQUIRED_BACKEND_COMMIT absent du dépôt"
+HEAD_B=$(git -C "$B" rev-parse HEAD)
+git -C "$B" merge-base --is-ancestor "$REQUIRED_BACKEND_COMMIT" "$HEAD_B" \
+  || ko "le HEAD backend $HEAD_B ne contient pas le module permissions ($REQUIRED_BACKEND_COMMIT)"
+if [ "$HEAD_B" = "$REQUIRED_BACKEND_COMMIT" ]; then echo "  HEAD = commit fonctionnel"
+else echo "  HEAD = $HEAD_B, descendant de $REQUIRED_BACKEND_COMMIT ($(git -C "$B" rev-list --count "$REQUIRED_BACKEND_COMMIT".."$HEAD_B") commit(s) de plus)"; fi
+ok "backend contient le module permissions"
 
 echo "══ EMPREINTE 063"
 M="$B/sql/063_permissions_avancees.sql"; [ -f "$M" ] || ko "$M introuvable"
@@ -104,11 +115,23 @@ fi
 psql "$DATABASE_URL" -c "SELECT u.fullname,u.role,count(*) AS exceptions FROM user_permission_overrides o JOIN users u ON u.id=o.user_id WHERE o.company_id=1 GROUP BY 1,2 ORDER BY 3 DESC LIMIT 10"
 
 echo "══ COMMIT FRONTEND"
+# Aucune manipulation de stash ici : les modifications locales éventuelles ont
+# été mises de côté à la main, et ce script ne doit ni les restaurer ni les
+# supprimer. Il se contente d'avancer sur origin/main.
 git -C "$F" fetch origin --quiet
-git -C "$F" cat-file -e "${SHA_F}^{commit}" 2>/dev/null || ko "commit $SHA_F absent"
-git -C "$F" merge --ff-only "$SHA_F" >/dev/null || ko "avance impossible sur $F"
-[ "$(git -C "$F" rev-parse HEAD)" = "$SHA_F" ] || ko "frontend HEAD ≠ $SHA_F"
-ok "frontend HEAD = $SHA_F"
+git -C "$F" cat-file -e "${REQUIRED_FRONTEND_COMMIT}^{commit}" 2>/dev/null \
+  || ko "commit fonctionnel $REQUIRED_FRONTEND_COMMIT absent du dépôt"
+HEAD_F=$(git -C "$F" rev-parse HEAD)
+if ! git -C "$F" merge-base --is-ancestor "$REQUIRED_FRONTEND_COMMIT" "$HEAD_F"; then
+  git -C "$F" merge --ff-only origin/main >/dev/null \
+    || ko "avance impossible sur $F sans écraser — traitez la divergence, aucun stash n'est touché"
+  HEAD_F=$(git -C "$F" rev-parse HEAD)
+fi
+git -C "$F" merge-base --is-ancestor "$REQUIRED_FRONTEND_COMMIT" "$HEAD_F" \
+  || ko "le HEAD frontend $HEAD_F ne contient pas l'écran des permissions ($REQUIRED_FRONTEND_COMMIT)"
+if [ "$HEAD_F" = "$REQUIRED_FRONTEND_COMMIT" ]; then echo "  HEAD = commit fonctionnel"
+else echo "  HEAD = $HEAD_F, descendant de $REQUIRED_FRONTEND_COMMIT ($(git -C "$F" rev-list --count "$REQUIRED_FRONTEND_COMMIT".."$HEAD_F") commit(s) de plus)"; fi
+ok "frontend contient l'écran des permissions"
 
 echo "══ DÉPENDANCES ET BUILD"
 for R in "$B" "$F"; do
@@ -178,8 +201,8 @@ done
 echo "══ CONCLUSION"
 pm2 jlist | node -e 'let e="";process.stdin.on("data",c=>e+=c).on("end",()=>JSON.parse(e||"[]").forEach(p=>console.log(`  ${p.name.padEnd(22)} ${String(p.pm2_env.status).padEnd(8)} ${Math.round((Date.now()-p.pm2_env.pm_uptime)/1000)}s`)))'
 echo "  ⇒ MaliLink et Hafiya : uptime supérieur à Triangle, non redémarrés"
-echo "  backend  $OLD_BACKEND_SHA → $SHA_B"
-echo "  frontend $OLD_FRONTEND_SHA → $SHA_F"
+echo "  backend  $OLD_BACKEND_SHA → $(git -C "$B" rev-parse HEAD)  (contient $REQUIRED_BACKEND_COMMIT)"
+echo "  frontend $OLD_FRONTEND_SHA → $(git -C "$F" rev-parse HEAD)  (contient $REQUIRED_FRONTEND_COMMIT)"
 echo "  063 sha256 $SHA_MIG"
 echo "  modules $(q "SELECT count(*) FROM permission_modules") | actions $(q "SELECT count(*) FROM permission_actions") | rôles $(q "SELECT count(*) FROM role_permissions") | exceptions $(q "SELECT count(*) FROM user_permission_overrides") | journal $(q "SELECT count(*) FROM permission_audit_log")"
 echo "  utilisateurs $U_AV inchangés | user_permissions $P_AV intacte"
