@@ -27,7 +27,41 @@ module.exports = function createPermissionsRouter(deps) {
   const requirePermission = service.creerRequirePermission(pool);
   const peutGerer = requirePermission("utilisateur.permissions", "manage");
 
-  const societeDe = (req) => Number(getEffectiveCompanyId(req, req.user?.company_id) || 0);
+  const estSuperAdmin = (u) =>
+    u?.is_super_admin === true || String(u?.role || "").toLowerCase() === "super_admin";
+
+  /**
+   * L'entreprise administrée.
+   *
+   * `getEffectiveCompanyId` peut rendre null : un super admin dont
+   * `users.company_id` est NULL et qui n'envoie pas `x-active-company-id`
+   * n'est rattaché à aucune société. Le `|| 0` transformait ce null en
+   * identifiant 0, et toutes les requêtes filtraient alors sur une société
+   * inexistante — la liste des employés revenait vide, avec un 200 et aucun
+   * message. Un compte introuvable et un filtre impossible se ressemblent
+   * trop pour qu'on les confonde.
+   *
+   * Quand la société ne peut pas être déduite et qu'il n'en existe qu'une
+   * seule, c'est nécessairement celle-là. S'il y en a plusieurs, on ne
+   * devine pas : la route le dit explicitement.
+   */
+  async function societeDe(req) {
+    const directe = Number(getEffectiveCompanyId(req, req.user?.company_id) || 0);
+    if (directe) return directe;
+    if (!estSuperAdmin(req.user)) return 0;
+    const { rows } = await pool.query(
+      `SELECT id FROM companies WHERE COALESCE(status,'active') <> 'deleted' ORDER BY id LIMIT 2`
+    );
+    return rows.length === 1 ? Number(rows[0].id) : 0;
+  }
+
+  /** Réponse commune lorsque l'entreprise reste indéterminable. */
+  const sansSociete = (res) =>
+    res.status(409).json({
+      error:
+        "Aucune entreprise active. Sélectionnez l'entreprise à administrer avant d'ouvrir les droits.",
+      code: "NO_ACTIVE_COMPANY",
+    });
 
   const echec = (res, e, message) => {
     console.error(message, e.message || e);
@@ -59,9 +93,6 @@ module.exports = function createPermissionsRouter(deps) {
     return rows[0]?.n || 0;
   }
 
-  const estSuperAdmin = (u) =>
-    u?.is_super_admin === true || String(u?.role || "").toLowerCase() === "super_admin";
-
   /* ─────────────────────────── LECTURE ─────────────────────────── */
 
   /** Mes propres droits : c'est ce que le frontend interroge au démarrage. */
@@ -90,6 +121,8 @@ module.exports = function createPermissionsRouter(deps) {
   /** Les comptes administrables, pour la liste déroulante. */
   router.get("/permissions/users", authenticateToken, peutGerer, async (req, res) => {
     try {
+      const companyId = await societeDe(req);
+      if (!companyId) return sansSociete(res);
       const { rows } = await pool.query(
         `SELECT u.id, u.fullname, u.email, u.role, u.badge_number, u.is_active,
                 u.is_super_admin,
@@ -98,7 +131,7 @@ module.exports = function createPermissionsRouter(deps) {
            FROM users u
           WHERE u.company_id = $1
           ORDER BY u.is_active DESC, lower(u.fullname)`,
-        [societeDe(req)]
+        [companyId]
       );
       res.json({ users: rows });
     } catch (e) { echec(res, e, "Erreur de lecture des comptes."); }
@@ -107,7 +140,8 @@ module.exports = function createPermissionsRouter(deps) {
   /** Droits d'un compte : effectifs, exceptions, et base du rôle. */
   router.get("/permissions/users/:id", authenticateToken, peutGerer, async (req, res) => {
     try {
-      const companyId = societeDe(req);
+      const companyId = await societeDe(req);
+      if (!companyId) return sansSociete(res);
       const cible = await cibleOuNull(companyId, req.params.id);
       if (!cible) return res.status(404).json({ error: "Utilisateur introuvable." });
 
@@ -150,7 +184,8 @@ module.exports = function createPermissionsRouter(deps) {
   router.put("/permissions/users/:id", authenticateToken, peutGerer, async (req, res) => {
     const client = await pool.connect();
     try {
-      const companyId = societeDe(req);
+      const companyId = await societeDe(req);
+      if (!companyId) return sansSociete(res);
       const cible = await cibleOuNull(companyId, req.params.id);
       if (!cible) return res.status(404).json({ error: "Utilisateur introuvable." });
 
@@ -237,7 +272,8 @@ module.exports = function createPermissionsRouter(deps) {
   router.post("/permissions/users/:id/reset", authenticateToken, peutGerer, async (req, res) => {
     const client = await pool.connect();
     try {
-      const companyId = societeDe(req);
+      const companyId = await societeDe(req);
+      if (!companyId) return sansSociete(res);
       const cible = await cibleOuNull(companyId, req.params.id);
       if (!cible) return res.status(404).json({ error: "Utilisateur introuvable." });
 
@@ -276,7 +312,8 @@ module.exports = function createPermissionsRouter(deps) {
   router.post("/permissions/users/:id/copy", authenticateToken, peutGerer, async (req, res) => {
     const client = await pool.connect();
     try {
-      const companyId = societeDe(req);
+      const companyId = await societeDe(req);
+      if (!companyId) return sansSociete(res);
       const destination = await cibleOuNull(companyId, req.params.id);
       const source = await cibleOuNull(companyId, req.body?.source_user_id);
       if (!destination || !source) {
@@ -336,7 +373,8 @@ module.exports = function createPermissionsRouter(deps) {
   /** Journal — consultable, jamais modifiable depuis l'application. */
   router.get("/permissions/audit", authenticateToken, peutGerer, async (req, res) => {
     try {
-      const companyId = societeDe(req);
+      const companyId = await societeDe(req);
+      if (!companyId) return sansSociete(res);
       const userId = Number(req.query.user_id || 0);
       const { rows } = await pool.query(
         `SELECT l.id, l.changed_at, l.changed_by_name, l.target_user_id,
