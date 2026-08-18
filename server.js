@@ -17553,6 +17553,11 @@ app.use(
 );
 
 /* Impression groupée : lecture seule, aucun document ni stock touché. */
+/* Centre Droits & permissions. Monté avant les autres routeurs pour que
+   /permissions/me réponde même si un module plus bas est masqué. */
+const createPermissionsRouter = require("./routes/permissions");
+app.use("/", createPermissionsRouter({ pool, authenticateToken, getEffectiveCompanyId }));
+
 const createDocumentsPrintRouter = require("./routes/documents-print");
 app.use(
   "/",
