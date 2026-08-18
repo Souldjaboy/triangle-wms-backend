@@ -84,7 +84,7 @@ echo "  utilisateurs : $U_AV | user_permissions : $P_AV | empreinte rôles : $R_
 if [ -n "$AM_ID" ]; then
   AM_LIG=$(q "SELECT count(*) FROM user_permissions WHERE user_id=$AM_ID")
   AM_ATT=$(q "SELECT count(*) FROM user_permissions up CROSS JOIN LATERAL (VALUES ('view',up.can_view),('create',up.can_create),('update',up.can_edit),('delete',up.can_delete),('validate',up.can_validate)) AS v(a,val) WHERE up.user_id=$AM_ID AND v.val IS NOT NULL")
-  echo "  Amary id=$AM_ID : $AM_LIG ligne(s), $AM_ATT droit(s) renseigné(s)"
+  echo "  Amary id=$AM_ID : $AM_LIG ligne(s) historique(s), $AM_ATT cellule(s) renseignée(s) (toutes ne sont pas applicables)"
   psql "$DATABASE_URL" -c "SELECT module_key,can_view,can_create,can_edit,can_delete,can_validate FROM user_permissions WHERE user_id=$AM_ID ORDER BY module_key"
 else echo "  Amary introuvable — vérifications la concernant ignorées"; AM_LIG=0; AM_ATT=0; fi
 
@@ -102,15 +102,19 @@ echo "══ NON-RÉGRESSION"
 [ "$(q "SELECT md5(string_agg(id||':'||coalesce(role,'')||':'||coalesce(is_super_admin::text,'f'),',' ORDER BY id)) FROM users WHERE company_id=1")" = "$R_AV" ] || ko "un rôle a changé"
 [ "$(q "SELECT count(*) FROM user_permissions")" = "$P_AV" ] || ko "user_permissions modifiée"
 ok "utilisateurs, rôles et user_permissions inchangés"
-if [ -n "$AM_ID" ] && [ "$AM_LIG" -gt 0 ]; then
-  MANQUE=$(q "SELECT count(*) FROM (SELECT v.a AS action FROM user_permissions up CROSS JOIN LATERAL (VALUES ('view',up.can_view),('create',up.can_create),('update',up.can_edit),('delete',up.can_delete),('validate',up.can_validate)) AS v(a,val) WHERE up.user_id=$AM_ID AND v.val IS NOT NULL) s WHERE NOT EXISTS (SELECT 1 FROM user_permission_overrides o WHERE o.user_id=$AM_ID AND o.action=s.action)")
-  AM_AP=$(q "SELECT count(*) FROM user_permission_overrides WHERE user_id=$AM_ID")
-  AM_MOD=$(q "SELECT count(DISTINCT module_key) FROM user_permission_overrides WHERE user_id=$AM_ID")
-  echo "  $AM_ATT droit(s) → $AM_AP exception(s) sur $AM_MOD module(s)"
-  [ "$MANQUE" = "0" ] || ko "$MANQUE droit(s) d'Amary non repris"
-  [ "$AM_AP" -ge "$AM_ATT" ] || ko "reprise incomplète ($AM_ATT → $AM_AP)"
-  ok "droits d'Amary intégralement repris"
+# Comparaison ensembliste, pas un décompte : on reconstruit la correspondance
+# exacte de la migration — module mappé, action applicable, propagation aux
+# sous-modules — et l'on exige que chaque cible attendue existe. Un couple que
+# le catalogue ne connaît pas n'est pas un manque, c'est une case qui n'a
+# jamais eu de sens.
+( cd "$B" && node scripts/verifier-reprise-permissions.js --company=1 ) \
+  || ko "reprise des droits incomplète — voir le détail ci-dessus"
+ok "tous les droits historiques sont repris (tous comptes confondus)"
+if [ -n "$AM_ID" ]; then
+  ( cd "$B" && node scripts/verifier-reprise-permissions.js --company=1 --user="$AM_ID" ) \
+    || ko "reprise des droits d'Amary incomplète"
   psql "$DATABASE_URL" -c "SELECT module_key, string_agg(action||'='||effect,', ' ORDER BY action) AS droits FROM user_permission_overrides WHERE user_id=$AM_ID GROUP BY module_key ORDER BY module_key"
+  ok "droits d'Amary vérifiés module par module"
 fi
 psql "$DATABASE_URL" -c "SELECT u.fullname,u.role,count(*) AS exceptions FROM user_permission_overrides o JOIN users u ON u.id=o.user_id WHERE o.company_id=1 GROUP BY 1,2 ORDER BY 3 DESC LIMIT 10"
 
