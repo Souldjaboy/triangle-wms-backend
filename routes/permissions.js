@@ -75,7 +75,11 @@ module.exports = function createPermissionsRouter(deps) {
    */
   async function cibleOuNull(companyId, userId) {
     const { rows } = await pool.query(
-      `SELECT id, company_id, fullname, email, role, badge_number, is_super_admin, is_active
+      /* La colonne s'appelle `badge_code` en base ; l'API expose `badge_number`
+         depuis l'ouverture de cet écran. On aliase plutôt que de renommer :
+         la base ne bouge pas, le contrat JSON du frontend non plus. */
+      `SELECT id, company_id, fullname, email, role, badge_code AS badge_number,
+              is_super_admin, is_active
          FROM users WHERE id = $1 AND company_id = $2 LIMIT 1`,
       [Number(userId) || 0, companyId]
     );
@@ -124,8 +128,8 @@ module.exports = function createPermissionsRouter(deps) {
       const companyId = await societeDe(req);
       if (!companyId) return sansSociete(res);
       const { rows } = await pool.query(
-        `SELECT u.id, u.fullname, u.email, u.role, u.badge_number, u.is_active,
-                u.is_super_admin,
+        `SELECT u.id, u.fullname, u.email, u.role, u.badge_code AS badge_number,
+                u.is_active, u.is_super_admin,
                 (SELECT count(*)::int FROM user_permission_overrides o
                   WHERE o.company_id = u.company_id AND o.user_id = u.id) AS exceptions
            FROM users u
