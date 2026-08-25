@@ -21,6 +21,8 @@ const fs = require("fs");
 const crypto = require("crypto");
 const nodemailer = require("nodemailer");
 const stockLocations = require("./services/stock-locations");
+const locationHierarchy = require("./services/location-hierarchy");
+const documentDates = require("./services/document-dates");
 require("dotenv").config();
 
 let webPush = null;
@@ -8688,7 +8690,17 @@ function renderDocumentHtml(document, items = [], companySettings = {}) {
         <div class="right">
           <h1>${escapeHtml(document.document_type || "Document")}</h1>
           <p><strong>${escapeHtml(document.document_number || "")}</strong></p>
-          <p class="muted">${document.created_at ? new Date(document.created_at).toLocaleString("fr-FR") : ""}</p>
+          <!-- La date IMPRIMÉE est la date métier, pas l'instant où la ligne
+               est entrée en base, et elle s'écrit à l'heure de Bamako : sans
+               fuseau explicite, le même bon affichait deux heures différentes
+               selon le téléphone qui l'ouvrait. -->
+          <p class="muted">${(() => {
+            const d = documentDates.dateAAfficher(document);
+            const local = documentDates.versLocal(d.instant);
+            return local ? escapeHtml(local.affichage) : "";
+          })()}</p>
+          ${Number(document.document_revision || 1) > 1
+            ? `<p class="muted">Révision ${Number(document.document_revision)}</p>` : ""}
         </div>
       </section>
       <section>
@@ -12478,10 +12490,19 @@ app.delete("/warehouses/:id", authenticateToken, async (req, res) => {
   }
 });
 /* EMPLACEMENTS */
-app.get("/locations", authenticateToken, async (req, res) => {
+app.get("/locations", authenticateToken, requirePermission("stock.emplacement", "view"), async (req, res) => {
   try {
-    const companyId = req.user.company_id;
-    const isSuperAdmin = req.user.is_super_admin === true;
+    /* Un super admin sans société active voyait ici les emplacements de TOUTES
+       les entreprises : un compte FAT & MAT pouvait lire les bacs Triangle et
+       l'inverse. L'entreprise administrée est désormais toujours explicite,
+       et une société indéterminable refuse plutôt que de tout montrer. */
+    const companyId = Number(getEffectiveCompanyId(req, req.user.company_id) || 0);
+    if (!companyId) {
+      return res.status(409).json({
+        error: "Aucune entreprise active. Sélectionnez l'entreprise à administrer.",
+        code: "NO_ACTIVE_COMPANY",
+      });
+    }
 
     const result = await pool.query(
       `SELECT
@@ -12492,9 +12513,14 @@ app.get("/locations", authenticateToken, async (req, res) => {
        FROM locations
        LEFT JOIN warehouses ON locations.warehouse_id = warehouses.id
        LEFT JOIN products ON locations.product_id = products.id
-       ${isSuperAdmin ? "" : "WHERE locations.company_id=$1"}
-       ORDER BY locations.id DESC`
-      , isSuperAdmin ? [] : [companyId]
+       WHERE locations.company_id=$1 AND locations.archived_at IS NULL
+       ORDER BY locations.warehouse_code,
+                COALESCE(NULLIF(locations.rayon_code,''), locations.zone),
+                COALESCE(NULLIF(locations.case_code,''), locations.rayon),
+                COALESCE(locations.level_rank, 8999),
+                COALESCE(locations.bin_rank, 999999),
+                locations.id`
+      , [companyId]
     );
 
     res.json(result.rows);
@@ -12504,126 +12530,214 @@ app.get("/locations", authenticateToken, async (req, res) => {
   }
 });
 
-app.post("/locations", authenticateToken, async (req, res) => {
+app.post("/locations", authenticateToken, requirePermission("stock.emplacement", "create"), async (req, res) => {
   try {
     const {
-      warehouse_id,
-      zone,
-      rayon,
-      etagere,
-      status,
-      product_id,
-      product_reference,
-      product_name,
-      rayon_code,
-      case_code,
-      level_code,
-      bin_code,
-      bin_mode,
-      bin_group,
-      company_id
+      warehouse_id, zone, rayon, etagere, status,
+      product_id, product_reference, product_name,
+      rayon_code, case_code, level_code, bin_code, bin_mode, bin_group,
     } = req.body;
 
+    /* L'entreprise vient de la SESSION, jamais du corps de la requête : elle y
+       était acceptée telle quelle, ce qui permettait de poser un emplacement
+       dans la société d'autrui. */
+    const companyId = Number(getEffectiveCompanyId(req, req.user.company_id) || 0);
+    if (!companyId) {
+      return res.status(409).json({
+        error: "Aucune entreprise active. Sélectionnez l'entreprise à administrer.",
+        code: "NO_ACTIVE_COMPANY",
+      });
+    }
+
+    /* L'entrepôt doit appartenir à cette entreprise. Sans ce filtre, un
+       identifiant deviné suffisait à créer un bac chez le voisin. */
     const warehouseResult = await pool.query(
-      "SELECT * FROM warehouses WHERE id=$1",
-      [warehouse_id]
+      "SELECT * FROM warehouses WHERE id=$1 AND company_id=$2",
+      [warehouse_id, companyId]
     );
-
     const warehouse = warehouseResult.rows[0];
+    if (!warehouse) return res.status(404).json({ error: "Entrepôt introuvable" });
 
-    if (!warehouse)
-      return res.status(404).json({ error: "Entrepôt introuvable" });
+    const composantes = {
+      warehouse: String(warehouse.code || "").trim().toUpperCase(),
+      row: String(rayon_code || zone || "").trim().toUpperCase(),
+      shelf: String(case_code || rayon || "").trim().toUpperCase(),
+      level: String(level_code || etagere || "").trim().toUpperCase(),
+    };
 
-    const emplacement_code = `${warehouse.code}-${zone}-${rayon}-${etagere}`;
-    const qr_code = await QRCode.toDataURL(emplacement_code);
+    /* LE DÉFAUT HISTORIQUE.
+       « Full Bin : Bin 1 + 2 + 3 » envoyait bin_code = "1,2,3" et cette route
+       insérait UNE ligne portant ce nom. Les bacs 1, 2 et 3 n'existaient donc
+       jamais : voilà pourquoi on les cherchait en vain dans les sélecteurs.
+       Un code composite donne désormais AUTANT DE BACS QU'IL EN NOMME. */
+    const binBrut = String(bin_code || bin_group || "").trim();
+    const codes = locationHierarchy.estBinComposite(binBrut)
+      ? locationHierarchy.splitCompositeBin(binBrut)
+      : [binBrut.toUpperCase()].filter(Boolean);
 
-    const result = await pool.query(
-      `INSERT INTO locations
-      (
-        warehouse_id,
-        warehouse_code,
-        zone,
-        rayon,
-        etagere,
-        emplacement_code,
-        qr_code,
-        status,
-        product_id,
-        product_reference,
-        product_name,
-        rayon_code,
-        case_code,
-        level_code,
-        bin_code,
-        bin_mode,
-        bin_group,
-        company_id
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
-      RETURNING *`,
-      [
-        warehouse_id,
-        warehouse.code,
-        zone,
-        rayon,
-        etagere,
-        emplacement_code,
-        qr_code,
-        status || "Disponible",
-        product_id || null,
-        product_reference || "",
-        product_name || "",
-        rayon_code || zone || "",
-        case_code || rayon || "",
-        level_code || etagere || "",
-        bin_code || "",
-        bin_mode || "single",
-        bin_group || "",
-        company_id || req.user.company_id || warehouse.company_id || null
-      ]
-    );
+    if (!codes.length) {
+      return res.status(400).json({ error: "Code de bac obligatoire.", code: "MISSING_BIN" });
+    }
+
+    const emplacement_code = locationHierarchy.composeEmplacementCode(composantes);
+    const crees = [];
+    const existants = [];
+
+    for (const code of codes) {
+      const full = locationHierarchy.composeFullCode({ ...composantes, bin: code });
+      const deja = await pool.query(
+        `SELECT id, full_code FROM locations
+          WHERE company_id=$1 AND archived_at IS NULL
+            AND UPPER(COALESCE(full_code, emplacement_code, ''))=UPPER($2) LIMIT 1`,
+        [companyId, full]
+      );
+      if (deja.rows[0]) { existants.push(deja.rows[0]); continue; }
+
+      const qr = await QRCode.toDataURL(full);
+      const result = await pool.query(
+        `INSERT INTO locations
+          (warehouse_id, warehouse_code, zone, rayon, etagere, emplacement_code, qr_code,
+           status, product_id, product_reference, product_name,
+           rayon_code, case_code, level_code, bin_code, bin_mode, bin_group, company_id,
+           full_code, is_active, occupancy_status, level_rank, bin_rank)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,TRUE,'EMPTY',$20,$21)
+        RETURNING *`,
+        [
+          warehouse.id, warehouse.code,
+          composantes.row, composantes.shelf, composantes.level,
+          emplacement_code, qr, status || "Disponible",
+          product_id || null, product_reference || "", product_name || "",
+          composantes.row, composantes.shelf, composantes.level,
+          code, "single", bin_group || "", companyId, full,
+          locationHierarchy.levelRank(composantes.level),
+          locationHierarchy.binRank(code),
+        ]
+      );
+      crees.push(result.rows[0]);
+
+      await pool.query(
+        `INSERT INTO location_audit_log
+           (company_id, location_id, action, scope, new_value, reason,
+            quantity_before, quantity_after, changed_by, changed_by_name)
+         VALUES ($1,$2,'CREATE','BIN',$3,$4,0,0,$5,$6)`,
+        [companyId, result.rows[0].id, full,
+         codes.length > 1 ? `Bac issu du code composite « ${binBrut} »` : "Création",
+         req.user?.id || null, req.user?.fullname || req.user?.email || ""]
+      );
+    }
 
     await logActivity(
-      "Administrateur",
-      "admin",
+      req.user?.fullname || "Administrateur",
+      req.user?.role || "admin",
       "Création emplacement",
       "Emplacements",
-      `Emplacement créé : ${emplacement_code}`
+      `${crees.length} bac(s) créé(s) sous ${emplacement_code}`
     );
 
-    res.status(201).json(result.rows[0]);
+    /* Le corps garde la forme attendue par l'ancien écran — un emplacement —
+       tout en exposant la liste complète pour les appelants qui la lisent. */
+    res.status(crees.length ? 201 : 200).json({
+      ...(crees[0] || existants[0] || {}),
+      crees, existants,
+      bins_crees: crees.length,
+      bins_existants: existants.length,
+      stockImpact: 0,
+    });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Erreur ajout emplacement" });
   }
 });
 
-app.delete("/locations/:id", authenticateToken, async (req, res) => {
+/**
+ * ARCHIVAGE D'UN EMPLACEMENT — la route s'appelle encore DELETE, elle ne
+ * supprime plus.
+ *
+ * Elle exécutait un `DELETE FROM locations`, sans permission et sans vérifier
+ * ce que le bac contenait. Pour un produit dont la répartition n'est pas
+ * encore établie, aucune balance ne s'y oppose : la ligne partait, et avec
+ * elle la seule trace de l'endroit où la marchandise était rangée.
+ *
+ * Un emplacement se retire de la vue ; il ne se détruit pas. Son id, son
+ * historique et ses mouvements restent — c'est ce qui permet de relire un bon
+ * d'il y a deux ans sans tomber sur un emplacement introuvable.
+ */
+app.delete("/locations/:id", authenticateToken, requirePermission("stock.emplacement", "archive"), async (req, res) => {
+  const client = await pool.connect();
   try {
-    const companyId = req.user.company_id;
-    const isSuperAdmin = req.user.is_super_admin === true;
-    const values = [req.params.id];
-    let query = "DELETE FROM locations WHERE id=$1";
-
-    if (!isSuperAdmin) {
-      values.push(companyId);
-      query += " AND company_id=$2";
+    const companyId = Number(getEffectiveCompanyId(req, req.user.company_id) || 0);
+    if (!companyId) {
+      return res.status(409).json({
+        error: "Aucune entreprise active. Sélectionnez l'entreprise à administrer.",
+        code: "NO_ACTIVE_COMPANY",
+      });
     }
 
-    await pool.query(query, values);
+    await client.query("BEGIN");
+    const { rows } = await client.query(
+      `SELECT l.id, l.full_code, l.emplacement_code,
+              COALESCE((SELECT SUM(b.quantity) FROM stock_location_balances b
+                         WHERE b.location_id = l.id AND b.company_id = l.company_id), 0)::numeric AS quantite
+         FROM locations l
+        WHERE l.id=$1 AND l.company_id=$2 FOR UPDATE OF l`,
+      [Number(req.params.id) || 0, companyId]
+    );
+    const bac = rows[0];
+    if (!bac) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Emplacement introuvable." });
+    }
+
+    /* Un bac occupé ne s'archive pas : on le viderait de l'écran sans vider
+       l'étagère, et le stock deviendrait introuvable. */
+    const quantite = Number(bac.quantite);
+    if (quantite > 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        error: `Cet emplacement contient encore ${quantite} unité(s). ` +
+               `Transférez-les vers un autre bac avant de l'archiver.`,
+        code: "LOCATION_NOT_EMPTY",
+        quantite,
+      });
+    }
+
+    await client.query(
+      `UPDATE locations SET archived_at = now(), archived_by = $2, is_active = FALSE,
+              occupancy_status = 'INACTIVE', updated_at = now()
+        WHERE id=$1 AND company_id=$3`,
+      [bac.id, req.user?.id || null, companyId]
+    );
+    await client.query(
+      `INSERT INTO location_audit_log
+         (company_id, location_id, action, scope, old_value, new_value, reason,
+          quantity_before, quantity_after, changed_by, changed_by_name)
+       VALUES ($1,$2,'ARCHIVE','BIN',$3,$3,$4,0,0,$5,$6)`,
+      [companyId, bac.id, bac.full_code || bac.emplacement_code,
+       String(req.body?.reason || ""), req.user?.id || null,
+       req.user?.fullname || req.user?.email || ""]
+    );
+    await client.query("COMMIT");
 
     await logActivity(
-      "Administrateur",
-      "admin",
-      "Suppression emplacement",
+      req.user?.fullname || "Administrateur",
+      req.user?.role || "admin",
+      "Archivage emplacement",
       "Emplacements",
-      `Emplacement supprimé ID : ${req.params.id}`
+      `Emplacement archivé : ${bac.full_code || bac.emplacement_code || bac.id}`
     );
 
-    res.json({ message: "Emplacement supprimé" });
+    res.json({
+      message: "Emplacement archivé",
+      archived: true,
+      id: bac.id,
+      code: bac.full_code || bac.emplacement_code,
+    });
   } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
     console.error(error);
-    res.status(500).json({ error: "Erreur suppression emplacement" });
+    res.status(500).json({ error: "Erreur archivage emplacement" });
+  } finally {
+    client.release();
   }
 });
 
@@ -17550,6 +17664,23 @@ const createStockLocationsRouter = require("./routes/stock-locations");
 app.use(
   "/",
   createStockLocationsRouter({ pool, authenticateToken, getEffectiveCompanyId, requirePermission })
+);
+
+/* Administration des emplacements : arborescence complète, création en série,
+   renommage atomique, découpage des bacs composites « 1,2,3 » hérités de
+   l'ancien écran. Aucune de ces routes n'écrit une quantité de stock. */
+const createLocationsAdminRouter = require("./routes/locations-admin");
+app.use(
+  "/",
+  createLocationsAdminRouter({ pool, authenticateToken, getEffectiveCompanyId, requirePermission })
+);
+
+/* Dates métier des documents : ce qui est IMPRIMÉ se corrige, ce qui est
+   ENREGISTRÉ ne se réécrit pas. created_at reste hors d'atteinte. */
+const createDocumentDatesRouter = require("./routes/documents-dates");
+app.use(
+  "/",
+  createDocumentDatesRouter({ pool, authenticateToken, getEffectiveCompanyId, requirePermission })
 );
 
 /* Impression groupée : lecture seule, aucun document ni stock touché. */

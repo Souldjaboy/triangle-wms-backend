@@ -19,6 +19,7 @@
  */
 
 const express = require("express");
+const D = require("../services/document-dates");
 
 /* Compte technique de l'import, et identité métier à afficher à sa place.
    « fonction » est le libellé lisible porté sur le bon papier ; « role » est
@@ -66,6 +67,7 @@ module.exports = function createDocumentsPrintRouter(deps) {
        ORDER BY id DESC LIMIT 1
     )
     SELECT d.id, d.document_number, d.document_type, d.created_at, d.created_by,
+           d.operation_effective_at, d.document_datetime, d.document_revision,
            (SELECT id FROM dernier) AS import_id,
            (SELECT file_name FROM dernier) AS import_file
       FROM documents d
@@ -111,7 +113,9 @@ module.exports = function createDocumentsPrintRouter(deps) {
         modification_base: false,
         documents: rows.map((d) => ({
           id: d.id, numero: d.document_number, type: d.document_type,
-          famille: familleDocument(d.document_type), date: d.created_at,
+          famille: familleDocument(d.document_type),
+          date: D.dateAAfficher(d).instant,
+          date_affichee: D.versLocal(D.dateAAfficher(d).instant),
           auteur_actuel: d.created_by,
           sera_remplace: String(d.created_by || "").trim().toLowerCase() === AUTEUR_IMPORT,
         })),
@@ -167,10 +171,17 @@ module.exports = function createDocumentsPrintRouter(deps) {
         documents: documents.map((d) => {
           const substitue = duDernierImport.has(d.id)
             && String(d.created_by || "").trim().toLowerCase() === AUTEUR_IMPORT;
+          /* La date imprimée est la date MÉTIER, à l'heure de Bamako. Le lot
+             et le bon unitaire doivent afficher la même chose : deux règles
+             de date pour un même document, c'est deux documents. */
+          const dateAffichee = D.dateAAfficher(d);
           return {
             ...d,
             famille: familleDocument(d.document_type),
             items: parDocument.get(d.id) || [],
+            date_affichee: D.versLocal(dateAffichee.instant),
+            source_date_affichee: dateAffichee.source,
+            fuseau: D.FUSEAU,
             /* L'auteur affiché ; created_by reste tel quel dans la réponse,
                pour que l'écran puisse montrer les deux si besoin. */
             auteur_affiche: substitue ? AUTEUR_AFFICHE : {
