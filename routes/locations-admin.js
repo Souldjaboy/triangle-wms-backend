@@ -28,6 +28,7 @@
 const express = require("express");
 const H = require("../services/location-hierarchy");
 const rules = require("../services/location-rules");
+const L = require("../services/stock-locations");
 
 module.exports = function createLocationsAdminRouter(deps) {
   const { pool, authenticateToken, getEffectiveCompanyId, requirePermission } = deps;
@@ -131,6 +132,17 @@ module.exports = function createLocationsAdminRouter(deps) {
     });
     const archive = Boolean(r.archived_at);
     const actif = r.is_active !== false && !archive;
+    /* Un emplacement AMBIGU nomme plusieurs bacs à la fois, ou n'en nomme
+       aucun précisément : « 1,2,3 », « BIN1-2 », « FULLBIN ». Il n'est pas
+       exploitable, mais il porte souvent du stock — le masquer condamnerait
+       ce stock à rester introuvable. On l'affiche donc avec ce qu'il faut
+       pour le régulariser. */
+    const composite = H.estBinComposite(r.bin_code);
+    const ambigu = composite || ["LOCATION_UNRESOLVED", "LOCATION_UNRESOLVED_RANGE",
+      "LEGACY_FULLBIN", "LEGACY_PLACEHOLDER"].includes(String(motif));
+    const suggeres = composite
+      ? H.splitCompositeBin(r.bin_code)
+      : rules.binsFromRange({ bin_code: r.bin_code }).map((b) => b.bin);
     return {
       ...r,
       quantity, reserved,
@@ -140,15 +152,27 @@ module.exports = function createLocationsAdminRouter(deps) {
       /* EMPTY | OCCUPIED | PARTIAL : « partiellement occupé » signifie qu'une
          partie du contenu est réservée, donc immobilisée sans être sortie. */
       statut: archive ? "ARCHIVED"
+            : ambigu ? "A_REGULARISER"
             : !actif ? "DISABLED"
             : quantity <= 0 ? "EMPTY"
             : reserved > 0 && reserved < quantity ? "PARTIAL"
             : "OCCUPIED",
+      statut_libelle: archive ? "Archivé"
+            : ambigu ? "Emplacement historique à régulariser"
+            : !actif ? "Désactivé"
+            : quantity <= 0 ? "Libre"
+            : reserved > 0 && reserved < quantity ? "Partiellement occupé"
+            : "Occupé",
       exploitable: motif === null && actif,
       motif,
       motif_libelle: motif ? rules.MOTIF_FR[motif] : null,
-      composite: H.estBinComposite(r.bin_code),
-      bins_suggeres: H.estBinComposite(r.bin_code) ? H.splitCompositeBin(r.bin_code) : [],
+      ambigu,
+      composite,
+      /* Les bacs que cette ligne aurait dû être. Des CANDIDATS à créer, jamais
+         une répartition : savoir que trois bacs existent ne dit pas lequel
+         contient quoi. */
+      bins_suggeres: suggeres,
+      regularisable: ambigu && !archive,
       is_top: H.estNiveauTop(r.level_code),
     };
   };
@@ -218,6 +242,7 @@ module.exports = function createLocationsAdminRouter(deps) {
           OCCUPIED: bacs.filter((b) => b.statut === "OCCUPIED").length,
           PARTIAL: bacs.filter((b) => b.statut === "PARTIAL").length,
           DISABLED: bacs.filter((b) => b.statut === "DISABLED").length,
+          A_REGULARISER: bacs.filter((b) => b.statut === "A_REGULARISER").length,
           ARCHIVED: bacs.filter((b) => b.statut === "ARCHIVED").length,
           composites: bacs.filter((b) => b.composite).length,
           inexploitables: bacs.filter((b) => !b.exploitable && b.statut !== "ARCHIVED").length,
@@ -661,7 +686,348 @@ module.exports = function createLocationsAdminRouter(deps) {
     } catch (e) { fail(res, e, "Erreur de découpage du bac composite."); }
   });
 
+  /**
+   * RÉGULARISER UN EMPLACEMENT HISTORIQUE AMBIGU.
+   *
+   * « 1,2,3 », « BIN1-2 » : une ligne qui nomme plusieurs bacs. Elle porte du
+   * stock réel, mais ne dit pas lequel de ces bacs le contient. Aucune
+   * répartition automatique n'est donc possible — et aucune n'est tentée.
+   *
+   * L'utilisateur dit, produit par produit, combien va dans quel bac. Le
+   * serveur vérifie que l'arithmétique tombe juste :
+   *
+   *     somme(répartitions) + reliquat = quantité présente
+   *
+   * Le reliquat est ce qu'on assume de laisser sur place, faute de savoir. Il
+   * est explicite, jamais déduit : un écart silencieux serait du stock perdu.
+   *
+   * Chaque déplacement est un VRAI mouvement de transfert, passé par le
+   * moteur existant. L'emplacement d'origine n'est jamais supprimé : vidé, il
+   * est archivé, et il garde son code, son id et son historique.
+   *
+   *   { repartitions: [{ product_id, bin, quantity }], reliquats: {product_id: n},
+   *     reason }
+   */
+  router.post("/stock/locations/bins/:id/regulariser", authenticateToken, canCreate, async (req, res) => {
+    try {
+      const companyId = companyOf(req);
+      if (!companyId) return sansSociete(res);
+      const b = req.body || {};
+      const motif = String(b.reason || "").trim();
+      if (!motif) {
+        return res.status(400).json({
+          error: "Motif obligatoire : une régularisation se relit des mois plus tard.",
+          code: "REASON_REQUIRED",
+        });
+      }
+      const repartitions = Array.isArray(b.repartitions) ? b.repartitions : [];
+      if (!repartitions.length) {
+        return res.status(400).json({ error: "Aucune répartition transmise.", code: "NO_ALLOCATION" });
+      }
+
+      const out = await tx(async (client) => {
+        const source = await bacDe(client, companyId, req.params.id, { verrou: true });
+        const codeSource = source.full_code || source.emplacement_code || String(source.id);
+        const binSource = source.bin_code_resolu;
+        const motifRegle = rules.rejectionReason({
+          warehouse_code: source.warehouse_code, rayon_code: source.row_code,
+          case_code: source.shelf_code, level_code: source.level_code_resolu,
+          bin_code: binSource, emplacement_code: source.emplacement_code,
+        });
+        if (!H.estBinComposite(binSource) && !motifRegle) {
+          throw new H.HierarchyError(
+            `« ${codeSource} » est un bac exploitable : il n'y a rien à régulariser. ` +
+            `Utilisez un transfert ordinaire.`,
+            "NOT_AMBIGUOUS", 400
+          );
+        }
+
+        /* Ce que la source contient RÉELLEMENT, verrouillé. On ne fait pas
+           confiance aux quantités envoyées par le navigateur. */
+        const { rows: presents } = await client.query(
+          `SELECT b.product_id, b.quantity::numeric AS quantity,
+                  b.reserved_quantity::numeric AS reserved, p.name, p.reference, p.unit
+             FROM stock_location_balances b
+             JOIN products p ON p.id = b.product_id
+            WHERE b.company_id = $1 AND b.location_id = $2 AND b.quantity > 0
+            ORDER BY b.product_id
+            FOR UPDATE OF b`,
+          [companyId, source.id]
+        );
+        if (!presents.length) {
+          throw new H.HierarchyError(
+            `« ${codeSource} » ne contient aucun stock : archivez-le simplement.`,
+            "SOURCE_EMPTY", 409
+          );
+        }
+
+        /* ── arithmétique, produit par produit ─────────────────────────── */
+        const parProduit = new Map();
+        for (const r of repartitions) {
+          const pid = Number(r.product_id) || 0;
+          const q = Number(r.quantity);
+          const bin = String(r.bin || "").trim().toUpperCase();
+          if (!pid || !bin) {
+            throw new H.HierarchyError("Répartition incomplète : produit et bac requis.",
+              "INVALID_ALLOCATION", 400);
+          }
+          if (!(q > 0)) {
+            throw new H.HierarchyError(`Quantité invalide pour le bac ${bin}.`,
+              "INVALID_QUANTITY", 400);
+          }
+          if (!parProduit.has(pid)) parProduit.set(pid, []);
+          parProduit.get(pid).push({ bin, quantity: q });
+        }
+
+        const reliquats = b.reliquats || {};
+        const controle = [];
+        for (const p of presents) {
+          const lignes = parProduit.get(Number(p.product_id)) || [];
+          const somme = lignes.reduce((n, x) => n + x.quantity, 0);
+          const reliquat = Number(reliquats[p.product_id] ?? reliquats[String(p.product_id)] ?? 0);
+          const total = somme + reliquat;
+          const present = Number(p.quantity);
+          controle.push({
+            product_id: p.product_id, name: p.name, present,
+            reparti: somme, reliquat, total,
+          });
+          if (total !== present) {
+            throw new H.HierarchyError(
+              `Répartition incohérente pour « ${p.name} » : ${somme} réparti(s) + ${reliquat} de ` +
+              `reliquat = ${total}, alors que le bac en contient ${present}. ` +
+              `La somme doit être strictement égale à la quantité présente.`,
+              "ALLOCATION_MISMATCH", 400,
+              { product_id: p.product_id, present, reparti: somme, reliquat }
+            );
+          }
+          /* Le réservé ne se déplace pas à l'aveugle : on refuse de sortir
+             plus que le disponible. */
+          const disponible = present - Number(p.reserved);
+          if (somme > disponible) {
+            throw new H.HierarchyError(
+              `« ${p.name} » : ${somme} demandé(s) mais seulement ${disponible} disponible(s) ` +
+              `(${p.reserved} réservé(s)). Libérez la réservation d'abord.`,
+              "RESERVED_STOCK", 409, { product_id: p.product_id, disponible, reserved: Number(p.reserved) }
+            );
+          }
+        }
+        /* Un produit réparti qui n'est pas dans le bac : refus. */
+        for (const pid of parProduit.keys()) {
+          if (!presents.some((p) => Number(p.product_id) === pid)) {
+            throw new H.HierarchyError(
+              `Le produit ${pid} n'est pas présent dans « ${codeSource} ».`,
+              "PRODUCT_NOT_IN_SOURCE", 400
+            );
+          }
+        }
+
+        /* ── création des bacs destinataires, puis transferts réels ────── */
+        const lot = `REGUL-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const chemin = {
+          warehouse: source.warehouse_code, row: source.row_code,
+          shelf: source.shelf_code, level: source.level_code_resolu,
+        };
+        const wh = await entrepotDe(client, companyId, chemin.warehouse);
+        const emplacement = H.composeEmplacementCode(chemin);
+        const binsCrees = [];
+        const cible = new Map();   // bin -> location_id
+
+        const binsVises = [...new Set(repartitions.map((r) => String(r.bin || "").trim().toUpperCase()))];
+        for (const bin of binsVises) {
+          const refus = rules.rejectionReason({ ...chemin, warehouse_code: chemin.warehouse,
+            rayon_code: chemin.row, case_code: chemin.shelf, level_code: chemin.level, bin_code: bin });
+          if (refus) {
+            throw new H.HierarchyError(
+              `« ${bin} » ne peut pas servir de destination : ${rules.MOTIF_FR[refus]}.`,
+              refus, 409
+            );
+          }
+          const full = H.composeFullCode({ ...chemin, bin });
+          const { rows: deja } = await client.query(
+            `SELECT id FROM locations WHERE company_id=$1 AND archived_at IS NULL
+               AND UPPER(COALESCE(full_code, emplacement_code,''))=UPPER($2) LIMIT 1`,
+            [companyId, full]
+          );
+          if (deja[0]) { cible.set(bin, deja[0].id); continue; }
+          const { rows } = await client.query(
+            `INSERT INTO locations
+               (warehouse_id, warehouse_code, zone, rayon, etagere, emplacement_code,
+                rayon_code, case_code, level_code, bin_code, status, company_id,
+                full_code, is_active, occupancy_status, level_rank, bin_rank)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'Disponible',$11,$12,TRUE,'EMPTY',$13,$14)
+             RETURNING id, full_code, bin_code`,
+            [wh.id, wh.code, chemin.row, chemin.shelf, chemin.level, emplacement,
+             chemin.row, chemin.shelf, chemin.level, bin, companyId, full,
+             H.levelRank(chemin.level), H.binRank(bin)]
+          );
+          cible.set(bin, rows[0].id);
+          binsCrees.push(rows[0]);
+          await journaliser(client, companyId, req, {
+            locationId: rows[0].id, action: "CREATE", scope: "BIN", apres: full,
+            batchId: lot, quantiteAvant: 0, quantiteApres: 0,
+            reason: `Régularisation de « ${codeSource} » : ${motif}`,
+          });
+        }
+
+        const mouvements = [];
+        for (const [pid, lignes] of parProduit) {
+          for (const ligne of lignes) {
+            /* Le moteur de transfert existant, avec ses verrous, ses contrôles
+               et son écriture de mouvement. La seule tolérance : une source
+               historique — c'est précisément ce qu'on vide. */
+            const r = await L.transferBetweenLocations(client, {
+              companyId, productId: pid,
+              sourceLocationId: source.id,
+              destinationLocationId: cible.get(ligne.bin),
+              quantity: ligne.quantity,
+              user: userOf(req),
+              reason: `Régularisation « ${codeSource} » → ${ligne.bin} : ${motif}`,
+              legacySource: true,
+            });
+            mouvements.push({
+              product_id: pid, bin: ligne.bin, quantity: ligne.quantity,
+              movement_id: r.movement?.id,
+            });
+          }
+        }
+
+        /* ── l'origine : vidée, elle s'archive ; sinon elle reste visible ── */
+        const { rows: reste } = await client.query(
+          `SELECT COALESCE(SUM(quantity),0)::numeric AS q FROM stock_location_balances
+            WHERE company_id=$1 AND location_id=$2`,
+          [companyId, source.id]
+        );
+        const restant = Number(reste[0].q);
+        let archivee = false;
+        if (restant === 0) {
+          await client.query(
+            `UPDATE locations SET archived_at = now(), archived_by = $2, is_active = FALSE,
+                    occupancy_status = 'INACTIVE',
+                    previous_full_code = COALESCE(previous_full_code, full_code, emplacement_code),
+                    updated_at = now()
+              WHERE id = $1 AND company_id = $3`,
+            [source.id, req.user?.id || null, companyId]
+          );
+          archivee = true;
+        }
+        await journaliser(client, companyId, req, {
+          locationId: source.id, action: archivee ? "ARCHIVE" : "REGULARIZE",
+          scope: "BIN", avant: codeSource, apres: codeSource, batchId: lot,
+          quantiteAvant: presents.reduce((n, p) => n + Number(p.quantity), 0),
+          quantiteApres: restant,
+          reason: `Régularisation : ${motif}`,
+        });
+
+        return {
+          batchId: lot, source: { id: source.id, code: codeSource, bin: binSource },
+          controle, bins_crees: binsCrees, mouvements,
+          reliquat_total: restant, archivee,
+        };
+      });
+
+      res.status(201).json({
+        success: true, ...out,
+        message: out.archivee
+          ? `Emplacement « ${out.source.code} » régularisé et archivé. Il reste en base avec son historique.`
+          : `Emplacement « ${out.source.code} » partiellement régularisé : ${out.reliquat_total} unité(s) y restent.`,
+      });
+    } catch (e) { fail(res, e, "Erreur de régularisation."); }
+  });
+
   /* ═════════════════════════════════════════════════ RÉORGANISATION ══ */
+
+  /**
+   * LE PLAN INVERSE.
+   *
+   * Défaire « A→B, B→C » n'est pas défaire chaque ligne dans l'ordre : appliqué
+   * tel quel, « B→A » puis « C→B » écraserait A avant de l'avoir libéré. On
+   * inverse donc chaque correspondance ET on renverse leur ordre — le même
+   * raisonnement que celui qui a rendu la réorganisation possible à l'aller.
+   *
+   * Le moteur de renommage passe de toute façon par des codes temporaires, ce
+   * qui rend l'ordre indifférent ; le renversement garde surtout le plan
+   * LISIBLE pour celui qui doit le relire avant de le soumettre.
+   */
+  const inverser = (mappings) =>
+    (Array.isArray(mappings) ? mappings : [])
+      .slice()
+      .reverse()
+      .map((m) => ({
+        scope: m.scope, warehouse: m.warehouse || "",
+        from: m.to, to: m.from, path: m.path || {},
+      }));
+
+  /**
+   * RELIRE UNE RÉORGANISATION — et préparer son retour arrière.
+   *
+   * Ne défait RIEN. Rend le plan appliqué, le plan inverse calculé, et
+   * l'aperçu de ce que ce dernier ferait s'il était soumis. Le retour arrière
+   * passe ensuite par le même couple preview / apply que n'importe quelle
+   * réorganisation, avec sa confirmation et son motif : un « annuler » qui
+   * s'exécuterait d'un clic serait plus dangereux que le renommage initial.
+   */
+  router.get("/stock/locations/reorganize/:batchId", authenticateToken, canReorganize, async (req, res) => {
+    try {
+      const companyId = companyOf(req);
+      if (!companyId) return sansSociete(res);
+      const lot = String(req.params.batchId || "");
+
+      const { rows } = await pool.query(
+        `SELECT a.*, l.full_code, l.emplacement_code
+           FROM location_audit_log a
+           LEFT JOIN locations l ON l.id = a.location_id
+          WHERE a.company_id = $1 AND a.batch_id = $2
+          ORDER BY a.id`,
+        [companyId, lot]
+      );
+      if (!rows.length) {
+        return res.status(404).json({ error: "Réorganisation introuvable.", code: "BATCH_NOT_FOUND" });
+      }
+
+      const synthese = rows.find((r) => r.action === "REORGANIZE" && r.scope === "BATCH");
+      let mappings = [];
+      try { mappings = JSON.parse(synthese?.context || "{}").mappings || []; } catch { mappings = []; }
+      const renommages = rows.filter((r) => r.action === "RENAME");
+      const mappingsInverse = inverser(mappings);
+
+      /* L'aperçu du retour arrière est calculé sur l'état ACTUEL : entre-temps
+         d'autres renommages ont pu avoir lieu, et c'est précisément ce que
+         l'aperçu doit révéler avant qu'on soumette quoi que ce soit. */
+      let apercuRetour = null;
+      let erreurRetour = null;
+      if (mappingsInverse.length) {
+        try {
+          apercuRetour = await H.planifierRenommage(pool, companyId, mappingsInverse);
+        } catch (e) { erreurRetour = e.message; }
+      }
+
+      res.json({
+        batch_id: lot,
+        applique_le: synthese?.changed_at || renommages[0]?.changed_at || null,
+        applique_par: synthese?.changed_by_name || renommages[0]?.changed_by_name || "",
+        motif: synthese?.reason || renommages[0]?.reason || "",
+        quantite_avant: Number(synthese?.quantity_before ?? 0),
+        quantite_apres: Number(synthese?.quantity_after ?? 0),
+        /* Le plan tel qu'il a été appliqué, bac par bac. */
+        plan_applique: renommages.map((r) => ({
+          location_id: r.location_id,
+          code_avant: r.old_value, code_apres: r.new_value,
+          quantite: Number(r.quantity_before ?? 0),
+          code_actuel: r.full_code || r.emplacement_code || null,
+        })),
+        mappings,
+        /* À soumettre tel quel à /reorganize/preview puis /apply. Rien n'est
+           exécuté ici. */
+        mappings_inverse: mappingsInverse,
+        apercu_retour: apercuRetour,
+        erreur_retour: erreurRetour,
+        avertissement:
+          "Ce retour arrière n'est pas exécuté. Relisez l'aperçu, puis soumettez " +
+          "« mappings_inverse » à la prévisualisation habituelle avec un motif.",
+      });
+    } catch (e) { fail(res, e, "Erreur de lecture de la réorganisation."); }
+  });
+
 
   /** APERÇU d'un plan de renommage. Aucune écriture, aucun verrou. */
   router.post("/stock/locations/reorganize/preview", authenticateToken, canReorganize, async (req, res) => {
@@ -706,7 +1072,30 @@ module.exports = function createLocationsAdminRouter(deps) {
           companyId, plan, user: userOf(req), reason: motif,
           context: String(req.body?.context || ""),
         });
-        return { ...r, resume: plan.resume, cibles: plan.cibles };
+
+        /* LIGNE DE SYNTHÈSE DU LOT.
+           Sans elle, on saurait quels bacs ont été renommés mais pas selon
+           quelle règle : impossible de proposer le chemin inverse des mois
+           plus tard. On archive donc le plan lui-même, pas seulement ses
+           effets. */
+        const correspondances = plan.correspondances.map((c) => ({
+          scope: c.scope, warehouse: c.warehouse, from: c.from, to: c.to, path: c.path,
+        }));
+        await client.query(
+          `INSERT INTO location_audit_log
+             (company_id, location_id, action, scope, old_value, new_value, reason,
+              batch_id, quantity_before, quantity_after, changed_by, changed_by_name, context)
+           VALUES ($1,NULL,'REORGANIZE','BATCH',$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+          [companyId,
+           `${plan.resume.bins} bac(s) avant renommage`,
+           `${plan.resume.bins} bac(s) après renommage`,
+           motif, r.batchId, r.quantiteAvant, r.quantiteApres,
+           req.user?.id || null, userOf(req).name,
+           JSON.stringify({ mappings: correspondances })]
+        );
+
+        return { ...r, resume: plan.resume, cibles: plan.cibles,
+                 mappings_inverse: inverser(correspondances) };
       });
 
       res.json({ success: true, ...out, stockImpact: 0 });

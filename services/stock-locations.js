@@ -102,7 +102,15 @@ async function assertIntegrity(client, companyId, productId) {
 /* ------------------------------------------------------------- verrouillage */
 
 /** Charge l'emplacement et refuse tout ce qui n'est pas un bin exploitable. */
-async function lockLocation(client, companyId, locationId) {
+/**
+ * @param options.legacySource  autorise un emplacement HISTORIQUE ambigu
+ *   (« 1,2,3 », « BIN1-2 ») comme SOURCE. Réservé à la régularisation : vider
+ *   une telle ligne est précisément la façon de s'en débarrasser, et le lui
+ *   interdire condamnerait son stock à y rester pour toujours. Jamais permis
+ *   en destination, et jamais pour un rebut : « WRITE OFF » n'est pas un
+ *   contenant, on n'en sort rien.
+ */
+async function lockLocation(client, companyId, locationId, { legacySource = false } = {}) {
   const { rows } = await client.query(
     `SELECT * FROM locations WHERE id = $1 AND company_id = $2 FOR UPDATE`,
     [locationId, companyId]
@@ -134,7 +142,7 @@ async function lockLocation(client, companyId, locationId) {
      emplacements ne désigne un contenant. Y ranger du stock ferait croire à
      une localisation qui n'existe pas. */
   const motif = rules.rejectionReason(loc);
-  if (motif) {
+  if (motif && !legacySource) {
     throw new LocationStockError(
       `L'emplacement « ${loc.full_code || loc.emplacement_code || loc.id} » n'est pas un bac exploitable : ${rules.MOTIF_FR[motif]}.`,
       motif === "LEGACY_PLACEHOLDER" ? "LEGACY_PLACEHOLDER" : "BIN_NOT_SPECIFIED",
@@ -507,7 +515,7 @@ async function consumeReservation(client, { companyId, reservationId, user, reas
  */
 async function transferBetweenLocations(client, {
   companyId, productId, sourceLocationId, destinationLocationId, quantity, user,
-  reason = "Transfert interne",
+  reason = "Transfert interne", legacySource = false,
 }) {
   const q = num(quantity);
   if (!(q > 0)) throw new LocationStockError("Quantité invalide.", "INVALID_QUANTITY", 400);
@@ -522,7 +530,13 @@ async function transferBetweenLocations(client, {
      croisés simultanés ne peuvent pas se bloquer mutuellement. */
   const ids = [Number(sourceLocationId), Number(destinationLocationId)].sort((a, b) => a - b);
   const locks = {};
-  for (const id of ids) locks[id] = await lockLocation(client, companyId, id);
+  for (const id of ids) {
+    /* La tolérance ne vaut que pour la source : une destination ambiguë
+       recréerait le problème qu'on est en train de réparer. */
+    const estSource = Number(id) === Number(sourceLocationId);
+    locks[id] = await lockLocation(client, companyId, id,
+      { legacySource: legacySource && estSource });
+  }
   const source = locks[sourceLocationId];
   const destination = locks[destinationLocationId];
 

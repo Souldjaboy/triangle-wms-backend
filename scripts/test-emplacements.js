@@ -455,13 +455,20 @@ async function main() {
     verifier("aucun stock négatif", negatifs.rows[0].n === 0);
 
     const journal = await appel("GET", `/stock/locations/audit?batch_id=${r.corps.batchId}`, SUPER);
+    const renommages = (journal.corps.entries || []).filter((e) => e.action === "RENAME");
     verifier("chaque renommage est journalisé",
-      (journal.corps.entries || []).length === r.corps.bins,
-      `${(journal.corps.entries || []).length} / ${r.corps.bins}`);
+      renommages.length === r.corps.bins, `${renommages.length} / ${r.corps.bins}`);
     verifier("le journal porte l'ancien et le nouveau code",
-      journal.corps.entries.every((e) => e.old_value && e.new_value));
+      renommages.every((e) => e.old_value && e.new_value));
     verifier("il porte le motif",
-      journal.corps.entries.every((e) => e.reason.includes("Nouveau rayon")));
+      renommages.every((e) => e.reason.includes("Nouveau rayon")));
+    /* Une ligne de synthèse accompagne le lot : sans elle, on saurait quels
+       bacs ont bougé mais pas selon quelle règle — donc pas comment revenir. */
+    const synthese = (journal.corps.entries || []).filter((e) => e.action === "REORGANIZE");
+    verifier("une ligne de synthèse archive le plan lui-même", synthese.length === 1);
+    verifier("elle contient les correspondances appliquées",
+      JSON.parse(synthese[0]?.context || "{}").mappings?.length === 3,
+      synthese[0]?.context?.slice(0, 80));
   }
 
   console.log("\nCOLLISION ET ANNULATION");

@@ -379,6 +379,33 @@ function getEffectiveCompanyId(req, fallback = null) {
   return Number(req.user?.company_id || 0) || fallback || null;
 }
 
+/**
+ * L'ENTREPRISE ADMINISTRÉE, SANS LIRE LE CORPS DE LA REQUÊTE.
+ *
+ * `getRequestedActiveCompanyId` accepte `req.body.company_id`. C'est commode
+ * pour un super admin qui bascule d'entreprise, mais sur une route d'écriture
+ * le danger est réel : `company_id` est aussi un nom de champ de données. Un
+ * corps qui décrit un emplacement et porte « company_id: 2 » ne demande pas à
+ * changer d'entreprise — il décrit un emplacement. La route le redirigeait
+ * pourtant vers la société 2.
+ *
+ * La bascule reste possible, mais seulement là où elle est INTENTIONNELLE :
+ * l'en-tête `x-active-company-id` ou le paramètre d'URL. Le corps ne décide
+ * plus de la société dans laquelle on écrit.
+ */
+function getEffectiveCompanyIdStrict(req, fallback = null) {
+  if (isSuperAdminUser(req.user)) {
+    const entete =
+      req?.headers?.["x-active-company-id"] ||
+      req?.headers?.["x-company-id"] ||
+      req?.query?.active_company_id;
+    const demande = Number(entete);
+    const explicite = Number.isInteger(demande) && demande > 0 ? demande : null;
+    return explicite || Number(req.user?.company_id || 0) || fallback || null;
+  }
+  return Number(req.user?.company_id || 0) || fallback || null;
+}
+
 async function getCompanySettingsForCompany(clientOrPool, companyId) {
   const result = await clientOrPool.query(
     `SELECT *
@@ -12496,7 +12523,7 @@ app.get("/locations", authenticateToken, requirePermission("stock.emplacement", 
        les entreprises : un compte FAT & MAT pouvait lire les bacs Triangle et
        l'inverse. L'entreprise administrée est désormais toujours explicite,
        et une société indéterminable refuse plutôt que de tout montrer. */
-    const companyId = Number(getEffectiveCompanyId(req, req.user.company_id) || 0);
+    const companyId = Number(getEffectiveCompanyIdStrict(req, req.user.company_id) || 0);
     if (!companyId) {
       return res.status(409).json({
         error: "Aucune entreprise active. Sélectionnez l'entreprise à administrer.",
@@ -12541,7 +12568,7 @@ app.post("/locations", authenticateToken, requirePermission("stock.emplacement",
     /* L'entreprise vient de la SESSION, jamais du corps de la requête : elle y
        était acceptée telle quelle, ce qui permettait de poser un emplacement
        dans la société d'autrui. */
-    const companyId = Number(getEffectiveCompanyId(req, req.user.company_id) || 0);
+    const companyId = Number(getEffectiveCompanyIdStrict(req, req.user.company_id) || 0);
     if (!companyId) {
       return res.status(409).json({
         error: "Aucune entreprise active. Sélectionnez l'entreprise à administrer.",
@@ -12665,7 +12692,7 @@ app.post("/locations", authenticateToken, requirePermission("stock.emplacement",
 app.delete("/locations/:id", authenticateToken, requirePermission("stock.emplacement", "archive"), async (req, res) => {
   const client = await pool.connect();
   try {
-    const companyId = Number(getEffectiveCompanyId(req, req.user.company_id) || 0);
+    const companyId = Number(getEffectiveCompanyIdStrict(req, req.user.company_id) || 0);
     if (!companyId) {
       return res.status(409).json({
         error: "Aucune entreprise active. Sélectionnez l'entreprise à administrer.",
@@ -12743,8 +12770,16 @@ app.delete("/locations/:id", authenticateToken, requirePermission("stock.emplace
 
 app.get("/scan/resolve/:code", authenticateToken, async (req, res) => {
   try {
-    const companyId = req.user.company_id;
-    const isSuperAdmin = req.user.is_super_admin === true;
+    /* L'entreprise vient de la session. Un super admin lisait ici les
+       emplacements de TOUTES les sociétés : un code Triangle résolu depuis un
+       compte FAT & MAT, et réciproquement. */
+    const companyId = Number(getEffectiveCompanyIdStrict(req, req.user.company_id) || 0);
+    if (!companyId) {
+      return res.status(409).json({
+        error: "Aucune entreprise active. Sélectionnez l'entreprise avant de scanner.",
+        code: "NO_ACTIVE_COMPANY",
+      });
+    }
     let code = decodeURIComponent(req.params.code || "").trim();
 
     try {
@@ -12757,21 +12792,21 @@ app.get("/scan/resolve/:code", authenticateToken, async (req, res) => {
     code = code.replace(/^Ref\s+/i, "").trim();
     const normalizedCode = normalizeProductLookupCode(code);
 
-    const values = isSuperAdmin ? [code] : [code, companyId];
+    /* Code courant, code historique, PUIS ancien code d'avant renommage.
+       Une étiquette déjà collée survit ainsi à la réorganisation du rayon,
+       et la réponse dit qu'elle est périmée plutôt que de le taire. */
+    let resolution = null;
+    try {
+      resolution = await locationHierarchy.resoudreEtiquette(pool, companyId, code);
+    } catch (e) {
+      if (e.code === "AMBIGUOUS_CODE") {
+        return res.status(409).json({ error: e.message, code: e.code, details: e.details });
+      }
+      throw e;
+    }
 
-    const locationResult = await pool.query(
-      `SELECT locations.*, warehouses.name AS warehouse_name
-       FROM locations
-       LEFT JOIN warehouses ON locations.warehouse_id = warehouses.id
-       WHERE locations.emplacement_code=$1 ${
-         isSuperAdmin ? "" : "AND locations.company_id=$2"
-       }
-       LIMIT 1`,
-      values
-    );
-
-    if (locationResult.rows.length > 0) {
-      const location = locationResult.rows[0];
+    if (resolution) {
+      const location = resolution.location;
 
       const productsResult = await pool.query(
         `SELECT *
@@ -12781,11 +12816,9 @@ app.get("/scan/resolve/:code", authenticateToken, async (req, res) => {
            OR location_code=$2
            OR reference=$3
          )
-         ${isSuperAdmin ? "" : "AND company_id=$4"}
+         AND company_id=$4
          ORDER BY id DESC`,
-        isSuperAdmin
-          ? [location.id, location.emplacement_code, location.product_reference || ""]
-          : [
+        [
               location.id,
               location.emplacement_code,
               location.product_reference || "",
@@ -12801,16 +12834,10 @@ app.get("/scan/resolve/:code", authenticateToken, async (req, res) => {
            OR reason ILIKE $2
            OR product_reference = ANY($3::text[])
          )
-         ${isSuperAdmin ? "" : "AND company_id=$4"}
+         AND company_id=$4
          ORDER BY id DESC
          LIMIT 20`,
-        isSuperAdmin
-          ? [
-              location.emplacement_code,
-              `%${location.emplacement_code}%`,
-              productsResult.rows.map((product) => product.reference)
-            ]
-          : [
+        [
               location.emplacement_code,
               `%${location.emplacement_code}%`,
               productsResult.rows.map((product) => product.reference),
@@ -12821,6 +12848,15 @@ app.get("/scan/resolve/:code", authenticateToken, async (req, res) => {
       return res.json({
         type: "location",
         code,
+        /* Ce que porte l'étiquette scannée, et ce que porte le bac aujourd'hui.
+           Les deux, toujours : c'est leur écart qui dit s'il faut réimprimer. */
+        code_scanne: resolution.code_scanne,
+        code_actuel: resolution.code_actuel,
+        ancien_code_utilise: resolution.ancien_code_utilise,
+        ancienne_etiquette: resolution.ancienne_etiquette,
+        resolu_par: resolution.via,
+        archive: resolution.archive,
+        avertissement: resolution.avertissement,
         location,
         products: productsResult.rows,
         movements: movementsResult.rows,
@@ -12839,7 +12875,7 @@ app.get("/scan/resolve/:code", authenticateToken, async (req, res) => {
       });
     }
 
-    const productValues = isSuperAdmin ? [code, normalizedCode] : [code, normalizedCode, companyId];
+    const productValues = [code, normalizedCode, companyId];
     const productResult = await pool.query(
       `SELECT products.*, locations.emplacement_code, locations.rayon_code,
               locations.case_code, locations.level_code, locations.bin_code,
@@ -12856,7 +12892,7 @@ app.get("/scan/resolve/:code", authenticateToken, async (req, res) => {
          OR regexp_replace(lower(COALESCE(products.sku,'')), '[^a-z0-9]', '', 'g') = $2
          OR regexp_replace(lower(COALESCE(products.qr_code,'')), '[^a-z0-9]', '', 'g') = $2
        )
-       ${isSuperAdmin ? "" : "AND products.company_id=$3"}
+       AND products.company_id=$3
        LIMIT 1`,
       productValues
     );
@@ -12867,19 +12903,19 @@ app.get("/scan/resolve/:code", authenticateToken, async (req, res) => {
         `SELECT *
          FROM product_batches
          WHERE product_id=$1
-         ${isSuperAdmin ? "" : "AND company_id=$2"}
+         AND company_id=$2
          ORDER BY expiration_date ASC NULLS LAST, received_at ASC NULLS LAST, id ASC
          LIMIT 20`,
-        isSuperAdmin ? [product.id] : [product.id, companyId]
+        [product.id, companyId]
       );
       const movementsResult = await pool.query(
         `SELECT *
          FROM stock_movements
          WHERE product_reference=$1
-         ${isSuperAdmin ? "" : "AND company_id=$2"}
+         AND company_id=$2
          ORDER BY id DESC
          LIMIT 20`,
-        isSuperAdmin ? [product.reference] : [product.reference, companyId]
+        [product.reference, companyId]
       );
 
       return res.json({
@@ -12914,9 +12950,12 @@ app.get("/scan/resolve/:code", authenticateToken, async (req, res) => {
       `SELECT id, fullname, email, role, badge_code, company_id
        FROM users
        WHERE (badge_code=$1 OR CAST(id AS TEXT)=$1)
-       ${isSuperAdmin ? "" : "AND company_id=$2"}
+       AND company_id=$2
        LIMIT 1`,
-      values
+      /* Cette requête partageait le tableau `values` de la recherche
+         d'emplacement, disparu avec elle. Ses paramètres sont désormais les
+         siens : le code scanné, et l'entreprise de la session. */
+      [code, companyId]
     );
 
     if (userResult.rows.length > 0) {
@@ -17672,7 +17711,7 @@ app.use(
 const createLocationsAdminRouter = require("./routes/locations-admin");
 app.use(
   "/",
-  createLocationsAdminRouter({ pool, authenticateToken, getEffectiveCompanyId, requirePermission })
+  createLocationsAdminRouter({ pool, authenticateToken, getEffectiveCompanyId: getEffectiveCompanyIdStrict, requirePermission })
 );
 
 /* Dates métier des documents : ce qui est IMPRIMÉ se corrige, ce qui est
@@ -17680,7 +17719,7 @@ app.use(
 const createDocumentDatesRouter = require("./routes/documents-dates");
 app.use(
   "/",
-  createDocumentDatesRouter({ pool, authenticateToken, getEffectiveCompanyId, requirePermission })
+  createDocumentDatesRouter({ pool, authenticateToken, getEffectiveCompanyId: getEffectiveCompanyIdStrict, requirePermission })
 );
 
 /* Impression groupée : lecture seule, aucun document ni stock touché. */

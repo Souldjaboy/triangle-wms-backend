@@ -429,11 +429,96 @@ async function appliquerRenommage(client, { companyId, plan, user, reason = "", 
   return { batchId: lot, bins: plan.cibles.length, quantiteAvant, quantiteApres };
 }
 
+/* ------------------------------------------- résolution d'une étiquette */
+
+/**
+ * RETROUVER UN EMPLACEMENT À PARTIR D'UN CODE SCANNÉ.
+ *
+ * Renommer un rayon réétiquette des dizaines de bacs. Les étiquettes déjà
+ * collées, elles, ne changent pas le jour du renommage : on les réimprime au
+ * fil de l'eau. Entre-temps un scan doit continuer de tomber sur le BON bac —
+ * sinon le renommage, qui ne devait rien casser, casse le terrain.
+ *
+ * Trois pistes, de la plus fiable à la plus ancienne :
+ *   1. `full_code`          le code d'aujourd'hui ;
+ *   2. `emplacement_code`   le code historique, sans le bac ;
+ *   3. `previous_full_code` le code d'avant le dernier renommage.
+ *
+ * La troisième piste sert une étiquette périmée : on la suit, et on le DIT.
+ * Résoudre silencieusement laisserait croire que l'étiquette est à jour, et
+ * personne ne la remplacerait jamais.
+ *
+ * Un ancien code partagé par plusieurs emplacements ne se devine pas : on
+ * refuse plutôt que de désigner l'un des deux au hasard.
+ */
+async function resoudreEtiquette(runner, companyId, codeBrut) {
+  const code = up(codeBrut);
+  if (!code) {
+    throw new HierarchyError("Code vide.", "EMPTY_CODE", 400);
+  }
+  if (!Number(companyId)) {
+    throw new HierarchyError(
+      "Aucune entreprise active : impossible de résoudre une étiquette.",
+      "NO_ACTIVE_COMPANY", 409
+    );
+  }
+
+  const chercher = async (colonne) => {
+    const { rows } = await runner.query(
+      `SELECT l.*, w.name AS warehouse_name
+         FROM locations l
+         LEFT JOIN warehouses w ON w.id = l.warehouse_id
+        WHERE l.company_id = $1 AND UPPER(COALESCE(l.${colonne}, '')) = $2
+        ORDER BY l.archived_at NULLS FIRST, l.id`,
+      [companyId, code]
+    );
+    return rows;
+  };
+
+  /* Le code courant d'abord : un bac dont l'ANCIEN code serait le code
+     COURANT d'un autre ne doit pas voler la résolution à ce dernier. */
+  for (const [colonne, via, ancienne] of [
+    ["full_code", "full_code", false],
+    ["emplacement_code", "emplacement_code", false],
+    ["previous_full_code", "previous_full_code", true],
+  ]) {
+    const rows = await chercher(colonne);
+    if (!rows.length) continue;
+
+    if (rows.length > 1) {
+      throw new HierarchyError(
+        `Le code « ${code} » désigne ${rows.length} emplacements : il est ambigu et n'est pas résolu.`,
+        "AMBIGUOUS_CODE", 409,
+        { code, via, emplacements: rows.map((r) => ({ id: r.id, code: r.full_code || r.emplacement_code })) }
+      );
+    }
+
+    const l = rows[0];
+    return {
+      location: l,
+      via,
+      code_scanne: code,
+      code_actuel: l.full_code || l.emplacement_code || null,
+      ancien_code_utilise: ancienne ? code : null,
+      ancienne_etiquette: ancienne,
+      archive: Boolean(l.archived_at),
+      avertissement: ancienne
+        ? `Ancienne étiquette : ce bac s'appelle désormais « ${l.full_code || l.emplacement_code} ». ` +
+          `Remplacez l'étiquette dès que possible.`
+        : l.archived_at
+          ? `Cet emplacement est archivé : il ne doit plus recevoir de stock.`
+          : null,
+    };
+  }
+  return null;
+}
+
 module.exports = {
   ECHELONS, EXPR, RANG_TOP, RANG_INCONNU, HierarchyError,
   partsOf, composeFullCode, composeEmplacementCode,
   levelRank, binRank, estNiveauTop,
   generateBinCodes, estBinComposite, splitCompositeBin,
   normaliserCorrespondance, planifierRenommage, appliquerRenommage,
+  resoudreEtiquette,
   rules,
 };
