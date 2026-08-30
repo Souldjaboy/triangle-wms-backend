@@ -118,11 +118,21 @@ async function prochainBadge(client, companyId) {
  * valeur calculée ici et celle posée en base ne divergent pas.
  */
 function prefixeDepuisNom(nom, companyId) {
-  const propre = String(nom || "")
+  /* Mots entiers tant que le total tient en huit caractères : « FAT & MAT
+     Entreprise » donne FATMAT, « Triangle Logistics » donne TRIANGLE. Un
+     préfixe se lit sur une carte ; tronquer au caractère près donnerait
+     FATMATEN, que personne ne reconnaît. Mêmes règles que la migration 064. */
+  const mots = String(nom || "")
     .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
-    .toUpperCase().replace(/[^A-Z0-9]/g, "")
-    .slice(0, 12);
-  return propre || `ENT${companyId}`;
+    .toUpperCase().split(/\s+/)
+    .map((m) => m.replace(/[^A-Z0-9]/g, ""))
+    .filter(Boolean);
+  let out = "";
+  for (const mot of mots) {
+    if (out.length + mot.length > 8) break;
+    out += mot;
+  }
+  return out || `ENT${companyId}`;
 }
 
 module.exports = { societesAutorisees, resoudreSociete, prochainBadge, prefixeDepuisNom };

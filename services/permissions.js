@@ -153,6 +153,25 @@ function decider(ctx, cleModule, action) {
     }
   }
 
+  /* Le module parent ne déclare pas cette action, ses sous-modules si.
+     « Créer » sur les stocks n'existe pas au niveau du parent : la création
+     vit sur les entrées, sorties, transferts et inventaires. Sans cette
+     remontée, la page demandait can("stock","create"), ne trouvait rien,
+     retombait sur le rôle — et un employé restait en lecture seule alors
+     que le droit d'enregistrer une entrée lui avait été accordé.
+     On répond donc « peut-on le faire quelque part sous ce module ? ». Le
+     garde des routes, lui, interroge toujours la clé précise. */
+  const parent = ctx.parModule.get(cle);
+  if (parent && !parent.actions.includes(action)) {
+    const enfants = ctx.modules.filter((m) => m.parent_key === cle && m.actions.includes(action));
+    for (const enfant of enfants) {
+      if (decider(ctx, enfant.module_key, action).autorise) {
+        return { autorise: true, source: "sous_module" };
+      }
+    }
+    if (enfants.length) return { autorise: false, source: "sous_module" };
+  }
+
   const role = String(ctx.user?.role || "").trim().toLowerCase();
   return { autorise: ROLES_ADMIN.includes(role), source: "repli_role" };
 }

@@ -276,13 +276,37 @@ UPDATE companies c SET badge_prefix = a.prefixe
  WHERE a.company_id = c.id
    AND COALESCE(NULLIF(TRIM(c.badge_prefix), ''), '') = '';
 
-/* Faute de badge existant : premier mot du nom, en majuscules. */
-UPDATE companies
-   SET badge_prefix = NULLIF(left(upper(regexp_replace(translate(name,
-         'àâäéèêëîïôöùûüçÀÂÄÉÈÊËÎÏÔÖÙÛÜÇ', 'aaaeeeeiioouuucAAAEEEEIIOOUUUC'),
-         '[^A-Za-z0-9]', '', 'g')), 12), '')
- WHERE COALESCE(NULLIF(TRIM(badge_prefix), ''), '') = '';
+/* Faute de badge existant : on accole les mots du nom tant que le résultat
+   reste court. « FAT & MAT Entreprise » donne FATMAT, « Triangle Logistics
+   Transport » donne TRIANGLE — un préfixe se lit sur une carte, il doit
+   tenir. Tronquer au caractère près produirait FATMATENTREP, illisible. */
+UPDATE companies c
+   SET badge_prefix = court.prefixe
+  FROM (
+    SELECT id,
+           (SELECT string_agg(mot, '' ORDER BY rang)
+              FROM (
+                SELECT mot, rang,
+                       sum(length(mot)) OVER (ORDER BY rang) AS cumul
+                  FROM (
+                    SELECT upper(regexp_replace(m, '[^A-Za-z0-9]', '', 'g')) AS mot,
+                           ordinalite AS rang
+                      FROM regexp_split_to_table(
+                             translate(x.name,
+                               'àâäéèêëîïôöùûüçÀÂÄÉÈÊËÎÏÔÖÙÛÜÇ',
+                               'aaaeeeeiioouuucAAAEEEEIIOOUUUC'),
+                             '\s+') WITH ORDINALITY AS t(m, ordinalite)
+                  ) mots
+                 WHERE mot <> ''
+              ) cumules
+             WHERE cumul <= 8) AS prefixe
+      FROM companies x
+  ) court
+ WHERE court.id = c.id
+   AND COALESCE(NULLIF(TRIM(c.badge_prefix), ''), '') = ''
+   AND COALESCE(NULLIF(TRIM(court.prefixe), ''), '') <> '';
 
+/* Dernier recours : un nom qui ne donne aucune lettre exploitable. */
 UPDATE companies SET badge_prefix = 'ENT' || id
  WHERE COALESCE(NULLIF(TRIM(badge_prefix), ''), '') = '';
 
@@ -304,5 +328,33 @@ UPDATE companies c
 CREATE UNIQUE INDEX IF NOT EXISTS users_badge_code_par_societe
   ON users (company_id, upper(badge_code))
   WHERE badge_code IS NOT NULL AND badge_code <> '';
+
+COMMIT;
+
+-- ═════════════════════════════════════════════════════════════════════════
+-- ACTIONS MANQUANTES DU CATALOGUE
+--
+-- L'écran des emplacements demande « archiver » et « réorganiser ». Ni l'une
+-- ni l'autre n'existait dans permission_actions : la question ne portait sur
+-- rien, la réponse était donc toujours non, et les deux boutons restaient
+-- hors d'atteinte quel que soit le droit accordé.
+-- ═════════════════════════════════════════════════════════════════════════
+BEGIN;
+
+INSERT INTO permission_actions (action_key, label, description, sort_order, is_write) VALUES
+  ('archive',    'Archiver',    'Retirer un emplacement vide de la circulation sans le supprimer.', 155, true),
+  ('reorganize', 'Réorganiser', 'Renommer ou réordonner rayons, niveaux et bacs en masse.',        158, true)
+ON CONFLICT (action_key) DO NOTHING;
+
+/* Le module des emplacements sait faire ces deux choses : on complète sa
+   liste sans toucher aux autres. */
+UPDATE permission_modules
+   SET actions = (
+         SELECT array_agg(DISTINCT a ORDER BY a)
+           FROM unnest(actions || ARRAY['archive','reorganize']) AS a
+       ),
+       updated_at = now()
+ WHERE module_key = 'stock.emplacement'
+   AND NOT (actions @> ARRAY['archive','reorganize']);
 
 COMMIT;

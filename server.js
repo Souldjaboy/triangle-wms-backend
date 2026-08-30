@@ -16676,6 +16676,17 @@ app.get("/dashboard-stats", authenticateToken, async (req, res) => {
 /* ATTENDANCE TODAY - AFFICHAGE CORRIGÉ */
 app.get("/attendance/today", authenticateToken, async (req, res) => {
   try {
+    /* Cette route listait TOUS les utilisateurs de TOUTES les entreprises,
+       avec leur badge, leur rôle et leurs paramètres de salaire. N'importe
+       quel compte authentifié — Triangle comme FAT & MAT — voyait le
+       personnel de l'autre société et ce qu'il gagne. On la borne à
+       l'entreprise du contexte, comme le reste. */
+    const companyId = Number(getEffectiveCompanyId(req, req.user?.company_id) || 0);
+    if (!companyId) {
+      return res.status(409).json({
+        error: "Aucune entreprise active.", code: "NO_ACTIVE_COMPANY",
+      });
+    }
     const result = await pool.query(`
       SELECT
         u.id AS user_id,
@@ -16707,8 +16718,10 @@ app.get("/attendance/today", authenticateToken, async (req, res) => {
       ON ar.user_id = u.id
       AND ar.work_date = CURRENT_DATE
 
+      WHERE u.company_id = $1
+
       ORDER BY u.fullname ASC
-    `);
+    `, [companyId]);
 
     const records = result.rows.map((r) => {
       let computedStatus = "Absent";

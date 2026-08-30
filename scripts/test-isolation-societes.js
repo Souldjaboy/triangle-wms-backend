@@ -165,6 +165,72 @@ async function main() {
     verifier("aucun badge dupliqué dans une même entreprise", doublons.rows[0].n === 0);
   }
 
+  console.log("\nTENTATIVES DE FRANCHISSEMENT");
+  {
+    const employeFat = await u(21);
+    const employeTri = await u(11);
+
+    /* Falsification par l'en-tête : un non-super-admin ne peut pas changer
+       d'entreprise, getEffectiveCompanyId ne lit l'en-tête que pour eux. */
+    const parEntete = await ctx.resoudreSociete(
+      pool, requete(employeFat, TRIANGLE), getEffectiveCompanyId
+    );
+    verifier("en-tête falsifié par un employé FAT & MAT : sans effet",
+      parEntete.companyId === FATMAT, `${parEntete.companyId}`);
+
+    const parEnteteInverse = await ctx.resoudreSociete(
+      pool, requete(employeTri, FATMAT), getEffectiveCompanyId
+    );
+    verifier("en-tête falsifié par un employé Triangle : sans effet",
+      parEnteteInverse.companyId === TRIANGLE, `${parEnteteInverse.companyId}`);
+
+    /* Falsification par le corps. */
+    const parCorps = await ctx.resoudreSociete(
+      pool, requete(employeFat, null, { company_id: TRIANGLE }), getEffectiveCompanyId
+    );
+    verifier("company_id falsifié dans le corps : sans effet",
+      parCorps.companyId === FATMAT, `${parCorps.companyId}`);
+
+    /* Le pointage du jour ne doit plus montrer l'autre entreprise. */
+    const pointage = await pool.query(
+      `SELECT count(*)::int AS n FROM users WHERE company_id = $1`, [FATMAT]
+    );
+    const global = await pool.query(`SELECT count(*)::int AS n FROM users`);
+    verifier("le personnel FAT & MAT est un sous-ensemble strict",
+      pointage.rows[0].n < global.rows[0].n,
+      `${pointage.rows[0].n} / ${global.rows[0].n}`);
+  }
+
+  console.log("\nDROITS : AUCUNE FUITE ENTRE ENTREPRISES");
+  {
+    const employeFat = await u(21);
+    const employeTri = await u(11);
+    const cFat = await permissions.chargerContexte(pool, employeFat);
+    const cTri = await permissions.chargerContexte(pool, employeTri);
+
+    /* Un droit posé chez FAT & MAT ne doit jamais peupler le contexte d'un
+       compte Triangle, ni l'inverse. */
+    const cleFat = [...cFat.exceptions.keys()];
+    const cleTri = [...cTri.exceptions.keys()];
+    verifier("les exceptions de FAT & MAT ne sont pas celles de Triangle",
+      cleFat.length === 0 || cleTri.length === 0 ||
+      !cleFat.some((k) => cleTri.includes(k)) || cleFat.join() !== cleTri.join(),
+      `${cleFat.length} / ${cleTri.length}`);
+
+    const croise = await pool.query(
+      `SELECT count(*)::int AS n FROM user_permission_overrides o
+         JOIN users us ON us.id = o.user_id
+        WHERE o.company_id <> us.company_id`
+    );
+    verifier("aucune exception n'enjambe une frontière d'entreprise", croise.rows[0].n === 0);
+
+    const roles = await pool.query(
+      `SELECT count(*)::int AS n FROM role_permissions rp
+        WHERE NOT EXISTS (SELECT 1 FROM companies c WHERE c.id = rp.company_id)`
+    );
+    verifier("aucun droit de rôle sans entreprise réelle", roles.rows[0].n === 0);
+  }
+
   await pool.end();
   console.log(`\n${reussis} réussis, ${echoues} échoués\n`);
   process.exit(echoues ? 1 : 0);

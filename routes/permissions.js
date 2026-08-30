@@ -177,6 +177,54 @@ module.exports = function createPermissionsRouter(deps) {
     } catch (e) { echec(res, e, "Erreur de lecture des droits du compte."); }
   });
 
+  /**
+   * DIAGNOSTIC — pourquoi ce compte peut-il, ou non, faire cette action ?
+   *
+   * Répond pour chaque couple module/action : ce que dit le rôle, ce que dit
+   * l'exception individuelle, le verdict final et son origine. C'est ce qui
+   * manquait pour distinguer « droit jamais accordé » de « droit accordé mais
+   * écrasé par un refus », deux situations qui se ressemblent à l'écran.
+   *
+   * Borné à l'entreprise de l'appelant, comme les autres routes.
+   */
+  router.get("/permissions/users/:id/diagnostic", authenticateToken, peutGerer, async (req, res) => {
+    try {
+      const companyId = await societeDe(req);
+      if (!companyId) return sansSociete(res);
+      const cible = await cibleOuNull(companyId, req.params.id);
+      if (!cible) return res.status(404).json({ error: "Utilisateur introuvable." });
+
+      const ctx = await service.chargerContexte(pool, cible);
+      const filtre = String(req.query.module || "").trim();
+
+      const lignes = [];
+      for (const m of ctx.modules) {
+        if (filtre && m.module_key !== filtre && m.parent_key !== filtre) continue;
+        for (const action of m.actions) {
+          const verdict = service.decider(ctx, m.module_key, action);
+          const parRole = ctx.parRole.get(`${m.module_key}|${action}`);
+          const exception = ctx.exceptions.get(`${m.module_key}|${action}`);
+          lignes.push({
+            module_key: m.module_key,
+            label: m.label,
+            action,
+            role: parRole === undefined ? null : parRole,
+            individuel: exception || "INHERIT",
+            effectif: verdict.autorise,
+            origine: verdict.source,
+          });
+        }
+      }
+
+      res.json({
+        user: { id: cible.id, fullname: cible.fullname, role: cible.role },
+        total: lignes.length,
+        autorises: lignes.filter((l) => l.effectif).length,
+        lignes,
+      });
+    } catch (e) { echec(res, e, "Erreur de diagnostic des droits."); }
+  });
+
   /* ─────────────────────────── ÉCRITURE ─────────────────────────── */
 
   /**
