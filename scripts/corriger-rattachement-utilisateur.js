@@ -15,9 +15,13 @@
  *   DATABASE_URL=… node scripts/corriger-rattachement-utilisateur.js \
  *       --nom="Jules" --vers="FAT"
  *
- *   # 2. appliquer, en désignant explicitement l'identifiant vu à l'étape 1
+ *   # 2. simuler, avec l'identifiant relevé à l'étape 1
  *   DATABASE_URL=… node scripts/corriger-rattachement-utilisateur.js \
- *       --id=42 --vers="FAT" --executer
+ *       --user-id=42 --target-company-id=2
+ *
+ *   # 3. appliquer — l'identifiant et la confirmation sont exigés
+ *   DATABASE_URL=… node scripts/corriger-rattachement-utilisateur.js \
+ *       --user-id=42 --target-company-id=2 --executer --je-confirme
  */
 
 const { Pool } = require("pg");
@@ -29,28 +33,54 @@ const arg = (nom, defaut = "") => {
   return t ? t.split("=").slice(1).join("=") : defaut;
 };
 const EXECUTER = process.argv.includes("--executer");
+const CONFIRME = process.argv.includes("--je-confirme");
 
 const CHAMPS = `id, company_id, fullname, email, phone, role, badge_code,
                 is_super_admin, is_active, created_at`;
 
 async function main() {
   const nom = arg("nom");
-  const idDemande = Number(arg("id", "0"));
+  /* `--user-id` est la forme demandée ; `--id` reste acceptée. */
+  const idDemande = Number(arg("user-id", arg("id", "0")));
+  const societeCible = Number(arg("target-company-id", "0"));
   const vers = arg("vers");
-  if (!nom && !idDemande) throw new Error("Indiquez --nom=… pour chercher, ou --id=… pour agir.");
-  if (!vers) throw new Error("Indiquez --vers=… (fragment du nom de l'entreprise cible).");
+
+  if (!nom && !idDemande) throw new Error("Indiquez --nom=… pour chercher, ou --user-id=… pour agir.");
+  if (!vers && !societeCible) {
+    throw new Error("Indiquez --target-company-id=… ou --vers=… pour désigner l'entreprise cible.");
+  }
+  /* Un nom n'identifie personne : deux employés peuvent le partager, et se
+     tromper de compte est pire que ne rien faire. En application réelle,
+     l'identifiant est obligatoire. */
+  if (EXECUTER && !idDemande) {
+    throw new Error(
+      "Le mode --executer exige --user-id=<identifiant>. Lancez d'abord la recherche par nom, " +
+      "relevez l'identifiant affiché, puis relancez avec lui."
+    );
+  }
+  if (EXECUTER && !CONFIRME) {
+    throw new Error(
+      "Ajoutez --je-confirme pour appliquer. Sans cette confirmation explicite, rien n'est écrit."
+    );
+  }
 
   /* ── Entreprise cible ── */
-  const { rows: societes } = await pool.query(
-    `SELECT id, name, badge_prefix FROM companies
-      WHERE name ILIKE '%' || $1 || '%' AND COALESCE(status,'active') <> 'deleted'
-      ORDER BY id`,
-    [vers]
-  );
+  const { rows: societes } = societeCible
+    ? await pool.query(
+        `SELECT id, name, badge_prefix FROM companies
+          WHERE id = $1 AND COALESCE(status,'active') <> 'deleted'`,
+        [societeCible]
+      )
+    : await pool.query(
+        `SELECT id, name, badge_prefix FROM companies
+          WHERE name ILIKE '%' || $1 || '%' AND COALESCE(status,'active') <> 'deleted'
+          ORDER BY id`,
+        [vers]
+      );
   if (societes.length !== 1) {
-    console.log(`\n« ${vers} » désigne ${societes.length} entreprise(s) :`);
+    console.log(`\n« ${societeCible || vers} » désigne ${societes.length} entreprise(s) :`);
     societes.forEach((c) => console.log(`  #${c.id} ${c.name}`));
-    throw new Error("Précisez --vers= pour ne désigner qu'une seule entreprise.");
+    throw new Error("Précisez --target-company-id= pour ne désigner qu'une seule entreprise.");
   }
   const cible = societes[0];
   console.log(`\nENTREPRISE CIBLE  #${cible.id} ${cible.name}  (préfixe ${cible.badge_prefix || "—"})`);
@@ -84,7 +114,7 @@ async function main() {
     throw new Error(
       candidats.length === 0
         ? "Aucun candidat : rien à corriger."
-        : "Plusieurs candidats : relancez avec --id=<identifiant> pour désigner celui-ci et pas un autre."
+        : "Plusieurs candidats : relancez avec --user-id=<identifiant> pour désigner celui-ci et pas un autre."
     );
   }
   const u = candidats[0];
@@ -92,7 +122,8 @@ async function main() {
   if (!idDemande) {
     console.log(
       `\nRecherche seule. Pour appliquer :\n` +
-      `  node scripts/corriger-rattachement-utilisateur.js --id=${u.id} --vers="${vers}" --executer\n`
+      `  node scripts/corriger-rattachement-utilisateur.js --user-id=${u.id} ` +
+      `--target-company-id=${cible.id}\n`
     );
     return;
   }
@@ -109,13 +140,27 @@ async function main() {
   };
   console.log(`\nRATTACHEMENTS  ${attaches.exceptions} exception(s), ${attaches.permissions} permission(s) historique(s)`);
 
+  const socOrigine = (await pool.query(
+    `SELECT name FROM companies WHERE id = $1`, [u.company_id]
+  )).rows[0]?.name || "—";
+
   if (!EXECUTER) {
+    const prochain = String(Number(
+      (await pool.query(`SELECT badge_sequence FROM companies WHERE id=$1`, [cible.id]))
+        .rows[0]?.badge_sequence || 0
+    ) + 1).padStart(3, "0");
     console.log(
       `\nSIMULATION — aucune écriture.\n` +
-      `  société  #${u.company_id} → #${cible.id}\n` +
-      `  badge    ${u.badge_code || "—"} → ${cible.badge_prefix || "ENT" + cible.id}-EMP-…\n` +
-      `  mot de passe, email, téléphone et rôle : inchangés\n` +
-      `Ajoutez --executer pour appliquer.\n`
+      `  entreprise source : #${u.company_id} ${socOrigine}\n` +
+      `  entreprise cible  : #${cible.id} ${cible.name}\n` +
+      `  badge avant       : ${u.badge_code || "—"}\n` +
+      `  badge proposé     : ${cible.badge_prefix || "ENT" + cible.id}-EMP-${prochain}\n` +
+      `  rôle              : ${u.role || "—"} → inchangé\n` +
+      `  exceptions        : ${attaches.exceptions} → suivront le compte\n` +
+      `  mot de passe, email et téléphone : inchangés\n` +
+      `Pour appliquer :\n` +
+      `  node scripts/corriger-rattachement-utilisateur.js --user-id=${u.id} ` +
+      `--target-company-id=${cible.id} --executer --je-confirme\n`
     );
     return;
   }
@@ -151,13 +196,37 @@ async function main() {
        `correction de rattachement (${new Date().toISOString()})`]
     );
 
+    /* Vérification dans la même transaction : si quelque chose ne concorde
+       pas, on annule plutôt que de constater après coup. */
+    const apresUser = apres[0];
+    if (Number(apresUser.company_id) !== Number(cible.id)) {
+      throw new Error("L'entreprise n'a pas été appliquée : annulation.");
+    }
+    if (apresUser.role !== u.role) {
+      throw new Error("Le rôle a changé, ce qui n'était pas demandé : annulation.");
+    }
+    const { rows: verif } = await client.query(
+      `SELECT count(*)::int AS n FROM user_permission_overrides
+        WHERE user_id = $1 AND company_id <> $2`, [u.id, cible.id]
+    );
+    if (verif[0].n > 0) {
+      throw new Error(`${verif[0].n} exception(s) sont restées sur l'ancienne entreprise : annulation.`);
+    }
+
     await client.query("COMMIT");
+
+    const { rows: apresExceptions } = await pool.query(
+      `SELECT count(*)::int AS n FROM user_permission_overrides WHERE user_id = $1`, [u.id]
+    );
     console.log(
-      `\nAVANT   société #${u.company_id}, badge ${u.badge_code || "—"}\n` +
-      `APRÈS   société #${apres[0].company_id}, badge ${apres[0].badge_code}\n` +
-      `        ${deplacees} exception(s) de droits suivies\n` +
-      `        mot de passe, email, téléphone et rôle inchangés\n` +
-      `        correction journalisée\n`
+      `\nAVANT   société #${u.company_id} (${socOrigine})\n` +
+      `        badge ${u.badge_code || "—"} · rôle ${u.role || "—"}\n` +
+      `        ${attaches.exceptions} exception(s) de droits\n` +
+      `APRÈS   société #${apresUser.company_id} (${cible.name})\n` +
+      `        badge ${apresUser.badge_code} · rôle ${apresUser.role || "—"}\n` +
+      `        ${apresExceptions[0].n} exception(s), dont ${deplacees} déplacée(s)\n` +
+      `        mot de passe, email et téléphone inchangés\n` +
+      `        correction journalisée et vérifiée avant validation\n`
     );
   } catch (e) {
     await client.query("ROLLBACK").catch(() => {});
