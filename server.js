@@ -22,6 +22,7 @@ const crypto = require("crypto");
 const nodemailer = require("nodemailer");
 /* Entreprise d'appartenance et badge : une seule règle, côté serveur. */
 const companyContext = require("./services/company-context");
+const identifiants = require("./services/identifiants");
 const stockLocations = require("./services/stock-locations");
 const locationHierarchy = require("./services/location-hierarchy");
 const documentDates = require("./services/document-dates");
@@ -1161,6 +1162,14 @@ async function createVerificationCode({ companyId, userId, targetType, targetVal
   };
 }
 
+/* Un seul endroit décide si l'on sait envoyer un SMS. Le mode « sandbox »
+   n'envoie rien : promettre un SMS qui ne partira pas enfermerait dehors la
+   personne qui l'attend. */
+function smsServiceConfigure() {
+  return (process.env.SMS_PROVIDER || "sandbox") !== "sandbox"
+      && Boolean(process.env.SMS_API_KEY);
+}
+
 async function sendVerificationMessage({ targetType, targetValue, code, verifyUrl }) {
   if (targetType === "email") {
     if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
@@ -1200,7 +1209,7 @@ async function sendVerificationMessage({ targetType, targetValue, code, verifyUr
     return { sent: true, provider: process.env.EMAIL_PROVIDER || "smtp", message: "Code OTP envoyé par email." };
   }
 
-  if ((process.env.SMS_PROVIDER || "sandbox") === "sandbox" || !process.env.SMS_API_KEY) {
+  if (!smsServiceConfigure()) {
     return {
       sent: false,
       provider: process.env.SMS_PROVIDER || "sms",
@@ -2307,10 +2316,14 @@ app.post("/login", async (req, res) => {
       return res.status(400).json({ error: "Identifiant et mot de passe obligatoires" });
     }
 
-    const usersHasPhone = await columnExists("users", "phone");
-    const looksLikeEmail = loginIdentifier.includes("@");
-    const normalizedPhone = loginIdentifier.replace(/[^0-9+]/g, "");
-    const canSearchPhone = usersHasPhone && !looksLikeEmail && normalizedPhone.length >= 6;
+    /* Un seul flux pour les deux identifiants : on reconnaît la forme, on
+       normalise le numéro, et la recherche porte sur la colonne qui convient.
+       Sans normalisation, « 76 32 77 99 » et « +22376327799 » désignent le
+       même abonné mais ne trouvent pas le même compte. */
+    const usersHasPhone = await columnExists("users", "phone_normalise");
+    const looksLikeEmail = identifiants.estEmail(loginIdentifier);
+    const normalizedPhone = identifiants.normaliserTelephone(loginIdentifier);
+    const canSearchPhone = usersHasPhone && !looksLikeEmail && normalizedPhone !== "";
 
     const result = await pool.query(
       `SELECT 
@@ -2330,7 +2343,7 @@ app.post("/login", async (req, res) => {
        LEFT JOIN subscriptions s ON c.id = s.company_id
        LEFT JOIN subscription_plans sp ON s.plan_id = sp.id
        WHERE LOWER(u.email) = LOWER($1)
-          ${canSearchPhone ? "OR regexp_replace(COALESCE(u.phone,''), '[^0-9+]', '', 'g') = $2" : ""}
+          ${canSearchPhone ? "OR u.phone_normalise = $2" : ""}
        ORDER BY s.id DESC
        LIMIT 1`,
       canSearchPhone ? [loginIdentifier, normalizedPhone] : [loginIdentifier]
@@ -2375,7 +2388,14 @@ app.post("/login", async (req, res) => {
 
     const isCustomerAccount = normalizeRole(user.role) === "customer";
 
-    if (!isSuperAdmin) {
+    /* Le super-administrateur peut dispenser un compte de vérification :
+       quelqu'un qui n'a pas d'adresse email n'a rien à vérifier par email, et
+       lui réclamer une confirmation qu'il ne recevra jamais revient à lui
+       fermer la porte. Le réglage est vide sur tout l'existant, donc rien ne
+       change pour les comptes déjà en service. */
+    const dispenseDeVerification = String(user.verification_mode || "") === "none";
+
+    if (!isSuperAdmin && !dispenseDeVerification) {
       const userVerified = user.email_verified === true || user.phone_verified === true;
       const companyVerified =
         isCustomerAccount ||
@@ -3225,6 +3245,85 @@ app.post(
         });
       }
 
+      /* Un compte a besoin d'UN moyen d'être reconnu, pas des deux. Tout le
+         monde n'a pas d'adresse email ; le téléphone en tient lieu. */
+      const identite = identifiants.lireIdentifiants({ email, phone });
+
+      if (identite.telephoneIllisible) {
+        return res.status(400).json({
+          error: "Ce numéro de téléphone n'est pas exploitable. Exemples acceptés : "
+               + "76327799, 76 32 77 99, +22376327799, 0022376327799.",
+          code: "PHONE_INVALID",
+        });
+      }
+      if (!identite.email && !identite.telephone) {
+        return res.status(400).json({
+          error: "Indiquez au moins une adresse email ou un numéro de téléphone.",
+          code: "IDENTIFIER_REQUIRED",
+        });
+      }
+
+      /* Un identifiant déjà pris désigne quelqu'un d'autre : on refuse avant
+         d'écrire, plutôt que de laisser l'index trancher par une erreur
+         technique que personne ne sait lire. */
+      if (identite.emailNormalise) {
+        const { rows } = await pool.query(
+          `SELECT id FROM users WHERE lower(email) = $1 LIMIT 1`,
+          [identite.emailNormalise]
+        );
+        if (rows.length) {
+          return res.status(409).json({
+            error: "Cette adresse email est déjà utilisée par un autre compte.",
+            code: "EMAIL_TAKEN",
+          });
+        }
+      }
+      if (identite.telephone) {
+        const { rows } = await pool.query(
+          `SELECT id FROM users WHERE phone_normalise = $1 LIMIT 1`,
+          [identite.telephone]
+        );
+        if (rows.length) {
+          return res.status(409).json({
+            error: "Ce numéro de téléphone est déjà utilisé par un autre compte.",
+            code: "PHONE_TAKEN",
+          });
+        }
+      }
+
+      /* Dispenser de vérification, c'est ouvrir un compte sans preuve que
+         la personne contrôle l'adresse ou le numéro. Seul un
+         super-administrateur peut le décider — jamais l'intéressé. */
+      const modeDemande = String(req.body?.verification_mode || "").trim().toLowerCase();
+      let verificationMode = null;
+      if (modeDemande) {
+        if (!["none", "email", "phone"].includes(modeDemande)) {
+          return res.status(400).json({
+            error: "Mode de vérification inconnu.", code: "VERIFICATION_MODE_INVALID",
+          });
+        }
+        if (req.user.is_super_admin !== true) {
+          return res.status(403).json({
+            error: "Seul un super-administrateur peut choisir le mode de vérification.",
+            code: "VERIFICATION_MODE_FORBIDDEN",
+          });
+        }
+        if (modeDemande === "email" && !identite.email) {
+          return res.status(400).json({
+            error: "La vérification par email exige une adresse email.",
+            code: "VERIFICATION_EMAIL_IMPOSSIBLE",
+          });
+        }
+        if (modeDemande === "phone" && !smsServiceConfigure()) {
+          return res.status(400).json({
+            error: "Aucun service SMS n'est configuré : la vérification par téléphone "
+                 + "ne peut pas être exigée. Choisissez l'email, ou aucune vérification.",
+            code: "SMS_NOT_CONFIGURED",
+          });
+        }
+        verificationMode = modeDemande;
+      }
+
       const rawPassword = password || crypto.randomBytes(8).toString("base64");
       const passwordError = validatePasswordStrength(rawPassword);
 
@@ -3248,6 +3347,26 @@ app.post(
       }
       const assignedCompanyId = contexteSociete.companyId;
 
+      /* Affecter quelqu'un à un entrepôt d'une AUTRE entreprise lui ouvrirait
+         une porte latérale : l'entrepôt doit appartenir à l'entreprise qui
+         crée le compte. */
+      let entrepotAffecte = null;
+      if (req.body?.warehouse_id !== undefined && req.body?.warehouse_id !== null
+          && String(req.body.warehouse_id).trim() !== "") {
+        const demande = Number(req.body.warehouse_id);
+        const { rows } = await pool.query(
+          `SELECT id FROM warehouses WHERE id = $1 AND company_id = $2`,
+          [demande, assignedCompanyId]
+        );
+        if (!rows.length) {
+          return res.status(400).json({
+            error: "Cet entrepôt n'appartient pas à l'entreprise de ce compte.",
+            code: "WAREHOUSE_NOT_IN_COMPANY",
+          });
+        }
+        entrepotAffecte = rows[0].id;
+      }
+
       const userResult = await pool.query(
         `
       INSERT INTO users
@@ -3257,20 +3376,38 @@ app.post(
         password,
         role,
         phone,
+        phone_normalise,
         company_id,
-        is_super_admin
+        is_super_admin,
+        verification_mode,
+        verification_mode_set_by,
+        verification_mode_set_at,
+        email_verified,
+        phone_verified,
+        warehouse_id
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+              CASE WHEN $9::text IS NULL THEN NULL ELSE now() END,
+              $11,$12,$13)
       RETURNING *
       `,
         [
           fullname,
-          email,
+          identite.email,
           await hashPassword(rawPassword),
           requestedRole || "magasinier",
           phone || "",
+          identite.telephone,
           assignedCompanyId,
-          req.user.is_super_admin === true && requestedRole === "super_admin"
+          req.user.is_super_admin === true && requestedRole === "super_admin",
+          verificationMode,
+          verificationMode ? req.user.id : null,
+          /* Dispensé de vérification, le compte est utilisable tout de suite :
+             marquer vérifié ce que le super-administrateur a explicitement
+             dispensé évite qu'un contrôle hérité le bloque quand même. */
+          verificationMode === "none" && Boolean(identite.email),
+          verificationMode === "none" && Boolean(identite.telephone),
+          entrepotAffecte,
         ]
       );
 
@@ -3312,7 +3449,11 @@ app.post(
         [user.id, "Standard", "horaire", 1000, 8000, 200000, "08:00", "17:00"]
       );
 
-      res.status(201).json(updatedUser.rows[0]);
+      /* L'empreinte du mot de passe n'a rien à faire dans une réponse : elle
+         se retrouverait dans les journaux du navigateur et les outils réseau.
+         Elle ne sert qu'à la vérification, côté serveur. */
+      const { password: _empreinte, ...compteCree } = updatedUser.rows[0];
+      res.status(201).json(compteCree);
     } catch (error) {
       console.error("ERREUR CREATE USER :", error);
       res.status(500).json({
