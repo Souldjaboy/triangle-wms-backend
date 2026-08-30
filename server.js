@@ -468,7 +468,14 @@ async function nextShortDocumentNumber(prefix, companyId, client = pool) {
 }
 
 const rbacTriangle = require("./rbac-triangle");
-const requirePermission = rbacTriangle.createRequirePermission(pool);
+const permissionsService = require("./services/permissions");
+/* Le garde de TOUTES les routes vient du centre des droits, pas de l'ancien
+   moteur. Celui-ci ne lisait que `user_permissions` : une permission accordée
+   dans le nouvel écran — écrite dans `user_permission_overrides` — restait
+   invisible pour lui, et l'employé se voyait refuser ce qu'on venait de lui
+   donner. Le nouveau moteur consulte les deux, l'ancien modèle servant de
+   repli, si bien qu'aucun compte configuré autrefois ne perd son accès. */
+const requirePermission = permissionsService.creerRequirePermission(pool);
 
 /* Repli historique (utilisé UNIQUEMENT si aucune permission explicite n'est
    configurée pour l'utilisateur). `responsable_entrepot` est ajouté : ce rôle
