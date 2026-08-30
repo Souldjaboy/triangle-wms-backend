@@ -10,7 +10,11 @@ export EMAIL_PROVIDER=sandbox
 export SMS_PROVIDER=sandbox
 cd "$(dirname "$0")/.."
 
-node server.js > /tmp/claude-0/-home-user-triangle-wms-backend/b8d8b3d8-0894-5b0a-b013-81323b4e6511/scratchpad/serveur-test.log 2>&1 &
+# Le journal va dans le répertoire temporaire de la machine courante : un
+# chemin figé empêchait le serveur de démarrer ailleurs que là où il a été écrit.
+JOURNAL="${JOURNAL_SERVEUR:-${TMPDIR:-/tmp}/triangle-serveur-test.log}"
+
+node server.js > "$JOURNAL" 2>&1 &
 SERVEUR=$!
 trap 'kill $SERVEUR 2>/dev/null' EXIT
 
@@ -20,7 +24,7 @@ for i in $(seq 1 40); do
   sleep 0.5
 done
 if [ "$code" != "401" ]; then
-  echo "Le serveur n'a pas démarré :"; tail -20 /tmp/claude-0/-home-user-triangle-wms-backend/b8d8b3d8-0894-5b0a-b013-81323b4e6511/scratchpad/serveur-test.log; exit 1
+  echo "Le serveur n'a pas démarré :"; tail -20 "$JOURNAL"; exit 1
 fi
 
 BASE_URL="http://127.0.0.1:$PORT" node scripts/test-durcissement.js

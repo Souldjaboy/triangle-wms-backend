@@ -57,7 +57,11 @@ const FAMILLES = [
 ];
 
 /* L'opération a eu lieu le 22 août à 10 h 30 ; la saisie, le 25 à 14 h 07. */
-const CREATION_TECHNIQUE = "2026-08-25T14:07:33Z";
+/* `documents.created_at` est un `timestamp` SANS fuseau dans le schéma réel :
+   il enregistre une heure murale, pas un instant. On la manipule donc comme
+   telle — la comparer à un instant daté ferait échouer le test partout où la
+   machine n'est pas à UTC, sans que le produit ait le moindre défaut. */
+const CREATION_TECHNIQUE = "2026-08-25 14:07:33";
 const DATE_METIER = { date: "2026-08-22", time: "10:30", attendu: "22/08/2026 à 10:30" };
 const APRES_IMPRESSION = { date: "2026-08-21", time: "16:45", attendu: "21/08/2026 à 16:45" };
 
@@ -166,7 +170,9 @@ async function main() {
     verifier("la date imprimée vient bien du métier",
       imprime?.source_date_affichee === "document", imprime?.source_date_affichee);
     verifier("la date technique reste disponible à côté",
-      new Date(imprime?.created_at).toISOString() === new Date(CREATION_TECHNIQUE).toISOString());
+      new Date(imprime?.created_at).getTime()
+        === new Date(CREATION_TECHNIQUE.replace(" ", "T")).getTime(),
+      `${imprime?.created_at}`);
     verifier("les lignes du bon sont intactes", (imprime?.items || []).length >= 1);
 
     // ── cloisonnement
@@ -202,7 +208,7 @@ async function main() {
       mvts.rows[0].n === 5 && mvts.rows[0].q === 60, JSON.stringify(mvts.rows[0]));
     const intactes = await pool.query(
       `SELECT COUNT(*)::int AS n FROM documents
-        WHERE company_id=1 AND created_at <> $1::timestamptz`, [CREATION_TECHNIQUE]);
+        WHERE company_id=1 AND created_at <> $1::timestamp`, [CREATION_TECHNIQUE]);
     verifier("AUCUN created_at n'a été réécrit", intactes.rows[0].n === 0, `${intactes.rows[0].n} altéré(s)`);
   }
 
