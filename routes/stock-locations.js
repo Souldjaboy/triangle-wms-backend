@@ -30,6 +30,8 @@ const L = require("../services/stock-locations");
 /* Répartition d'un mouvement sur plusieurs bacs, en une transaction. */
 const M = require("../services/mouvements-multi-bins");
 const rules = require("../services/location-rules");
+/* Un compte affecté à un entrepôt ne voit ni ne touche les autres. */
+const E = require("../services/entrepots");
 
 module.exports = function createStockLocationsRouter(deps) {
   const { pool, authenticateToken, getEffectiveCompanyId, requirePermission } = deps;
@@ -39,6 +41,10 @@ module.exports = function createStockLocationsRouter(deps) {
   const canCreate = requirePermission("stock", "create");
   const canApply = requirePermission("stock", "validate");
   const userOf = (req) => ({ id: req.user.id, name: req.user.fullname || req.user.email, role: req.user.role });
+  const limiterEntrepot = E.creerLimiteEntrepot(pool);
+  /* Les listes se filtrent par entrepôt imposé ; `NULL` laisse tout passer,
+     ce qui préserve exactement le comportement des comptes non restreints. */
+  const entrepotDe = (req) => E.entrepotImpose(pool, req.user);
 
   const fail = (res, e, defaut) => {
     console.error(defaut, e);
@@ -92,9 +98,10 @@ module.exports = function createStockLocationsRouter(deps) {
            LEFT JOIN stock_location_balances b
                   ON b.location_id = l.id AND b.company_id = l.company_id
           WHERE l.company_id = $1 AND ${VIVANT} AND ${BAC_REEL}
+            AND ($2::int IS NULL OR l.warehouse_id = $2)
           GROUP BY l.id
           ORDER BY l.warehouse_code, 3, 4, 5, l.bin_code`,
-        [companyOf(req)]
+        [companyOf(req), await entrepotDe(req)]
       );
       /* Arborescence prête à alimenter des sélecteurs dépendants : un bin
          n'apparaît jamais sous un rayon auquel il n'appartient pas. */
@@ -119,8 +126,11 @@ module.exports = function createStockLocationsRouter(deps) {
 
   router.get("/stock/locations/bins", authenticateToken, canView, async (req, res) => {
     try {
+      /* L'entrepôt imposé prime sur celui demandé : sinon il suffirait de
+         changer un paramètre d'URL pour regarder à côté. */
+      const impose = await entrepotDe(req);
       res.json(await L.availableLocations(pool, companyOf(req), {
-        warehouseId: req.query.warehouseId ? Number(req.query.warehouseId) : null,
+        warehouseId: impose || (req.query.warehouseId ? Number(req.query.warehouseId) : null),
         onlyEmpty: req.query.onlyEmpty === "1",
       }));
     } catch (e) { fail(res, e, "Erreur chargement des bacs."); }
@@ -435,7 +445,7 @@ module.exports = function createStockLocationsRouter(deps) {
 
   // ---------------------------------------------------- opérations
   const operation = (chemin, permission, fn, defaut) =>
-    router.post(chemin, authenticateToken, permission, async (req, res) => {
+    router.post(chemin, authenticateToken, permission, limiterEntrepot, async (req, res) => {
       try {
         const out = await tx((client) => fn(client, req));
         res.status(201).json({ success: true, ...out });

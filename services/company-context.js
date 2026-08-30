@@ -99,6 +99,23 @@ async function resoudreSociete(pool, req, getEffectiveCompanyId) {
  * @param client un client déjà en transaction
  */
 async function prochainBadge(client, companyId) {
+  /* Une entreprise créée après la migration 065 n'a pas encore de préfixe.
+     Sans cela, ses cartes porteraient « ENT7 », que personne ne rattache à
+     l'entreprise en le lisant. On le déduit de son nom une seule fois, puis
+     on le garde : le préfixe d'une société ne doit pas changer d'un badge au
+     suivant. */
+  const { rows: avant } = await client.query(
+    `SELECT name, badge_prefix FROM companies WHERE id = $1 FOR UPDATE`, [companyId]
+  );
+  if (!avant[0]) throw new Error(`Entreprise ${companyId} introuvable pour l'attribution du badge.`);
+
+  if (!String(avant[0].badge_prefix || "").trim()) {
+    await client.query(
+      `UPDATE companies SET badge_prefix = $1 WHERE id = $2`,
+      [prefixeDepuisNom(avant[0].name, companyId), companyId]
+    );
+  }
+
   const { rows } = await client.query(
     `UPDATE companies
         SET badge_sequence = COALESCE(badge_sequence, 0) + 1
@@ -107,7 +124,6 @@ async function prochainBadge(client, companyId) {
                 badge_sequence`,
     [companyId]
   );
-  if (!rows[0]) throw new Error(`Entreprise ${companyId} introuvable pour l'attribution du badge.`);
   const { prefixe, badge_sequence: numero } = rows[0];
   return `${prefixe}-EMP-${String(numero).padStart(3, "0")}`;
 }

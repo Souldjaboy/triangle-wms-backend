@@ -27,6 +27,7 @@
 
 const express = require("express");
 const H = require("../services/location-hierarchy");
+const E = require("../services/entrepots");
 const rules = require("../services/location-rules");
 const L = require("../services/stock-locations");
 
@@ -195,6 +196,11 @@ module.exports = function createLocationsAdminRouter(deps) {
       const where = ["l.company_id = $1"];
 
       if (String(req.query.archived || "") !== "1") where.push("l.archived_at IS NULL");
+
+      /* Un compte affecté à un entrepôt ne voit que le sien, quel que soit le
+         filtre demandé dans l'URL. */
+      const entrepotImpose = await E.entrepotImpose(pool, req.user);
+      if (entrepotImpose) where.push(`l.warehouse_id = $${params.push(entrepotImpose)}`);
       if (req.query.warehouse) where.push(`UPPER(${H.EXPR.WAREHOUSE}) = UPPER($${params.push(req.query.warehouse)})`);
       if (req.query.row) where.push(`UPPER(${H.EXPR.ROW}) = UPPER($${params.push(req.query.row)})`);
       if (req.query.shelf) where.push(`UPPER(${H.EXPR.SHELF}) = UPPER($${params.push(req.query.shelf)})`);
