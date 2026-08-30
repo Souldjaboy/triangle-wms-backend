@@ -27,6 +27,8 @@
 
 const express = require("express");
 const L = require("../services/stock-locations");
+/* Répartition d'un mouvement sur plusieurs bacs, en une transaction. */
+const M = require("../services/mouvements-multi-bins");
 const rules = require("../services/location-rules");
 
 module.exports = function createStockLocationsRouter(deps) {
@@ -442,6 +444,26 @@ module.exports = function createStockLocationsRouter(deps) {
 
   /* Préparation : le mouvement est créé « En attente », aucun stock n'est
      appliqué. C'est sa validation qui le fera — bouton Valider existant. */
+  /* ── Mouvements répartis sur plusieurs emplacements ──
+     Le moteur ne sait travailler que sur un bac à la fois. Sortir trente
+     unités d'un stock réparti sur trois rayons demandait donc plusieurs
+     appels distincts, sans transaction commune : la seconde sortie pouvait
+     échouer alors que la première avait déjà vidé un bac. Ces routes
+     appliquent toutes les lignes dans une seule transaction. */
+  operation("/stock/locations/exit-multi", canCreate, (client, req) =>
+    M.sortieRepartie(client, {
+      companyId: companyOf(req), productId: Number(req.body?.productId),
+      quantity: req.body?.quantity, allocations: req.body?.allocations,
+      reason: req.body?.reason || "Sortie répartie", user: userOf(req),
+    }), "Erreur de sortie répartie.");
+
+  operation("/stock/locations/entry-multi", canCreate, (client, req) =>
+    M.entreeRepartie(client, {
+      companyId: companyOf(req), productId: Number(req.body?.productId),
+      quantity: req.body?.quantity, allocations: req.body?.allocations,
+      reason: req.body?.reason || "Entrée répartie", user: userOf(req),
+    }), "Erreur d'entrée répartie.");
+
   operation("/stock/locations/prepare-entry", canCreate, (client, req) =>
     L.prepareEntryAtLocation(client, {
       companyId: companyOf(req), productId: Number(req.body?.productId),

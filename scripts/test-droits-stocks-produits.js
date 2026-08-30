@@ -43,6 +43,9 @@ async function accorder(companyId, userId, couples, effet = "ALLOW") {
 
 async function main() {
   const TRIANGLE = 1;
+  /* On repart d'une ardoise propre : une section qui laisserait des droits
+     derrière elle ferait échouer la suivante pour de mauvaises raisons. */
+  await pool.query(`DELETE FROM user_permission_overrides WHERE company_id = $1`, [TRIANGLE]);
   const employe = await user(3);      // employe Triangle, aucun droit d'écriture
   const superAdmin = await user(1);
 
@@ -81,7 +84,7 @@ async function main() {
     verifier("can(stock, create) répond OUI via les sous-modules",
       peut(c, "stock", "create"), `origine ${origine(c, "stock", "create")}`);
     verifier("et l'origine le dit", origine(c, "stock", "create") === "sous_module");
-    verifier("→ l'écran n'est donc PAS en lecture seule", peut(c, "stock", "create"));
+    verifier("→ l'écran n'est donc PAS en lecture seule", p.peutEcrire(c, "stock"));
 
     console.log("  — mouvements —");
     verifier("enregistrer une entrée", peut(c, "stock.entree", "create"));
@@ -123,7 +126,7 @@ async function main() {
     verifier("il ne crée rien", !peut(c, "stock", "create"), `origine ${origine(c, "stock", "create")}`);
     verifier("ni entrée", !peut(c, "stock.entree", "create"));
     verifier("ni sortie", !peut(c, "stock.sortie", "create"));
-    verifier("→ l'écran reste bien en lecture seule", !peut(c, "stock", "create"));
+    verifier("→ l'écran reste bien en lecture seule", !p.peutEcrire(c, "stock"));
   }
 
   console.log("\nACTIONS DE L'ÉCRAN EMPLACEMENTS");
@@ -138,6 +141,43 @@ async function main() {
       .map((r) => r.action_key);
     verifier("les deux sont des actions déclarées",
       connues.includes("archive") && connues.includes("reorganize"));
+  }
+
+  console.log("\nMATRICE — chaque sous-permission n'ouvre QUE son action");
+  {
+    /* La remontée aux sous-modules ne doit pas transformer un droit unique en
+       blanc-seing : accorder la seule sortie ne doit ouvrir ni l'entrée, ni le
+       transfert, ni l'inventaire, ni la création de produit. */
+    const cobaye = await user(4);
+    const SOUS = [
+      ["stock.entree", "create", "Entrée"],
+      ["stock.sortie", "create", "Sortie"],
+      ["stock.transfert", "transfer", "Transfert"],
+      ["stock.inventaire", "create", "Inventaire"],
+    ];
+
+    for (const [moduleAccorde, actionAccordee, nom] of SOUS) {
+      await pool.query(`DELETE FROM user_permission_overrides WHERE user_id=$1`, [cobaye.id]);
+      await accorder(TRIANGLE, cobaye.id, [
+        ["stock", "visible"], ["stock", "view"],
+        [moduleAccorde, "visible"], [moduleAccorde, "view"], [moduleAccorde, actionAccordee],
+      ]);
+      const c = await droits(cobaye);
+
+      const ouvert = SOUS.filter(([m, a]) => peut(c, m, a)).map(([, , n]) => n);
+      verifier(
+        `seul « ${nom} » est ouvert quand seul ${moduleAccorde}.${actionAccordee} est accordé`,
+        ouvert.length === 1 && ouvert[0] === nom,
+        `ouverts : ${ouvert.join(", ") || "aucun"}`
+      );
+      /* Le bandeau suit la capacité d'ÉCRIRE, pas celle de créer : quelqu'un
+         qui ne peut que transférer n'est pas un lecteur. */
+      verifier(`  → le module Stock n'est pas en lecture seule`, p.peutEcrire(c, "stock"));
+      verifier(`  → créer un produit reste refusé`, !peut(c, "produit", "create"));
+      verifier(`  → supprimer un produit reste refusé`, !peut(c, "produit", "delete"));
+    }
+
+    await pool.query(`DELETE FROM user_permission_overrides WHERE user_id=$1`, [cobaye.id]);
   }
 
   console.log("\nSUPER ADMIN");

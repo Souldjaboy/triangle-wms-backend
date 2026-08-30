@@ -139,6 +139,30 @@ function decider(ctx, cleModule, action) {
     if (parRole === false) return { autorise: false, source: "role" };
   }
 
+  /* Le module parent ne déclare pas cette action, ses sous-modules si.
+     « Créer » sur les stocks n'existe pas au niveau du parent : la création
+     vit sur les entrées, sorties, transferts et inventaires. Sans cette
+     remontée, la page demandait can("stock","create"), ne trouvait rien,
+     retombait sur le rôle — et un employé restait en lecture seule alors
+     que le droit d'enregistrer une entrée lui avait été accordé.
+     On répond donc « peut-on le faire quelque part sous ce module ? ». Le
+     garde des routes, lui, interroge toujours la clé précise.
+
+     Ce test passe AVANT l'ancien modèle : une ligne héritée disant « ne peut
+     pas créer sur stocks » ne doit pas annuler un droit d'entrée accordé
+     explicitement aujourd'hui. L'ancien modèle est un repli, pas un veto sur
+     les décisions récentes. */
+  const parent = ctx.parModule.get(cle);
+  if (parent && !parent.actions.includes(action)) {
+    const enfants = ctx.modules.filter((m) => m.parent_key === cle && m.actions.includes(action));
+    for (const enfant of enfants) {
+      if (decider(ctx, enfant.module_key, action).autorise) {
+        return { autorise: true, source: "sous_module" };
+      }
+    }
+    if (enfants.length) return { autorise: false, source: "sous_module" };
+  }
+
   /* Comptes configurés dans l'ancien écran, avant ce module. */
   for (const candidat of candidats) {
     const ligne = ctx.ancien.get(legacy.normalizeModuleKey(candidat));
@@ -153,27 +177,40 @@ function decider(ctx, cleModule, action) {
     }
   }
 
-  /* Le module parent ne déclare pas cette action, ses sous-modules si.
-     « Créer » sur les stocks n'existe pas au niveau du parent : la création
-     vit sur les entrées, sorties, transferts et inventaires. Sans cette
-     remontée, la page demandait can("stock","create"), ne trouvait rien,
-     retombait sur le rôle — et un employé restait en lecture seule alors
-     que le droit d'enregistrer une entrée lui avait été accordé.
-     On répond donc « peut-on le faire quelque part sous ce module ? ». Le
-     garde des routes, lui, interroge toujours la clé précise. */
-  const parent = ctx.parModule.get(cle);
-  if (parent && !parent.actions.includes(action)) {
-    const enfants = ctx.modules.filter((m) => m.parent_key === cle && m.actions.includes(action));
-    for (const enfant of enfants) {
-      if (decider(ctx, enfant.module_key, action).autorise) {
-        return { autorise: true, source: "sous_module" };
-      }
-    }
-    if (enfants.length) return { autorise: false, source: "sous_module" };
-  }
-
   const role = String(ctx.user?.role || "").trim().toLowerCase();
   return { autorise: ROLES_ADMIN.includes(role), source: "repli_role" };
+}
+
+/* Actions qui modifient. Sert au seul signal « lecture seule » : un écran ne
+   doit pas s'annoncer en lecture seule à qui peut transférer, même s'il ne
+   peut rien créer. */
+const ACTIONS_ECRITURE = [
+  "create", "update", "delete", "import", "validate", "cancel",
+  "putaway", "transfer", "reserve", "assign", "configure", "share",
+  "archive", "reorganize", "manage",
+];
+
+/**
+ * Le compte peut-il écrire quelque part sous ce module ?
+ *
+ * Le distinguer de `create` importe : quelqu'un qui n'a que le droit de
+ * transférer ne crée rien, et son écran ne doit pourtant pas s'annoncer en
+ * lecture seule. Chaque bouton garde son contrôle propre ; ceci ne décide que
+ * du bandeau.
+ */
+function peutEcrire(ctx, cleModule) {
+  const candidats = chaineDeCles(cleModule);
+  const cle = candidats.find((c) => ctx.parModule.has(c)) || candidats[0];
+  const famille = [cle, ...ctx.modules.filter((m) => m.parent_key === cle).map((m) => m.module_key)];
+  for (const module of famille) {
+    const declaration = ctx.parModule.get(module);
+    if (!declaration) continue;
+    for (const action of declaration.actions) {
+      if (!ACTIONS_ECRITURE.includes(action)) continue;
+      if (decider(ctx, module, action).autorise) return true;
+    }
+  }
+  return false;
 }
 
 /** Tous les droits d'un utilisateur, prêts pour le frontend. */
@@ -196,6 +233,12 @@ async function droitsEffectifs(pool, user) {
       is_system: m.is_system, actions: m.actions,
     })),
     permissions: out,
+    /* Par module : une action d'écriture y est-elle ouverte ? C'est ce qui
+       décide du bandeau « Lecture seule », et non le seul droit de créer. */
+    ecriture: Object.fromEntries(
+      ctx.modules.filter((m) => !m.parent_key)
+        .map((m) => [m.module_key, peutEcrire(ctx, m.module_key)])
+    ),
   };
 }
 
@@ -240,7 +283,7 @@ function creerRequirePermission(pool) {
 }
 
 module.exports = {
-  ROLES_ADMIN, MODULE_PERMISSIONS, ALIAS,
+  ROLES_ADMIN, MODULE_PERMISSIONS, ALIAS, ACTIONS_ECRITURE, peutEcrire,
   normaliser, chaineDeCles, estSuperAdmin,
   chargerContexte, decider, droitsEffectifs, creerRequirePermission,
 };
