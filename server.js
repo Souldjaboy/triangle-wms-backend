@@ -20,6 +20,8 @@ const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
 const nodemailer = require("nodemailer");
+/* Entreprise d'appartenance et badge : une seule règle, côté serveur. */
+const companyContext = require("./services/company-context");
 const stockLocations = require("./services/stock-locations");
 const locationHierarchy = require("./services/location-hierarchy");
 const documentDates = require("./services/document-dates");
@@ -1986,7 +1988,9 @@ app.post("/register-saas", async (req, res) => {
         "admin",
         company.id,
         false,
-        `TRIANGLE-EMP-${company.id}-${Date.now()}`,
+        /* Premier compte d'une entreprise qui vient d'être créée : son
+           badge porte déjà son préfixe, pas celui d'une autre société. */
+        `${companyContext.prefixeDepuisNom(company.name, company.id)}-EMP-001`,
         cleanPhone,
         false,
         false,
@@ -3221,10 +3225,21 @@ app.post(
         return res.status(400).json({ error: passwordError });
       }
 
-      const assignedCompanyId =
-        req.user.is_super_admin === true
-          ? company_id || req.user.company_id || null
-          : req.user.company_id;
+      /* L'entreprise vient du contexte de travail authentifié, pas du corps
+         de la requête. C'est ce qui manquait : un employé créé depuis
+         FAT & MAT atterrissait dans Triangle parce que la route lisait
+         `company_id` du navigateur, puis se rabattait sur la société du
+         compte administrateur — jamais sur l'entreprise réellement active. */
+      const contexteSociete = await companyContext.resoudreSociete(
+        pool, req, getEffectiveCompanyId
+      );
+      if (!contexteSociete.companyId) {
+        return res.status(409).json({
+          error: contexteSociete.refus || "Entreprise indéterminée.",
+          code: "COMPANY_CONTEXT_REQUIRED",
+        });
+      }
+      const assignedCompanyId = contexteSociete.companyId;
 
       const userResult = await pool.query(
         `
@@ -3254,17 +3269,22 @@ app.post(
 
       const user = userResult.rows[0];
 
-      const badgeCode = `TRIANGLE-EMP-${user.id}`;
-
-      const updatedUser = await pool.query(
-        `
-      UPDATE users
-      SET badge_code = $1
-      WHERE id = $2
-      RETURNING *
-      `,
-        [badgeCode, user.id]
-      );
+      /* Le badge suit l'entreprise d'appartenance réelle. La séquence est
+         incrémentée sous verrou dans la même transaction que l'écriture :
+         deux créations simultanées obtiennent deux numéros distincts. */
+      const clientBadge = await pool.connect();
+      let updatedUser;
+      try {
+        await clientBadge.query("BEGIN");
+        const badgeCode = await companyContext.prochainBadge(clientBadge, assignedCompanyId);
+        updatedUser = await clientBadge.query(
+          `UPDATE users SET badge_code = $1 WHERE id = $2 RETURNING *`,
+          [badgeCode, user.id]
+        );
+        await clientBadge.query("COMMIT");
+      } finally {
+        clientBadge.release();
+      }
 
       await pool.query(
         `

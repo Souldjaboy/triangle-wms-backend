@@ -232,3 +232,77 @@ COMMIT;
 --   Elle ne renomme aucun rayon, ne remplit aucun full_code manquant, ne
 --   supprime aucun doublon. Tout cela reste sous décision humaine.
 -- ═════════════════════════════════════════════════════════════════════════
+
+-- ═════════════════════════════════════════════════════════════════════════
+-- BADGES PAR ENTREPRISE
+--
+-- Le badge était fabriqué en dur : `TRIANGLE-EMP-<id>`, quelle que soit la
+-- société. Un employé créé dans FAT & MAT recevait donc une étiquette
+-- Triangle — un badge n'est pas un libellé décoratif, il identifie la
+-- personne à l'entrée d'un site.
+--
+-- Le préfixe et la séquence appartiennent désormais à l'entreprise. Rien
+-- n'est deviné : à défaut de valeur, on dérive un préfixe des premières
+-- lettres du nom, et l'administrateur peut le corriger.
+-- ═════════════════════════════════════════════════════════════════════════
+BEGIN;
+
+ALTER TABLE companies
+  ADD COLUMN IF NOT EXISTS badge_prefix   text,
+  ADD COLUMN IF NOT EXISTS badge_sequence integer NOT NULL DEFAULT 0;
+
+/* Préfixe initial : celui que portent DÉJÀ les badges de l'entreprise.
+   Le déduire du nom donnerait « TRIANGLELOGI » là où les cartes en
+   circulation disent « TRIANGLE » — les anciennes cesseraient de concorder
+   avec les nouvelles. On reprend donc le préfixe dominant existant, et l'on
+   ne se rabat sur le nom que faute de badge exploitable. */
+WITH candidats AS (
+  SELECT company_id, upper(split_part(badge_code, '-', 1)) AS prefixe, count(*) AS n
+    FROM users
+   WHERE company_id IS NOT NULL AND COALESCE(badge_code,'') <> ''
+     AND position('-' IN badge_code) > 1
+   GROUP BY 1, 2
+),
+/* Un préfixe n'appartient qu'à une entreprise : celle qui en porte le plus.
+   Sans cette règle, un badge attribué par erreur — celui d'un employé
+   FAT & MAT étiqueté TRIANGLE — donnerait le préfixe Triangle à FAT & MAT,
+   et l'erreur d'hier deviendrait la règle de demain. */
+attribue AS (
+  SELECT DISTINCT ON (prefixe) prefixe, company_id
+    FROM candidats ORDER BY prefixe, n DESC, company_id
+)
+UPDATE companies c SET badge_prefix = a.prefixe
+  FROM attribue a
+ WHERE a.company_id = c.id
+   AND COALESCE(NULLIF(TRIM(c.badge_prefix), ''), '') = '';
+
+/* Faute de badge existant : premier mot du nom, en majuscules. */
+UPDATE companies
+   SET badge_prefix = NULLIF(left(upper(regexp_replace(translate(name,
+         'àâäéèêëîïôöùûüçÀÂÄÉÈÊËÎÏÔÖÙÛÜÇ', 'aaaeeeeiioouuucAAAEEEEIIOOUUUC'),
+         '[^A-Za-z0-9]', '', 'g')), 12), '')
+ WHERE COALESCE(NULLIF(TRIM(badge_prefix), ''), '') = '';
+
+UPDATE companies SET badge_prefix = 'ENT' || id
+ WHERE COALESCE(NULLIF(TRIM(badge_prefix), ''), '') = '';
+
+/* La séquence repart au-dessus du plus grand numéro déjà attribué, pour que
+   la génération ne réutilise jamais un badge existant. */
+UPDATE companies c
+   SET badge_sequence = GREATEST(c.badge_sequence, COALESCE(m.plus_haut, 0))
+  FROM (
+    SELECT u.company_id,
+           max(NULLIF(regexp_replace(COALESCE(u.badge_code,''), '^.*[^0-9]', '', 'g'), '')::bigint) AS plus_haut
+      FROM users u
+     WHERE u.company_id IS NOT NULL
+       AND COALESCE(u.badge_code,'') ~ '[0-9]$'
+     GROUP BY u.company_id
+  ) m
+ WHERE m.company_id = c.id;
+
+/* Un badge ne doit jamais désigner deux personnes de la même société. */
+CREATE UNIQUE INDEX IF NOT EXISTS users_badge_code_par_societe
+  ON users (company_id, upper(badge_code))
+  WHERE badge_code IS NOT NULL AND badge_code <> '';
+
+COMMIT;

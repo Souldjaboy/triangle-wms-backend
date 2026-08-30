@@ -42,6 +42,12 @@ const ALIAS = {
   factures: "comptabilite", camions: "logistique", clients: "crm",
   fournisseurs: "fournisseur", partenaires: "partenaire",
   ventes: "vente", achats: "achat", parametres: "parametre",
+  /* Les routes de vente gardent leurs modules sous les clés anglaises
+     `cement` et `sand`, tandis que le catalogue les nomme en français. Sans
+     ces deux lignes, un droit accordé sur « sable » ne répond à aucune
+     question posée sur « sand » : le moteur retombe sur le rôle, un employé
+     n'y a droit à rien, et le module reste invisible malgré la permission. */
+  cement: "ciment", sand: "sable",
 };
 
 function normaliser(cle) {
