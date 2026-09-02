@@ -215,8 +215,12 @@ async function previsualiser(client, { companyId, buffer, nomFichier }) {
           quantiteAttendue: a.quantiteAttendue,
           attendu: a.attendu, affiche: a.affiche,
           rayon: ligne.rayon, location: ligne.location, niveau: ligne.niveau,
+          zoneSansRack: ligne.zoneSansRack,
           stockInitial: ligne.stockInitial, entrees: ligne.entrees, sorties: ligne.sorties,
           nouveauStock: ligne.nouveauStock, unite: ligne.unite,
+          /* La date réelle de l'opération, pour que la grille montre quand
+             c'est arrivé et pas seulement combien. */
+          dateUnique: ligne.dateUnique,
         },
       });
     }

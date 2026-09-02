@@ -26,6 +26,21 @@ const D = require("./import-em2s-db");
 
 const BLOQUANTES = ["MULTI_BIN", "DATES_MULTIPLES", "NEW_STOCK_INCOHERENT"];
 
+/* Refus que les données peuvent légitimement provoquer, et qui n'ont pas à
+   faire tomber le lot entier : le stock manque, la réservation bloque, le bac
+   ne convient pas. Tout autre code d'erreur reste une anomalie du programme. */
+const REFUS_METIER = new Set([
+  /* Relevés dans services/stock-locations.js, pas devinés : ce sont les refus
+     que l'état des données peut légitimement provoquer. Tout autre code reste
+     une anomalie du programme et fait tomber le lot. */
+  "STOCK_INSUFFICIENT", "LOCATION_STOCK_INSUFFICIENT", "NO_BALANCE_AT_LOCATION",
+  "LOCATION_NOT_FOUND", "PRODUCT_NOT_FOUND", "INVALID_QUANTITY",
+  "LOCATION_WITHOUT_BIN", "LOCATION_INACTIVE", "LEGACY_PLACEHOLDER",
+  "WRITE_OFF_NOT_A_LOCATION", "BIN_NOT_SPECIFIED", "LOCATION_REQUIRED",
+  "NO_ALLOCATION", "SAME_LOCATION", "DUPLICATE_LOCATION",
+  "LOCATION_BALANCE_MISMATCH", "RESERVATION_EXCEEDS_AVAILABLE",
+]);
+
 /* ────────────────────────────────────────── ce qui reste bloqué ── */
 
 /**
@@ -140,7 +155,7 @@ async function ecrireMouvements(client, {
   const anomalies = await anomaliesOuvertes(client, { companyId, sha });
 
   const rapport = {
-    ecrits: 0, ignores: 0, dejaFaits: 0, bloques: 0,
+    ecrits: 0, ignores: 0, dejaFaits: 0, bloques: 0, refuses: 0,
     quantiteEntree: 0, quantiteSortie: 0, details: [],
   };
 
@@ -241,9 +256,27 @@ async function ecrireMouvements(client, {
         reason: `Import ${sha.slice(0, 12)} — ${m.provenance.feuille}:${m.provenance.ligne}`,
       };
 
-      const out = m.sens === "Entrée"
-        ? await L.entryAtLocation(client, options)
-        : await L.exitFromLocation(client, options);
+      /* Une sortie qui dépasse le disponible est une CONDITION des données,
+         pas un défaut du programme : elle doit se signaler ligne par ligne,
+         pas faire échouer les cent autres. On retire la clé posée juste avant,
+         sinon la ligne serait tenue pour faite et ne repasserait jamais. */
+      let out;
+      try {
+        out = m.sens === "Entrée"
+          ? await L.entryAtLocation(client, options)
+          : await L.exitFromLocation(client, options);
+      } catch (erreur) {
+        if (!REFUS_METIER.has(erreur.code)) throw erreur;
+        await client.query(
+          `DELETE FROM stock_import_operations
+            WHERE company_id = $1 AND idempotency_key = $2 AND movement_id IS NULL`,
+          [companyId, cle]);
+        rapport.refuses += 1;
+        rapport.details.push({ ligne: cleLigne, article: m.description,
+          etat: "refusé", motif: erreur.message, code: erreur.code,
+          sens: m.sens, quantite: part.quantite, bac: part.bin });
+        continue;
+      }
 
       /* La date métier du classeur, pas celle de la frappe. */
       if (part.date && out.movement?.id) {

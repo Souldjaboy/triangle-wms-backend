@@ -21,6 +21,7 @@ const P = require("../services/import-em2s");
 const D = require("../services/import-em2s-db");
 const contexteSociete = require("../services/company-context");
 const M = require("../services/import-em2s-mouvements");
+const E = require("../services/import-em2s-emplacements");
 const permissionsService = require("../services/permissions");
 
 module.exports = function createImportEm2sRouter(deps) {
@@ -399,6 +400,84 @@ module.exports = function createImportEm2sRouter(deps) {
         });
         res.json({ success: true, ...out });
       } catch (e) { echec(res, e, "Erreur de résolution groupée."); }
+    });
+
+  /* ──────────────────────────── la hiérarchie décrite par le classeur ── */
+
+  /** Ce que la création d'emplacements produirait, sans rien écrire. */
+  router.post("/stock/import-em2s/locations/preview", authenticateToken, peutLire,
+    upload.single("file"), async (req, res) => {
+      const companyId = await societeDe(req);
+      if (!companyId) return sansSociete(res);
+      const client = await pool.connect();
+      try {
+        const { buffer, nom } = fichierDe(req);
+        const lecture = P.lireClasseur(buffer, { nomFichier: nom });
+        const analyse = await E.analyser(client, {
+          companyId, lecture,
+          entrepotParDefaut: String(req.body?.entrepot || "A").trim().toUpperCase(),
+        });
+        res.json({ success: true, fichier: lecture.fichier, emplacements: analyse });
+      } catch (e) { echec(res, e, "Erreur d'analyse des emplacements."); }
+      finally { client.release(); }
+    });
+
+  /**
+   * Crée les emplacements manquants. Ni suppression, ni renommage, ni
+   * archivage : un identifiant d'emplacement est cité par des balances, des
+   * mouvements et des étiquettes collées sur des racks.
+   */
+  router.post("/stock/import-em2s/locations", authenticateToken, peutEcrire,
+    upload.single("file"), async (req, res) => {
+      const companyId = await societeDe(req);
+      if (!companyId) return sansSociete(res);
+      try {
+        const { buffer, nom } = fichierDe(req);
+        const attendue = String(req.body?.sha256 || "").trim().toLowerCase();
+
+        const out = await transaction(async (client) => {
+          const lecture = P.lireClasseur(buffer, { nomFichier: nom });
+          if (attendue && attendue !== lecture.fichier.sha256) {
+            const e = new Error("Le fichier a changé depuis la prévisualisation.");
+            e.httpStatus = 409; e.code = "FILE_CHANGED"; throw e;
+          }
+
+          const avant = await client.query(
+            `SELECT (SELECT COALESCE(SUM(quantity),0)::numeric FROM stock_location_balances
+                      WHERE company_id = $1) AS stock,
+                    (SELECT count(*)::int FROM stock_movements WHERE company_id = $1) AS mouvements`,
+            [companyId]);
+
+          const analyse = await E.analyser(client, {
+            companyId, lecture,
+            entrepotParDefaut: String(req.body?.entrepot || "A").trim().toUpperCase(),
+          });
+          const rapport = await E.creer(client, { companyId, analyse, utilisateur: utilisateurDe(req) });
+
+          const apres = await client.query(
+            `SELECT (SELECT COALESCE(SUM(quantity),0)::numeric FROM stock_location_balances
+                      WHERE company_id = $1) AS stock,
+                    (SELECT count(*)::int FROM stock_movements WHERE company_id = $1) AS mouvements`,
+            [companyId]);
+
+          /* Créer un contenant ne place aucune marchandise dedans. Si le stock
+             ou les mouvements ont bougé, c'est un défaut de notre côté : on
+             annule plutôt que de le constater après coup. */
+          if (Number(avant.rows[0].stock) !== Number(apres.rows[0].stock)
+              || avant.rows[0].mouvements !== apres.rows[0].mouvements) {
+            const e = new Error("La création d'emplacements a touché au stock : annulation.");
+            e.httpStatus = 500; e.code = "STOCK_TOUCHED"; throw e;
+          }
+
+          return { rapport, resume: {
+            total: analyse.total, existants: analyse.existants, aCreer: analyse.aCreer,
+            ambigus: analyse.ambigus, invalides: analyse.invalides,
+            structure: analyse.structure,
+          }, stock: Number(apres.rows[0].stock), mouvements: apres.rows[0].mouvements };
+        });
+
+        res.status(201).json({ success: true, ...out });
+      } catch (e) { echec(res, e, "Erreur de création des emplacements."); }
     });
 
   /* ─────────────────────────────────── créer les produits manquants ── */
