@@ -17915,6 +17915,17 @@ app.use(
   createDocumentsPrintRouter({ pool, authenticateToken, getEffectiveCompanyId, requirePermission })
 );
 
+/* Import d'un classeur de stock : réceptions conteneur, mouvements colorés,
+   anomalies en attente de décision. */
+const createImportEm2sRouter = require("./routes/import-em2s");
+app.use(
+  "/",
+  createImportEm2sRouter({
+    pool, authenticateToken, getEffectiveCompanyId, requirePermission,
+    upload: inventoryImportUpload,
+  })
+);
+
 const createInventoryImportRouter = require("./routes/inventory-import");
 app.use(
   "/",
