@@ -52,6 +52,38 @@ const staff = [
   [27,"Mohamedou Diallo","OFFICE",["mohamedou diallo","mohamadou diallo"]],
 ];
 
+// Montants individuels lus sur la fiche de salaire d'août 2026. Les retenues
+// d'août ne sont pas reconduites : à partir de septembre, les absences et les
+// ajustements justifiés alimentent le calcul mensuel.
+const salaryRows = {
+  1:["74329225","Responsable administrative et informatique",150000,5000],
+  2:["72717014","Responsable logistique",150000,5000],
+  3:["92995011","Comptable",100000,3333],
+  4:["76489323","Assistante directeur",75000,2500],
+  5:["93311815","Stagiaire",50000,1667],
+  6:["89902819","Ménagère",30000,1000],
+  7:["76452019","Agent de terrain",50000,1667],
+  8:["76161347","Coursier",30000,1000],
+  9:["76327799","Magasinier",100000,3333],
+  10:["74711611","Magasinier",100000,3333],
+  11:["62892701","Aide magasinier",100000,3333],
+  12:["62674444","Magasinier",100000,3333],
+  13:["78800121","Aide magasinier",100000,3333],
+  14:["707144149","Aide magasinier",50000,1667],
+  15:["79608644","Aide magasinier",50000,1667],
+  16:["71777577","Aide magasinier",50000,1667],
+  17:["79218819","Aide magasinier",100000,3333],
+  18:["73583702","Aide magasinier",50000,1667],
+  19:["91855943","Stagiaire",50000,1667],
+  20:["78149103","Aide magasinier",50000,1667],
+  21:["83328186","Stagiaire",50000,1667],
+  22:["82274122","Aide magasinier",100000,3333],
+  23:["98346440","Stagiaire",25000,833],
+  24:["97291589","Stagiaire",25000,833],
+  25:["72717014","Stagiaire",25000,833],
+  26:["82388894","Stagiaire",25000,833],
+};
+
 const norm = (value) => normalizeRole(value).replace(/_/g, " ").replace(/[’']/g, "").trim();
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
@@ -92,6 +124,7 @@ async function main() {
       BOUGOUBA: chooseUser(users, ["drissa traore"], process.env.ATTENDANCE_OPERATOR_BOUGOUBA_USER_ID),
     };
     const director = chooseUser(users, ["mohamedou diallo","mohamadou diallo"], process.env.ATTENDANCE_DIRECTOR_USER_ID);
+    const accountant = chooseUser(users, ["souleymane yaya fofana","souleman fofana","souleymane fofana"], process.env.ATTENDANCE_ACCOUNTANT_USER_ID);
     const legacy = {};
     legacy.attendance_records = (await client.query(`SELECT a.* FROM attendance_records a JOIN users u ON u.id=a.user_id WHERE u.company_id=$1`,[COMPANY_ID])).rows;
     legacy.attendance_history = (await client.query(`SELECT a.* FROM attendance_history a JOIN users u ON u.id=a.user_id WHERE u.company_id=$1`,[COMPANY_ID])).rows;
@@ -103,6 +136,8 @@ async function main() {
     console.log(`Effectif prévu : ${staff.length}; comptes liés automatiquement : ${matches.filter((m)=>m.user).length}`);
     for (const [site, user] of Object.entries(operators)) console.log(`Opérateur ${site}: ${user ? `${user.fullname} [user ${user.id}]` : "NON TROUVÉ"}`);
     console.log(`Directeur avec accès salaires : ${director ? `${director.fullname} [user ${director.id}]` : "compte non trouvé — employé créé sans accès de connexion"}`);
+    console.log(`Comptable autorisé à préparer/payer : ${accountant ? `${accountant.fullname} [user ${accountant.id}]` : "compte non trouvé — à lier avant paiement"}`);
+    console.log("Salaires individuels : 26; total mensuel calculé : 1 785 000 FCFA (le total imprimé 1 710 000 est incohérent). Mohamedou Diallo : en attente.");
     console.log("Anciennes lignes à archiver/réinitialiser:", Object.fromEntries(Object.entries(legacy).map(([k,v])=>[k,v.length])));
     if (!APPLY) { console.log("\nAPERÇU UNIQUEMENT — aucune écriture. Utilisez --apply avec la confirmation requise."); return; }
     if (CONFIRM !== "RESET_POINTAGE_2026_09_03") throw new Error("Confirmation destructive absente ou incorrecte.");
@@ -150,12 +185,22 @@ async function main() {
     await client.query(`UPDATE attendance_employees SET active=false,effective_to='2026-09-02',updated_at=now() WHERE company_id=$1`,[COMPANY_ID]);
     for (const { entry, user } of matches) {
       const [number,name,siteCode] = entry; const schedule = siteCode === "OFFICE" ? "OFFICE" : "WAREHOUSE";
-      await client.query(
-        `INSERT INTO attendance_employees(company_id,employee_number,full_name,user_id,site_id,schedule_id,job_title,active,effective_from,effective_to)
-         VALUES($1,$2,$3,$4,$5,$6,$7,true,'2026-09-03',null)
+      const salary = salaryRows[number];
+      const employee = (await client.query(
+        `INSERT INTO attendance_employees(company_id,employee_number,full_name,user_id,site_id,schedule_id,job_title,phone,active,effective_from,effective_to)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,true,'2026-09-03',null)
          ON CONFLICT(company_id,employee_number) DO UPDATE SET full_name=EXCLUDED.full_name,user_id=EXCLUDED.user_id,site_id=EXCLUDED.site_id,
-           schedule_id=EXCLUDED.schedule_id,job_title=EXCLUDED.job_title,active=true,effective_from='2026-09-03',effective_to=null,updated_at=now()`,
-        [COMPANY_ID,number,name,user?.id||null,siteRows[siteCode].id,schedules[schedule].id,number===27?"Directeur":""]
+           schedule_id=EXCLUDED.schedule_id,job_title=EXCLUDED.job_title,phone=EXCLUDED.phone,active=true,
+           effective_from='2026-09-03',effective_to=null,updated_at=now() RETURNING id`,
+        [COMPANY_ID,number,name,user?.id||null,siteRows[siteCode].id,schedules[schedule].id,
+         salary?.[1] || (number===27?"Directeur":""),salary?.[0] || ""]
+      )).rows[0];
+      if (salary) await client.query(
+        `INSERT INTO attendance_salary_settings_v2(company_id,employee_id,monthly_salary,daily_rate,basis_days,effective_from,set_by)
+         VALUES($1,$2,$3,$4,30,'2026-09-03',$5)
+         ON CONFLICT(employee_id,effective_from) DO UPDATE SET monthly_salary=EXCLUDED.monthly_salary,
+           daily_rate=EXCLUDED.daily_rate,basis_days=30,set_by=EXCLUDED.set_by,updated_at=now()`,
+        [COMPANY_ID,employee.id,salary[2],salary[3],actor.id]
       );
     }
     await client.query(`DELETE FROM attendance_operator_scopes WHERE company_id=$1`,[COMPANY_ID]);
@@ -167,6 +212,12 @@ async function main() {
       `INSERT INTO attendance_salary_viewers(company_id,user_id,reason) VALUES($1,$2,'Directeur') ON CONFLICT(company_id,user_id) DO UPDATE SET reason=EXCLUDED.reason`,
       [COMPANY_ID,director.id]
     );
+    if (accountant) await client.query(
+      `INSERT INTO attendance_payroll_authorizations(company_id,user_id,can_prepare,can_pay,reason)
+       VALUES($1,$2,true,true,'Comptable désigné')
+       ON CONFLICT(company_id,user_id) DO UPDATE SET can_prepare=true,can_pay=true,reason=EXCLUDED.reason`,
+      [COMPANY_ID,accountant.id]
+    );
     await client.query(
       `INSERT INTO attendance_company_configuration(company_id,official_start_at,timezone,updated_by)
        VALUES($1,'2026-09-03 08:00:00+00','Africa/Bamako',$2)
@@ -174,7 +225,7 @@ async function main() {
       [COMPANY_ID,actor.id]
     );
     await client.query("COMMIT");
-    console.log("\nCONFIGURATION APPLIQUÉE — 27 employés, 3 sites, horaires et opérateurs. Salaires laissés vides.");
+    console.log("\nCONFIGURATION APPLIQUÉE — 27 employés, 3 sites, horaires et opérateurs. 26 salaires chargés; directeur en attente.");
   } catch (error) {
     await client.query("ROLLBACK").catch(()=>{});
     throw error;

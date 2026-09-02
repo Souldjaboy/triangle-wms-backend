@@ -76,6 +76,7 @@ function stripSalary(employee, allowed) {
   if (allowed) return employee;
   const clean = { ...employee };
   delete clean.daily_rate;
+  delete clean.monthly_salary;
   delete clean.salary_earned;
   delete clean.salary_adjustments;
   delete clean.salary_payable;

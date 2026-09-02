@@ -17932,7 +17932,10 @@ app.use(
 const createAttendanceWorkforceRouter = require("./routes/attendance-workforce");
 app.use(
   "/",
-  createAttendanceWorkforceRouter({ pool, authenticateToken, getEffectiveCompanyId })
+  createAttendanceWorkforceRouter({
+    pool, authenticateToken, getEffectiveCompanyId,
+    nextAccountingNumber, createAccountingEntry,
+  })
 );
 
 const createInventoryImportRouter = require("./routes/inventory-import");
