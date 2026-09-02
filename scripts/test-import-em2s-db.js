@@ -603,6 +603,44 @@ async function main() {
     verifier("les recréer n'en ajoute aucun", rejeuProduits.corps.crees === 0,
       `${rejeuProduits.corps.crees}`);
 
+    console.log("  — prévalidation et confirmation explicite —");
+    const prevalidation = await envoyer("/stock/import-em2s/movements/prevalidation",
+      jImport, {}, CLASSEUR, chezTriangle);
+    verifier("la prévalidation classe sans rien écrire", prevalidation.statut === 200,
+      `statut ${prevalidation.statut}`);
+    const cl = prevalidation.corps.classement || {};
+    verifier("elle sépare prêtes et bloquées",
+      typeof cl.pretes === "number" && typeof cl.bloquees === "number"
+        && cl.pretes + cl.bloquees + cl.dejaFaits === cl.total,
+      JSON.stringify({ t: cl.total, p: cl.pretes, b: cl.bloquees, d: cl.dejaFaits }));
+    verifier("chaque ligne bloquée dit pourquoi",
+      (cl.listeBloquees || []).every((l) => l.motif), JSON.stringify((cl.listeBloquees || [])[0]));
+    verifier("les quantités prêtes sont annoncées",
+      typeof cl.quantiteEntreePrete === "number" && typeof cl.quantiteSortiePrete === "number",
+      JSON.stringify({ e: cl.quantiteEntreePrete, s: cl.quantiteSortiePrete }));
+    verifier("la prévalidation ne touche pas au stock",
+      (await stockTotal(TRIANGLE.id)) === stockAvant);
+
+    /* Sans confirmation, un lot qui contient des lignes bloquées n'écrit RIEN :
+       c'est la garantie que « sept écrites, trois refusées » ne peut pas
+       survenir dans le dos de l'utilisateur. */
+    if (cl.bloquees > 0) {
+      const stockAvantRefus = await stockTotal(TRIANGLE.id);
+      const mvtAvantRefus = await nbMouvements(TRIANGLE.id);
+      const sansConfirmation = await envoyer("/stock/import-em2s/movements", jImport,
+        { sha256: apercu.fichier.sha256 }, CLASSEUR, chezTriangle);
+      verifier("sans confirmation, un lot partiellement bloqué est refusé",
+        sansConfirmation.statut === 409
+          && sansConfirmation.corps.code === "PARTIAL_CONFIRMATION_REQUIRED",
+        `statut ${sansConfirmation.statut} ${sansConfirmation.corps.code}`);
+      verifier("le refus montre le classement complet",
+        sansConfirmation.corps.classement
+          && sansConfirmation.corps.classement.listeBloquees.length === cl.bloquees);
+      verifier("et n'écrit aucun mouvement",
+        (await stockTotal(TRIANGLE.id)) === stockAvantRefus
+          && (await nbMouvements(TRIANGLE.id)) === mvtAvantRefus);
+    }
+
     const simulation = await envoyer("/stock/import-em2s/movements", jImport,
       { sha256: apercu.fichier.sha256, simulation: "1" }, CLASSEUR, chezTriangle);
     verifier("la simulation rend un rapport", simulation.statut === 200 && simulation.corps.simulation === true,
@@ -612,26 +650,42 @@ async function main() {
       `${stockAvant} → ${await stockTotal(TRIANGLE.id)}`);
 
     const reel = await envoyer("/stock/import-em2s/movements", jImport,
-      { sha256: apercu.fichier.sha256 }, CLASSEUR, chezTriangle);
+      { sha256: apercu.fichier.sha256, importerLignesPretes: "1" }, CLASSEUR, chezTriangle);
     verifier("l'écriture des mouvements aboutit", reel.statut === 201,
       `statut ${reel.statut} ${JSON.stringify(reel.corps).slice(0, 160)}`);
 
     const rapport = reel.corps.rapport || {};
-    verifier("le rapport distingue écrits, bloqués et ignorés",
-      typeof rapport.ecrits === "number" && typeof rapport.bloques === "number",
-      JSON.stringify({ e: rapport.ecrits, b: rapport.bloques, i: rapport.ignores }));
+    verifier("le rapport distingue écrits et bloqués",
+      typeof rapport.ecrits === "number" && typeof rapport.bloquees === "number",
+      JSON.stringify({ e: rapport.ecrits, b: rapport.bloquees }));
     verifier("les lignes encore bloquées n'ont rien écrit",
       (rapport.details || []).filter((d) => d.etat === "bloqué")
         .every((d) => d.quantite === undefined));
 
+    /* Un second passage peut légitimement écrire : une sortie bloquée faute
+       de stock devient possible une fois l'entrée passée. Ce qui ne doit
+       JAMAIS arriver, c'est qu'un mouvement déjà écrit le soit deux fois. */
     const rejeu = await envoyer("/stock/import-em2s/movements", jImport,
-      { sha256: apercu.fichier.sha256 }, CLASSEUR, chezTriangle);
-    verifier("rejouer l'écriture n'ajoute aucun mouvement",
-      rejeu.statut === 201 && (rejeu.corps.rapport?.ecrits || 0) === 0,
-      `${rejeu.corps.rapport?.ecrits} écrit(s)`);
-    verifier("le stock est le même après le rejeu",
-      Number(rejeu.corps.stockAvant) === Number(rejeu.corps.stockApres),
-      `${rejeu.corps.stockAvant} → ${rejeu.corps.stockApres}`);
+      { sha256: apercu.fichier.sha256, importerLignesPretes: "1" }, CLASSEUR, chezTriangle);
+    verifier("une ligne débloquée par le premier passage peut enfin s'écrire",
+      rejeu.statut === 201, `statut ${rejeu.statut}`);
+
+    const troisieme = await envoyer("/stock/import-em2s/movements", jImport,
+      { sha256: apercu.fichier.sha256, importerLignesPretes: "1" }, CLASSEUR, chezTriangle);
+    verifier("une fois tout écrit, un passage de plus n'ajoute rien",
+      (troisieme.corps.rapport?.ecrits || 0) === 0,
+      `${troisieme.corps.rapport?.ecrits} écrit(s)`);
+    verifier("le stock ne bouge plus au passage suivant",
+      Number(troisieme.corps.stockAvant) === Number(troisieme.corps.stockApres),
+      `${troisieme.corps.stockAvant} → ${troisieme.corps.stockApres}`);
+
+    const cles = await pool.query(
+      `SELECT count(*)::int AS total,
+              count(DISTINCT idempotency_key)::int AS distinctes
+         FROM stock_import_operations WHERE company_id = $1 AND kind = 'MOVEMENT'`,
+      [TRIANGLE.id]);
+    verifier("aucun mouvement n'a été écrit deux fois",
+      cles.rows[0].total === cles.rows[0].distinctes, JSON.stringify(cles.rows[0]));
 
     verifier("la réconciliation constate sans corriger",
       reel.corps.reconciliation && typeof reel.corps.reconciliation.ecarts === "number",
@@ -649,16 +703,17 @@ async function main() {
       (rapport.details || []).some((d) => d.etat === "écrit" && d.bac),
       JSON.stringify((rapport.details || []).filter((d) => d.etat === "écrit").slice(0, 2)));
 
-    /* Une sortie qui dépasse le disponible est refusée ligne par ligne, sans
-       faire tomber les autres. */
-    const refuses = (rapport.details || []).filter((d) => d.etat === "refusé");
-    verifier("une sortie sans stock est refusée sans annuler le lot",
-      rapport.refuses === undefined || rapport.refuses === refuses.length,
-      `${rapport.refuses} refus`);
-    if (refuses.length) {
-      verifier("le refus dit pourquoi",
-        refuses.every((d) => d.motif && d.code), JSON.stringify(refuses[0]).slice(0, 140));
-    }
+    /* Les lignes bloquées sont restées en attente : elles n'ont ni été
+       écrites, ni perdues, ni marquées faites. */
+    verifier("les lignes bloquées restent en attente",
+      (reel.corps.rapport?.bloquees || 0) === (reel.corps.classement?.bloquees || 0),
+      `${reel.corps.rapport?.bloquees} / ${reel.corps.classement?.bloquees}`);
+    const clesBloquees = await pool.query(
+      `SELECT count(*)::int AS n FROM stock_import_operations
+        WHERE company_id = $1 AND kind = 'MOVEMENT' AND movement_id IS NULL`,
+      [TRIANGLE.id]);
+    verifier("aucune clé d'idempotence n'est consommée sans mouvement",
+      clesBloquees.rows[0].n === 0, `${clesBloquees.rows[0].n} clé(s) orpheline(s)`);
 
     const mouvementsEnBase = await pool.query(
       `SELECT count(*)::int AS n,
@@ -667,6 +722,89 @@ async function main() {
     verifier("les mouvements écrits portent leur date métier",
       mouvementsEnBase.rows[0].n === 0 || mouvementsEnBase.rows[0].datees > 0,
       JSON.stringify(mouvementsEnBase.rows[0]));
+  }
+
+  console.log("\n▸ ATOMICITÉ DU LOT");
+  {
+    /* On éprouve la promesse la plus difficile à tenir : si la quatrième
+       ligne d'un lot échoue pour une raison technique, aucune des trois
+       précédentes ne doit rester écrite.
+
+       Le déclencheur ci-dessous fait échouer la Nième insertion de mouvement
+       de la transaction. Il vit le temps du test, et disparaît ensuite. */
+    const dejaEcrits = Number((await pool.query(
+      `SELECT count(*)::int AS n FROM stock_movements WHERE company_id = $1`,
+      [TRIANGLE.id])).rows[0].n);
+
+    /* On efface les clés pour que le lot repasse, puis on fait échouer la
+       quatrième écriture. Le seuil est figé dans le corps de la fonction :
+       un réglage de session ne suivrait pas jusqu'au serveur. */
+    await pool.query(
+      `DELETE FROM stock_import_operations WHERE company_id = $1 AND kind = 'MOVEMENT'`,
+      [TRIANGLE.id]);
+
+    /* L'état de référence se relève APRÈS ce nettoyage : sinon on comparerait
+       l'après-panne à un avant qui n'existe plus. */
+    const etatAvant = await pool.query(
+      `SELECT (SELECT COALESCE(SUM(quantity),0)::numeric FROM stock_location_balances
+                WHERE company_id = $1) AS stock,
+              (SELECT count(*)::int FROM stock_movements WHERE company_id = $1) AS mouvements,
+              (SELECT count(*)::int FROM stock_import_operations
+                WHERE company_id = $1 AND kind = 'MOVEMENT') AS cles`,
+      [TRIANGLE.id]);
+
+    const seuil = dejaEcrits + 3;
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION essai_panne_mouvement() RETURNS trigger AS $$
+      DECLARE n integer;
+      BEGIN
+        SELECT count(*) INTO n FROM stock_movements WHERE company_id = NEW.company_id;
+        IF n >= ${seuil} THEN
+          RAISE EXCEPTION 'panne technique simulée sur le mouvement %', n + 1;
+        END IF;
+        RETURN NEW;
+      END $$ LANGUAGE plpgsql;`);
+    await pool.query(`DROP TRIGGER IF EXISTS essai_panne_trg ON stock_movements`);
+    await pool.query(
+      `CREATE TRIGGER essai_panne_trg BEFORE INSERT ON stock_movements
+         FOR EACH ROW EXECUTE FUNCTION essai_panne_mouvement()`);
+
+    const avecPanne = await envoyer("/stock/import-em2s/movements", jImport,
+      { sha256: apercu.fichier.sha256, importerLignesPretes: "1" }, CLASSEUR, chezTriangle);
+
+    await pool.query(`DROP TRIGGER IF EXISTS essai_panne_trg ON stock_movements`);
+    await pool.query(`DROP FUNCTION IF EXISTS essai_panne_mouvement()`);
+
+    const etatApres = await pool.query(
+      `SELECT (SELECT COALESCE(SUM(quantity),0)::numeric FROM stock_location_balances
+                WHERE company_id = $1) AS stock,
+              (SELECT count(*)::int FROM stock_movements WHERE company_id = $1) AS mouvements,
+              (SELECT count(*)::int FROM stock_import_operations
+                WHERE company_id = $1 AND kind = 'MOVEMENT') AS cles`,
+      [TRIANGLE.id]);
+
+    const aPlante = avecPanne.statut >= 400;
+    verifier("une panne technique fait échouer la requête", aPlante,
+      `statut ${avecPanne.statut}`);
+    if (aPlante) {
+      verifier("aucun mouvement du lot n'a survécu",
+        Number(etatApres.rows[0].mouvements) === Number(etatAvant.rows[0].mouvements),
+        `${etatAvant.rows[0].mouvements} → ${etatApres.rows[0].mouvements}`);
+      verifier("le stock est revenu à son état d'avant",
+        Number(etatApres.rows[0].stock) === Number(etatAvant.rows[0].stock),
+        `${etatAvant.rows[0].stock} → ${etatApres.rows[0].stock}`);
+      verifier("aucune clé d'idempotence n'est restée consommée",
+        Number(etatApres.rows[0].cles) === Number(etatAvant.rows[0].cles),
+        `${etatAvant.rows[0].cles} → ${etatApres.rows[0].cles}`);
+    }
+
+    /* Après la panne, un import normal doit repasser sans rien avoir perdu. */
+    const reprise = await envoyer("/stock/import-em2s/movements", jImport,
+      { sha256: apercu.fichier.sha256, importerLignesPretes: "1" }, CLASSEUR, chezTriangle);
+    verifier("l'import repasse une fois la panne écartée", reprise.statut === 201,
+      `statut ${reprise.statut}`);
+    verifier("et réécrit bien les lignes prêtes",
+      (reprise.corps.rapport?.ecrits || 0) > 0, `${reprise.corps.rapport?.ecrits}`);
   }
 
   console.log("\n▸ CORRIGER UNE DATE APRÈS IMPRESSION");
@@ -713,18 +851,21 @@ async function main() {
 
   console.log("\n▸ BILAN");
   {
-    /* Le stock a pu bouger — c'est le but de l'écriture des mouvements. Ce
-       qui doit rester vrai, c'est qu'il n'a bougé QUE par des mouvements
-       tracés : autant de quantité écrite que de quantité constatée. */
+    /* Le stock a pu bouger — c'est le but de l'écriture des mouvements. Ce qui
+       doit rester vrai, c'est qu'il n'a bougé QUE par des mouvements
+       enregistrés : on compare au journal des mouvements lui-même, seule
+       source qui survive au scénario de panne (lequel efface volontairement
+       des clés d'import). */
     const parMouvements = Number((await pool.query(
-      `SELECT COALESCE(SUM(CASE WHEN movement_kind = 'Entrée' THEN quantity
-                                ELSE -quantity END), 0)::numeric AS q
-         FROM stock_import_operations
-        WHERE company_id = $1 AND kind = 'MOVEMENT' AND movement_id IS NOT NULL`,
+      `SELECT COALESCE(SUM(CASE WHEN type ILIKE 'entr%' THEN quantity
+                                WHEN type ILIKE 'sorti%' THEN -quantity
+                                ELSE 0 END), 0)::numeric AS q
+         FROM stock_movements WHERE company_id = $1`,
       [TRIANGLE.id])).rows[0].q);
-    verifier("le stock n'a bougé que par des mouvements tracés",
+    verifier("le stock n'a bougé que par des mouvements enregistrés",
       (await stockTotal(TRIANGLE.id)) === stockAvant + parMouvements,
       `${stockAvant} + ${parMouvements} ≠ ${await stockTotal(TRIANGLE.id)}`);
+
     verifier("aucun stock négatif n'est apparu",
       Number((await pool.query(
         `SELECT count(*)::int AS n FROM stock_location_balances WHERE quantity < 0`)).rows[0].n) === 0);

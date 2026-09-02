@@ -139,75 +139,69 @@ async function emplacementDuBac(client, companyId, ligne, bin) {
   return null;
 }
 
-/* ═══════════════════════════════════════════════════ ÉCRITURE ══ */
+/* ═════════════════════════════════════════════ PRÉVALIDATION ══ */
 
 /**
- * Écrit les mouvements exploitables d'un aperçu.
+ * Classe chaque mouvement AVANT toute écriture : prêt, ou bloqué avec son
+ * motif exact.
  *
- * `client` est déjà dans une transaction : si une ligne échoue, tout le lot
- * est annulé. Aucun demi-mouvement, aucune balance incohérente.
+ * C'est le cœur de la garantie promise à l'utilisateur. Écrire sept lignes et
+ * en refuser trois au passage, après qu'il a cliqué « importer », lui fait
+ * croire que tout est passé. Il doit voir la liste des refusées AVANT, et
+ * choisir explicitement de laisser celles-là en attente.
  *
- * @returns compte-rendu détaillé, ligne par ligne
+ * Aucune clé d'idempotence n'est posée ici : une ligne qu'on n'écrit pas ne
+ * doit jamais être tenue pour faite.
  */
-async function ecrireMouvements(client, {
-  companyId, batchId, sha, apercu, utilisateur, limite = null,
-}) {
+async function classer(client, { companyId, sha, apercu }) {
   const anomalies = await anomaliesOuvertes(client, { companyId, sha });
+  const pretes = [];
+  const bloquees = [];
+  const dejaFaits = [];
 
-  const rapport = {
-    ecrits: 0, ignores: 0, dejaFaits: 0, bloques: 0, refuses: 0,
-    quantiteEntree: 0, quantiteSortie: 0, details: [],
-  };
+  const bloquer = (m, motif, extra = {}) => bloquees.push({
+    ligne: `${m.provenance.feuille}:${m.provenance.ligne}`,
+    article: m.description, sens: m.sens, quantite: m.quantite,
+    date: m.date, motif, ...extra,
+  });
 
   for (const m of apercu.mouvements.liste) {
     const cleLigne = `${m.provenance.feuille}:${m.provenance.ligne}`;
     const etat = anomalies.get(cleLigne) || { ouvertes: [], resolues: [] };
 
     if (etat.ouvertes.length > 0) {
-      rapport.bloques += 1;
-      rapport.details.push({ ligne: cleLigne, article: m.description,
-        etat: "bloqué", motifs: etat.ouvertes.map((a) => a.anomaly_type) });
+      bloquer(m, "anomalie non tranchée", { motifs: etat.ouvertes.map((a) => a.anomaly_type) });
       continue;
     }
-
     if (m.dejaImporte) {
-      rapport.dejaFaits += 1;
-      rapport.details.push({ ligne: cleLigne, article: m.description, etat: "déjà importé" });
+      dejaFaits.push({ ligne: cleLigne, article: m.description });
       continue;
     }
-
     if (!m.produit) {
-      rapport.ignores += 1;
-      rapport.details.push({ ligne: cleLigne, article: m.description,
-        etat: "sans produit — la correspondance doit être confirmée d'abord" });
+      bloquer(m, "produit inconnu — la correspondance doit être confirmée d'abord");
       continue;
     }
 
-    /* Les décisions prises sur cette ligne, s'il y en a eu. */
     const decisions = {};
-    for (const a of etat.resolues) {
-      Object.assign(decisions, a.resolution || {});
-    }
+    for (const a of etat.resolues) Object.assign(decisions, a.resolution || {});
 
     const parts = decomposer(m, decisions);
     if (parts === null) {
-      rapport.bloques += 1;
-      rapport.details.push({ ligne: cleLigne, article: m.description,
-        etat: "en attente — indiquez par quel bac ce mouvement est passé",
-        bacsPossibles: m.bins });
+      bloquer(m, "le bac du mouvement n'est pas indiqué", { bacsPossibles: m.bins });
       continue;
     }
+
     const sommeParts = parts.reduce((s, p) => s + p.quantite, 0);
     if (sommeParts !== m.quantite) {
-      /* Garde-fou : la décomposition ne doit jamais créer ni perdre d'unité.
-         Si elle le fait, c'est un défaut de notre côté, pas une donnée à
-         corriger — on refuse le lot entier plutôt que d'écrire un stock faux. */
-      const e = new Error(
-        `Décomposition incohérente pour « ${m.description} » (${cleLigne}) : `
-        + `${sommeParts} au lieu de ${m.quantite}.`);
-      e.httpStatus = 500; e.code = "DECOMPOSITION_MISMATCH";
-      throw e;
+      bloquer(m, `décomposition incohérente : ${sommeParts} au lieu de ${m.quantite}`);
+      continue;
     }
+
+    /* Chaque part doit trouver son emplacement, et une sortie doit trouver de
+       quoi sortir. On le vérifie ici, à froid : découvrir le manque au moment
+       d'écrire obligerait à défaire ce qui vient d'être fait. */
+    const resolues = [];
+    let refus = null;
 
     for (const part of parts) {
       const emplacement = part.bin
@@ -215,22 +209,96 @@ async function ecrireMouvements(client, {
         : (m.emplacement || null);
 
       if (!emplacement) {
-        rapport.ignores += 1;
-        rapport.details.push({ ligne: cleLigne, article: m.description,
-          etat: `emplacement introuvable${part.bin ? ` pour ${part.bin}` : ""}` });
-        continue;
+        refus = { motif: `emplacement introuvable${part.bin ? ` pour ${part.bin}` : ""}`,
+                  bac: part.bin };
+        break;
       }
 
+      if (m.sens === "Sortie") {
+        const { rows } = await client.query(
+          `SELECT COALESCE(quantity, 0)::numeric AS quantite,
+                  COALESCE(reserved_quantity, 0)::numeric AS reserve
+             FROM stock_location_balances
+            WHERE company_id = $1 AND product_id = $2 AND location_id = $3`,
+          [companyId, m.produit.id, emplacement.id]
+        );
+        const presente = Number(rows[0]?.quantite || 0);
+        const reservee = Number(rows[0]?.reserve || 0);
+        const disponible = presente - reservee;
+        if (disponible < part.quantite) {
+          refus = {
+            motif: `stock insuffisant en ${emplacement.full_code} : `
+                 + `${part.quantite} demandé(s), ${disponible} disponible(s)`,
+            bac: part.bin, presente, reservee, disponible,
+          };
+          break;
+        }
+      }
+
+      resolues.push({ ...part, emplacement });
+    }
+
+    if (refus) { bloquer(m, refus.motif, refus); continue; }
+
+    pretes.push({ mouvement: m, cleLigne, parts: resolues });
+  }
+
+  const somme = (sens) => pretes
+    .filter((p) => p.mouvement.sens === sens)
+    .reduce((s, p) => s + p.parts.reduce((t, x) => t + x.quantite, 0), 0);
+
+  return {
+    total: apercu.mouvements.liste.length,
+    pretes: pretes.length,
+    bloquees: bloquees.length,
+    dejaFaits: dejaFaits.length,
+    quantiteEntreePrete: somme("Entrée"),
+    quantiteSortiePrete: somme("Sortie"),
+    listePretes: pretes.map((p) => ({
+      ligne: p.cleLigne, article: p.mouvement.description,
+      sens: p.mouvement.sens, quantite: p.mouvement.quantite, date: p.mouvement.date,
+      repartition: p.parts.map((x) => ({ bac: x.bin, quantite: x.quantite,
+                                         emplacement: x.emplacement.full_code, date: x.date })),
+    })),
+    listeBloquees: bloquees,
+    listeDejaFaites: dejaFaits,
+    /* Interne : porte les emplacements déjà résolus, pour ne pas les rechercher
+       une seconde fois au moment d'écrire. */
+    _pretes: pretes,
+  };
+}
+
+/* ═══════════════════════════════════════════════════ ÉCRITURE ══ */
+
+/**
+ * Écrit les lignes déclarées prêtes par `classer`, et elles seules.
+ *
+ * `client` est déjà dans une transaction : une erreur inattendue sur la
+ * quatrième ligne annule les trois premières. Les lignes bloquées n'entrent
+ * jamais dans cette transaction — elles restent en attente, intactes.
+ */
+async function ecrireMouvements(client, {
+  companyId, batchId, sha, classement, utilisateur,
+}) {
+  const rapport = {
+    ecrits: 0, dejaFaits: 0, bloquees: classement.bloquees,
+    quantiteEntree: 0, quantiteSortie: 0, details: [],
+  };
+
+  for (const prete of classement._pretes) {
+    const m = prete.mouvement;
+
+    for (const part of prete.parts) {
       const cle = D.cleIdempotence({
         sha, kind: "MOVEMENT", libelle: m.description, sens: m.sens,
         quantite: part.quantite, date: part.date,
-        emplacement: `${emplacement.id}`,
+        emplacement: `${part.emplacement.id}`,
         feuille: m.provenance.feuille, ligne: m.provenance.ligne,
       });
 
-      /* La clé est posée AVANT le mouvement : si elle existe déjà, on n'a
-         rien écrit et on passe. C'est la base qui tranche, pas une lecture
-         préalable qui pourrait être doublée par deux requêtes simultanées. */
+      /* La clé est posée avant le mouvement : c'est la base qui refuse le
+         doublon, pas une lecture préalable que deux requêtes simultanées
+         pourraient doubler. */
       const { rowCount } = await client.query(
         `INSERT INTO stock_import_operations
            (company_id, batch_id, idempotency_key, kind, file_sha256, excel_sheet,
@@ -240,45 +308,26 @@ async function ecrireMouvements(client, {
          ON CONFLICT (company_id, idempotency_key) DO NOTHING
          RETURNING id`,
         [companyId, batchId, cle, sha, m.provenance.feuille, m.provenance.ligne,
-         m.provenance.cellule, m.produit.id, m.description, emplacement.id,
-         emplacement.full_code, m.sens, part.quantite, part.date,
+         m.provenance.cellule, m.produit.id, m.description, part.emplacement.id,
+         part.emplacement.full_code, m.sens, part.quantite, part.date,
          utilisateur?.id || null]
       );
 
-      if (rowCount === 0) {
-        rapport.dejaFaits += 1;
-        continue;
-      }
+      if (rowCount === 0) { rapport.dejaFaits += 1; continue; }
 
       const options = {
-        companyId, productId: m.produit.id, locationId: emplacement.id,
+        companyId, productId: m.produit.id, locationId: part.emplacement.id,
         quantity: part.quantite, user: utilisateur,
         reason: `Import ${sha.slice(0, 12)} — ${m.provenance.feuille}:${m.provenance.ligne}`,
       };
 
-      /* Une sortie qui dépasse le disponible est une CONDITION des données,
-         pas un défaut du programme : elle doit se signaler ligne par ligne,
-         pas faire échouer les cent autres. On retire la clé posée juste avant,
-         sinon la ligne serait tenue pour faite et ne repasserait jamais. */
-      let out;
-      try {
-        out = m.sens === "Entrée"
-          ? await L.entryAtLocation(client, options)
-          : await L.exitFromLocation(client, options);
-      } catch (erreur) {
-        if (!REFUS_METIER.has(erreur.code)) throw erreur;
-        await client.query(
-          `DELETE FROM stock_import_operations
-            WHERE company_id = $1 AND idempotency_key = $2 AND movement_id IS NULL`,
-          [companyId, cle]);
-        rapport.refuses += 1;
-        rapport.details.push({ ligne: cleLigne, article: m.description,
-          etat: "refusé", motif: erreur.message, code: erreur.code,
-          sens: m.sens, quantite: part.quantite, bac: part.bin });
-        continue;
-      }
+      /* Aucun refus métier n'est rattrapé ici : `classer` les a tous écartés
+         en amont. Ce qui survient encore est inattendu, et doit annuler tout
+         le lot plutôt que d'écrire à moitié. */
+      const out = m.sens === "Entrée"
+        ? await L.entryAtLocation(client, options)
+        : await L.exitFromLocation(client, options);
 
-      /* La date métier du classeur, pas celle de la frappe. */
       if (part.date && out.movement?.id) {
         await client.query(
           `UPDATE stock_movements
@@ -298,13 +347,11 @@ async function ecrireMouvements(client, {
       if (m.sens === "Entrée") rapport.quantiteEntree += part.quantite;
       else rapport.quantiteSortie += part.quantite;
       rapport.details.push({
-        ligne: cleLigne, article: m.description, etat: "écrit",
+        ligne: prete.cleLigne, article: m.description, etat: "écrit",
         sens: m.sens, quantite: part.quantite, bac: part.bin,
-        emplacement: emplacement.full_code, date: part.date,
+        emplacement: part.emplacement.full_code, date: part.date,
         stockAvant: out.stockBefore, stockApres: out.stockAfter,
       });
-
-      if (limite && rapport.ecrits >= limite) return rapport;
     }
   }
 
@@ -359,5 +406,5 @@ async function reconcilier(client, { companyId, apercu }) {
   };
 }
 
-module.exports = { BLOQUANTES, anomaliesOuvertes, decomposer, emplacementDuBac,
-                   ecrireMouvements, reconcilier };
+module.exports = { BLOQUANTES, REFUS_METIER, anomaliesOuvertes, decomposer,
+                   emplacementDuBac, classer, ecrireMouvements, reconcilier };

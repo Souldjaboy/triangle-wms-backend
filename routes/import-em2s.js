@@ -533,6 +533,9 @@ module.exports = function createImportEm2sRouter(deps) {
         const { buffer, nom } = fichierDe(req);
         const attendue = String(req.body?.sha256 || "").trim().toLowerCase();
         const simulation = String(req.body?.simulation || "") === "1";
+        /* Ce drapeau ne se coche jamais tout seul : c'est l'utilisateur qui
+           décide de laisser des lignes en attente. */
+        const importerPartiel = String(req.body?.importerLignesPretes || "") === "1";
 
         const out = await transaction(async (client) => {
           const apercu = await D.previsualiser(client, { companyId, buffer, nomFichier: nom });
@@ -552,13 +555,31 @@ module.exports = function createImportEm2sRouter(deps) {
             e.httpStatus = 409; e.code = "BATCH_REQUIRED"; throw e;
           }
 
+          /* Premier temps : on classe, sans rien écrire ni réserver. */
+          const classement = await M.classer(client, {
+            companyId, sha: apercu.fichier.sha256, apercu,
+          });
+          const { _pretes, ...vueClassement } = classement;
+
+          /* Des lignes ne passeront pas. On refuse d'écrire les autres tant
+             que l'utilisateur ne l'a pas dit explicitement : sinon il croirait
+             que tout est passé alors qu'une partie attend encore. */
+          if (classement.bloquees > 0 && !importerPartiel && !simulation) {
+            const e = new Error(
+              `${classement.bloquees} ligne(s) ne peuvent pas être importées. `
+              + "Choisissez d'importer uniquement les lignes prêtes, ou corrigez d'abord.");
+            e.httpStatus = 409; e.code = "PARTIAL_CONFIRMATION_REQUIRED";
+            e.classement = vueClassement;
+            throw e;
+          }
+
           const avant = await client.query(
             `SELECT COALESCE(SUM(quantity),0)::numeric AS stock FROM stock_location_balances
               WHERE company_id = $1`, [companyId]);
 
           const rapport = await M.ecrireMouvements(client, {
             companyId, batchId: lots[0].id, sha: apercu.fichier.sha256,
-            apercu, utilisateur: utilisateurDe(req),
+            classement, utilisateur: utilisateurDe(req),
           });
 
           const apres = await client.query(
@@ -567,16 +588,16 @@ module.exports = function createImportEm2sRouter(deps) {
 
           const reconciliation = await M.reconcilier(client, { companyId, apercu });
 
-          /* Une simulation lit tout, écrit tout, puis annule : c'est la seule
-             façon de montrer le résultat exact sans le subir. */
+          /* Une simulation écrit tout puis annule : c'est la seule façon de
+             montrer le résultat exact sans le subir. */
           if (simulation) {
             const e = new Error("SIMULATION");
-            e.simulation = { rapport, reconciliation,
+            e.simulation = { classement: vueClassement, rapport, reconciliation,
               stockAvant: Number(avant.rows[0].stock), stockApres: Number(apres.rows[0].stock) };
             throw e;
           }
 
-          return { batchId: lots[0].id, rapport, reconciliation,
+          return { batchId: lots[0].id, classement: vueClassement, rapport, reconciliation,
                    stockAvant: Number(avant.rows[0].stock),
                    stockApres: Number(apres.rows[0].stock) };
         }).catch((e) => {
@@ -585,7 +606,37 @@ module.exports = function createImportEm2sRouter(deps) {
         });
 
         res.status(out.simulation ? 200 : 201).json({ success: true, ...out });
-      } catch (e) { echec(res, e, "Erreur d'écriture des mouvements."); }
+      } catch (e) {
+        if (e.code === "PARTIAL_CONFIRMATION_REQUIRED") {
+          return res.status(409).json({
+            error: e.message, code: e.code, classement: e.classement,
+            action: "Renvoyez la demande avec importerLignesPretes=1 pour "
+                  + "importer uniquement les lignes prêtes et laisser les autres en attente.",
+          });
+        }
+        echec(res, e, "Erreur d'écriture des mouvements.");
+      }
+    });
+
+  /**
+   * Le classement seul, sans rien écrire : ce que l'écran montre avant de
+   * demander confirmation.
+   */
+  router.post("/stock/import-em2s/movements/prevalidation", authenticateToken, peutLire,
+    upload.single("file"), async (req, res) => {
+      const companyId = await societeDe(req);
+      if (!companyId) return sansSociete(res);
+      const client = await pool.connect();
+      try {
+        const { buffer, nom } = fichierDe(req);
+        const apercu = await D.previsualiser(client, { companyId, buffer, nomFichier: nom });
+        const classement = await M.classer(client, {
+          companyId, sha: apercu.fichier.sha256, apercu,
+        });
+        const { _pretes, ...vue } = classement;
+        res.json({ success: true, fichier: apercu.fichier, classement: vue });
+      } catch (e) { echec(res, e, "Erreur de prévalidation."); }
+      finally { client.release(); }
     });
 
   /* ───────────────────────────────────────────────── réconciliation ── */
