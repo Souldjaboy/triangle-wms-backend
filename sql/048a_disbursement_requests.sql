@@ -13,6 +13,8 @@ CREATE TABLE IF NOT EXISTS disbursement_requests (
   category TEXT,
   urgency TEXT DEFAULT 'normale',
   reason TEXT NOT NULL DEFAULT '',
+  disbursement_comment TEXT DEFAULT '';
+
   description TEXT DEFAULT '',
   status TEXT DEFAULT 'brouillon',
   payment_method TEXT,
