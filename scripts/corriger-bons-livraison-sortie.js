@@ -102,29 +102,11 @@ async function empreinteStock(client) {
   return rows[0];
 }
 
-/**
- * Le numéro suivant de la série, EXACTEMENT comme `nextShortDocumentNumber`
- * dans server.js : mêmes colonnes, même clé `PREFIX#AAMMJJ`, même séquence.
- *
- * Cette copie n'est pas un confort : si le script ouvrait sa propre série, il
- * distribuerait des numéros que l'application redonnerait ensuite à d'autres
- * bons. Toute divergence ici se paierait en doublons de numéros en production.
- */
-async function numeroSuivant(client, companyId, prefixe) {
-  const d = new Date();
-  const stamp = String(d.getFullYear()).slice(2)
-    + String(d.getMonth() + 1).padStart(2, "0")
-    + String(d.getDate()).padStart(2, "0");
-  const { rows } = await client.query(
-    `INSERT INTO stock_request_counters (company_id, year, prefix, last_seq)
-     VALUES ($1, $2, $3, 1)
-     ON CONFLICT (company_id, year, prefix)
-     DO UPDATE SET last_seq = stock_request_counters.last_seq + 1
-     RETURNING last_seq`,
-    [companyId || 0, d.getFullYear(), `${prefixe}#${stamp}`]
-  );
-  return `${prefixe}-${stamp}-${String(rows[0].last_seq).padStart(3, "0")}`;
-}
+/* La MÊME série que l'application, pas une copie : une série parallèle
+   distribuerait des numéros que l'application redonnerait ensuite. */
+const { nextShortDocumentNumber } = require("../services/numerotation-documents");
+const numeroSuivant = (client, companyId, prefixe) =>
+  nextShortDocumentNumber(prefixe, companyId, client);
 
 async function main() {
   const params = societeArg ? [Number(societeArg)] : [];

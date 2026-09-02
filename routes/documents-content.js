@@ -162,6 +162,212 @@ module.exports = function createDocumentsContentRouter(deps) {
     } catch (e) { echec(res, e, "Erreur de lecture des mouvements à documenter."); }
   });
 
+  /* ═══════════════════════════ LES ÉVÉNEMENTS À DOCUMENTER ══ */
+
+  /**
+   * Les sorties réelles du dernier import, une fiche par ÉVÉNEMENT.
+   *
+   * `stock_movements.import_id` ne suffit plus. L'ancien chemin d'import
+   * consolidait plusieurs sorties d'un même produit en un seul mouvement :
+   * trois sorties STADE 4 AOUT de 7, 7 et 6 devenaient un mouvement de 20.
+   * Lister les mouvements affiche donc « 20 », un chiffre que personne n'a
+   * sorti en une fois et qu'aucun bon ne peut porter.
+   *
+   * `stock_import_movement_events` décrit les sorties telles qu'elles ont eu
+   * lieu — cellule, date, quantité. C'est cette table qui alimente l'écran.
+   */
+  router.get("/documents/pending-events", authenticateToken, peutVoir, async (req, res) => {
+    const companyId = societeDe(req);
+    if (!companyId) return sansSociete(res);
+    try {
+      const avecHistorique = String(req.query.historique || "") === "1";
+
+      const { rows: dernier } = await pool.query(
+        `SELECT id, file_name, file_hash, created_at FROM inventory_imports
+          WHERE company_id = $1 ORDER BY id DESC LIMIT 1`,
+        [companyId]);
+      const imp = dernier[0] || null;
+
+      const conditions = [
+        "e.company_id = $1",
+        "e.status <> 'CANCELLED'",
+        `NOT EXISTS (SELECT 1 FROM documents d
+                      WHERE d.company_id = e.company_id
+                        AND d.stock_import_movement_event_id = e.id
+                        AND d.cancelled_at IS NULL)`,
+      ];
+      const params = [companyId];
+
+      if (!avecHistorique && imp?.file_hash) {
+        /* Le rattachement passe par l'empreinte du fichier, pas par une date
+           ni par un nom de produit : c'est la seule chose qui identifie le
+           classeur importé sans ambiguïté. */
+        conditions.push(`e.file_sha256 = $${params.push(imp.file_hash)}`);
+      }
+
+      const { rows: evenements } = await pool.query(
+        `SELECT e.id, e.direction, e.quantity, e.effective_date::text AS effective_date,
+                e.excel_sheet, e.excel_row, e.excel_cell, e.event_key, e.status,
+                e.movement_id, e.file_sha256,
+                e.source_context->>'produit'  AS product_name,
+                e.source_context->>'fichier'  AS import_fichier,
+                e.source_context->>'rayon'    AS rayon,
+                e.source_context->>'location' AS location_code,
+                m.product_reference, m.quantity AS quantite_mouvement,
+                COALESCE(w.name, w.code) AS entrepot,
+                (e.file_sha256 = $${params.push(imp?.file_hash || null)}) AS du_dernier_import
+           FROM stock_import_movement_events e
+           LEFT JOIN stock_movements m ON m.id = e.movement_id
+           LEFT JOIN warehouses w ON w.id = m.warehouse_id
+          WHERE ${conditions.join(" AND ")}
+          ORDER BY e.excel_row, e.event_sequence
+          LIMIT ${Math.min(Number(req.query.limite) || 1000, 2000)}`,
+        params);
+
+      /* Cet import a-t-il produit des événements, documentés ou non ?
+         La question n'est pas « reste-t-il quelque chose à faire » : une fois
+         les 21 bons émis, la liste est vide, et retomber alors sur les
+         mouvements consolidés ferait réapparaître à l'écran des lignes de 20
+         que l'on vient précisément de remplacer. */
+      const { rows: compte } = imp?.file_hash ? await pool.query(
+        `SELECT count(*) AS n FROM stock_import_movement_events
+          WHERE company_id = $1 AND file_sha256 = $2`,
+        [companyId, imp.file_hash]) : [{ n: "0" }];
+
+      res.json({
+        success: true,
+        dernierImport: imp,
+        historiqueInclus: avecHistorique,
+        importAvecEvenements: Number(compte[0]?.n || 0) > 0,
+        evenementsDeLImport: Number(compte[0]?.n || 0),
+        total: evenements.length,
+        quantiteTotale: evenements.reduce((s, e) => s + Number(e.quantity), 0),
+        evenements,
+      });
+    } catch (e) { echec(res, e, "Erreur de lecture des événements à documenter."); }
+  });
+
+  /**
+   * Génère un bon par ÉVÉNEMENT, en une transaction.
+   *
+   * La quantité imprimée est celle de l'événement, jamais celle du mouvement
+   * consolidé : c'est toute la différence entre un bon de 7 qu'on peut faire
+   * signer et un bon de 20 qui ne correspond à rien.
+   */
+  router.post("/documents/from-events", authenticateToken, peutCreer, async (req, res) => {
+    const companyId = societeDe(req);
+    if (!companyId) return sansSociete(res);
+
+    const ids = Array.isArray(req.body?.event_ids)
+      ? [...new Set(req.body.event_ids.map(Number).filter((n) => Number.isInteger(n) && n > 0))]
+      : [];
+
+    if (ids.length === 0) {
+      return res.status(400).json({ error: "Aucun événement fourni.", code: "EMPTY" });
+    }
+    if (ids.length > MAX_PAR_LOT) {
+      return res.status(400).json({
+        error: `Trop d'événements en une fois (${MAX_PAR_LOT} au plus).`, code: "TOO_MANY" });
+    }
+
+    const TYPE_PAR_SENS = {
+      OUT: { type: "Bon de sortie", prefixe: "BS" },
+      IN: { type: "Bon de réception", prefixe: "BR" },
+      TRANSFER_SOURCE: { type: "Bon de transfert", prefixe: "BT" },
+      TRANSFER_DESTINATION: { type: "Bon de transfert", prefixe: "BT" },
+    };
+
+    try {
+      const out = await transaction(async (client) => {
+        const { rows: evenements } = await client.query(
+          `SELECT e.*, e.effective_date::text AS date_texte,
+                  m.product_reference, m.warehouse_id
+             FROM stock_import_movement_events e
+             LEFT JOIN stock_movements m ON m.id = e.movement_id
+            WHERE e.id = ANY($1::bigint[]) AND e.company_id = $2
+            ORDER BY e.id
+            FOR UPDATE OF e`,
+          [ids, companyId]);
+
+        const trouves = new Set(evenements.map((e) => Number(e.id)));
+        const crees = [];
+        const refuses = [];
+
+        for (const id of ids) {
+          if (!trouves.has(id)) {
+            refuses.push({ id, motif: "événement introuvable dans cette entreprise" });
+          }
+        }
+
+        for (const e of evenements) {
+          if (e.status === "CANCELLED") {
+            refuses.push({ id: Number(e.id), motif: "événement annulé" });
+            continue;
+          }
+
+          const { rows: existants } = await client.query(
+            `SELECT id, document_number, document_type FROM documents
+              WHERE company_id = $1 AND stock_import_movement_event_id = $2
+                AND cancelled_at IS NULL LIMIT 1`,
+            [companyId, e.id]);
+          if (existants[0]) {
+            refuses.push({
+              id: Number(e.id), motif: "un document actif existe déjà",
+              document: existants[0],
+            });
+            continue;
+          }
+
+          const regle = TYPE_PAR_SENS[e.direction] || { type: "Document stock", prefixe: "DOC" };
+          const numero = await nextShortDocumentNumber(regle.prefixe, companyId, client);
+          const produit = e.source_context?.produit || "Article";
+          const provenance = `Sortie EM2S — ${e.source_context?.fichier || "import"}`
+            + ` · feuille ${e.excel_sheet} · ligne ${e.excel_row} · cellule ${e.excel_cell}`
+            + (e.movement_id ? ` · mouvement #${e.movement_id}` : " · sans mouvement rattaché");
+
+          const { rows: doc } = await client.query(
+            `INSERT INTO documents
+               (document_type, document_number, client_name, client_phone, client_address,
+                total_amount, observation, created_by, company_id,
+                related_entity_type, related_entity_id, stock_movement_id,
+                stock_import_movement_event_id, warehouse_id, status, document_datetime)
+             VALUES ($1,$2,'','','',0,$3,$4,$5,'stock_import_movement_event',
+                     $6::integer,$7::integer,$6::bigint,$8::integer,'Validé',$9::timestamptz)
+             RETURNING *`,
+            [regle.type, numero, provenance, nomDe(req), companyId,
+             e.id, e.movement_id, e.warehouse_id || null,
+             `${e.date_texte}T12:00:00Z`]);
+
+          /* La quantité de l'ÉVÉNEMENT. Reprendre celle du mouvement
+             imprimerait 20 là où la sortie était de 7. */
+          await client.query(
+            `INSERT INTO document_items
+               (document_id, product_reference, product_name, quantity, unit_price, total_price)
+             VALUES ($1,$2,$3,$4,0,0)`,
+            [doc[0].id, e.product_reference, produit, Number(e.quantity)]);
+
+          crees.push({
+            documentId: doc[0].id, numero, type: regle.type,
+            evenementId: Number(e.id), sens: e.direction,
+            quantite: Number(e.quantity), produit,
+            ligneExcel: e.excel_row, date: e.date_texte,
+            mouvementId: e.movement_id,
+          });
+        }
+
+        return { crees, refuses };
+      });
+
+      res.status(201).json({
+        success: true,
+        crees: out.crees.length,
+        refuses: out.refuses.length,
+        documents: out.crees,
+        evenementsRefuses: out.refuses,
+      });
+    } catch (e) { echec(res, e, "Erreur de génération groupée par événement."); }
+  });
+
   /* ═════════════════════════════════════ GÉNÉRATION GROUPÉE ══ */
 
   /**

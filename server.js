@@ -449,23 +449,15 @@ function canAccessDirectionModule(user) {
 
 
 /* Numéro de document COURT et lisible : PREFIX-AAMMJJ-NNN (ex. BR-260801-001).
-   Unique par entreprise + préfixe + jour. Séquence atomique (UPSERT) : deux
-   requêtes simultanées obtiennent deux numéros différents. Jamais Date.now(). */
+   L'implémentation vit dans services/numerotation-documents.js, pour que les
+   scripts de correction appellent la MÊME série au lieu d'en réinventer une
+   parallèle — ce qui distribuerait des numéros que l'application redonnerait
+   ensuite à d'autres bons. */
+const { nextShortDocumentNumber: numeroterDocument } =
+  require("./services/numerotation-documents");
+
 async function nextShortDocumentNumber(prefix, companyId, client = pool) {
-  const d = new Date();
-  const stamp = String(d.getFullYear()).slice(2) +
-    String(d.getMonth() + 1).padStart(2, "0") +
-    String(d.getDate()).padStart(2, "0");
-  const key = `${prefix}#${stamp}`;
-  const { rows } = await client.query(
-    `INSERT INTO stock_request_counters (company_id, year, prefix, last_seq)
-     VALUES ($1, $2, $3, 1)
-     ON CONFLICT (company_id, year, prefix)
-     DO UPDATE SET last_seq = stock_request_counters.last_seq + 1
-     RETURNING last_seq`,
-    [companyId || 0, d.getFullYear(), key]
-  );
-  return `${prefix}-${stamp}-${String(rows[0].last_seq).padStart(3, "0")}`;
+  return numeroterDocument(prefix, companyId, client);
 }
 
 const rbacTriangle = require("./rbac-triangle");
