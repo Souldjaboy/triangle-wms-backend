@@ -23,6 +23,36 @@
   \set dry_run false
 \endif
 
+/* ═════════════════════════════════════════════════════════════════════════
+   EXÉCUTABLE SANS PARAMÈTRES.
+
+   Cette migration cible UNE entreprise et attend des nombres relevés dans le
+   preview. Sans eux, psql échouait dès la première interpolation sur
+   « syntax error at or near ":" » — une reconstruction de base neuve
+   s'arrêtait donc ici, et l'erreur ne disait rien de la cause.
+
+   Les valeurs manquantes prennent donc un défaut, et `company_id = 0` signifie
+   « aucune entreprise ciblée » : la migration s'annonce et ne fait rien. Elle
+   garde exactement le même comportement quand les paramètres SONT fournis.
+   ═════════════════════════════════════════════════════════════════════════ */
+\if :{?company_id}
+\else
+  \set company_id 0
+\endif
+\if :{?expected_balances}
+\else
+  \set expected_balances -1
+\endif
+\if :{?dry_run}
+\else
+  \set dry_run false
+\endif
+
+SELECT (:company_id)::int = 0 AS sans_cible \gset
+\if :sans_cible
+\echo '061 ignorée : aucune entreprise ciblée (company_id absent ou nul).'
+\else
+
 BEGIN;
 
 /* Les variables psql ne s'interpolent pas dans un bloc DO $$ … $$. */
@@ -354,4 +384,6 @@ END $$;
   ROLLBACK;
 \else
   COMMIT;
+\endif
+
 \endif
