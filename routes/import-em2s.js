@@ -22,6 +22,7 @@ const D = require("../services/import-em2s-db");
 const contexteSociete = require("../services/company-context");
 const M = require("../services/import-em2s-mouvements");
 const E = require("../services/import-em2s-emplacements");
+const R = require("../services/import-em2s-repartitions");
 const permissionsService = require("../services/permissions");
 
 module.exports = function createImportEm2sRouter(deps) {
@@ -44,6 +45,7 @@ module.exports = function createImportEm2sRouter(deps) {
   const peutLire     = requirePermission("stock.import", "import_preview");
   const peutEcrire   = requirePermission("stock.import", "import_execute");
   const peutResoudre = requirePermission("stock.import", "import_resolve");
+  const peutReouvrir = requirePermission("stock.import", "import_reopen");
   const peutAnnuler  = requirePermission("stock.import", "import_cancel");
 
   const echec = (res, e, defaut) => {
@@ -141,6 +143,8 @@ module.exports = function createImportEm2sRouter(deps) {
           });
           const anomalies = await D.ecrireAnomalies(client,
             { companyId, batchId, sha: apercu.fichier.sha256, apercu });
+          const evenements = await R.synchroniser(client,
+            { companyId, batchId, sha: apercu.fichier.sha256, apercu });
 
           return {
             batchId, fichier: apercu.fichier, receptions, anomalies,
@@ -151,6 +155,7 @@ module.exports = function createImportEm2sRouter(deps) {
               importables: apercu.mouvements.importables,
               bloques: apercu.mouvements.bloques,
               ecrits: 0,
+              evenements,
               note: "Les mouvements attendent la mise en stock et la levée des anomalies.",
             },
           };
@@ -224,6 +229,100 @@ module.exports = function createImportEm2sRouter(deps) {
     } catch (e) { echec(res, e, "Erreur de lecture des anomalies."); }
   });
 
+  /* Répartitions définitives : le stock final reste attaché à la ligne ; les
+     mouvements sont des événements indépendants (sens, date, séquence). */
+  router.get("/stock/import-em2s/repartitions", authenticateToken, peutVoir, async (req,res) => {
+    const companyId=await societeDe(req); if(!companyId) return sansSociete(res);
+    try { res.json({success:true,evenements:await R.lister(pool,{companyId,sha:req.query.sha||null})}); }
+    catch(e){ echec(res,e,"Erreur de lecture des répartitions."); }
+  });
+
+  router.post("/stock/import-em2s/repartitions/stock",authenticateToken,peutResoudre,async(req,res)=>{
+    const companyId=await societeDe(req); if(!companyId) return sansSociete(res);
+    try {
+      const out=await transaction(async(client)=>{
+        const b=req.body||{};
+        const {rows:lots}=await client.query(`SELECT id FROM stock_import_batches
+          WHERE company_id=$1 AND file_sha256=$2 AND status<>'CANCELLED' ORDER BY id DESC LIMIT 1`,
+          [companyId,b.sha]);
+        if(!lots[0]) { const e=new Error("Lot introuvable.");e.code="BATCH_REQUIRED";e.httpStatus=409;throw e; }
+        const {rows:anom}=await client.query(`SELECT * FROM stock_import_anomalies
+          WHERE company_id=$1 AND file_sha256=$2 AND excel_sheet=$3 AND excel_row=$4
+            AND anomaly_type='MULTI_BIN' FOR UPDATE`,
+          [companyId,b.sha,b.feuille,Number(b.ligne)]);
+        if(!anom[0]){const e=new Error("Ligne multi-bins introuvable.");e.code="NOT_FOUND";e.httpStatus=404;throw e;}
+        const rep=await R.validerStock(client,{companyId,batchId:lots[0].id,sha:b.sha,feuille:b.feuille,
+          ligne:Number(b.ligne),attendu:Number(anom[0].payload.quantiteAttendue),allocation:b.allocation,
+          bins:anom[0].payload.bins||[],
+          userId:req.user?.id});
+        await client.query(`UPDATE stock_import_anomalies SET status='RESOLVED',
+          resolution=$1,resolved_by=$2,resolved_at=now()
+          WHERE company_id=$3 AND file_sha256=$4 AND excel_sheet=$5 AND excel_row=$6
+            AND anomaly_type='MULTI_BIN' AND status='OPEN'`,
+          [JSON.stringify({stockAllocationId:rep.id}),req.user?.id||null,companyId,b.sha,b.feuille,Number(b.ligne)]);
+        return rep;
+      });
+      res.json({success:true,repartition:out});
+    } catch(e){echec(res,e,"Erreur de répartition du stock.");}
+  });
+
+  router.post("/stock/import-em2s/anomalies/:id/date-split",authenticateToken,peutResoudre,async(req,res)=>{
+    const companyId=await societeDe(req); if(!companyId) return sansSociete(res);
+    try {
+      const out=await transaction(async(client)=>{
+        const {rows}=await client.query(`SELECT * FROM stock_import_anomalies
+          WHERE id=$1 AND company_id=$2 AND anomaly_type='DATES_MULTIPLES' FOR UPDATE`,
+          [Number(req.params.id),companyId]);
+        const a=rows[0]; if(!a){const e=new Error("Anomalie introuvable.");e.code="NOT_FOUND";e.httpStatus=404;throw e;}
+        const direction=String(req.body?.direction||"").toUpperCase();
+        if(!["IN","OUT"].includes(direction)){const e=new Error("Indiquez IN ou OUT.");e.code="DIRECTION_REQUIRED";e.httpStatus=400;throw e;}
+        const quantite=Number(direction==="IN"?a.payload.entrees:a.payload.sorties);
+        if(!(quantite>0)){const e=new Error("Cette ligne ne porte aucun mouvement de ce sens.");e.code="MOVEMENT_MISSING";e.httpStatus=400;throw e;}
+        const mouvement={sens:R.sensDe(direction),quantite,datesProposees:a.payload.dates||[],
+          bins:a.payload.bins||[],rayon:a.payload.rayon,location:a.payload.location,niveau:a.payload.niveau,
+          zoneSansRack:a.payload.zoneSansRack,description:a.description,
+          provenance:{feuille:a.excel_sheet,ligne:a.excel_row,
+            cellule:(a.payload.evenementsSource||[]).find((m)=>m.direction===direction)?.cellule||a.excel_cell}};
+        const {rows:lots}=await client.query(`SELECT id FROM stock_import_batches WHERE company_id=$1
+          AND file_sha256=$2 AND status<>'CANCELLED' ORDER BY id DESC LIMIT 1`,[companyId,a.file_sha256]);
+        const events=await R.ventilerDates(client,{companyId,batchId:lots[0]?.id||a.batch_id,sha:a.file_sha256,
+          mouvement,fractions:req.body?.fractions,userId:req.user?.id});
+        const requis=[Number(a.payload.entrees)>0?"IN":null,Number(a.payload.sorties)>0?"OUT":null].filter(Boolean);
+        const {rows:faits}=await client.query(`SELECT DISTINCT direction FROM stock_import_movement_events
+          WHERE company_id=$1 AND file_sha256=$2 AND excel_sheet=$3 AND excel_row=$4`,
+          [companyId,a.file_sha256,a.excel_sheet,a.excel_row]);
+        if(requis.every((d)=>faits.some((f)=>f.direction===d))){
+          await client.query(`UPDATE stock_import_anomalies SET status='RESOLVED',resolved_by=$1,
+            resolved_at=now(),resolution=$2 WHERE id=$3`,[req.user?.id||null,
+            JSON.stringify({movementEventsCreated:true}),a.id]);
+        }
+        return events;
+      });
+      res.status(201).json({success:true,evenements:out});
+    }catch(e){echec(res,e,"Erreur de ventilation des dates.");}
+  });
+
+  router.post("/stock/import-em2s/movement-events/:id/allocation",authenticateToken,peutResoudre,async(req,res)=>{
+    const companyId=await societeDe(req); if(!companyId) return sansSociete(res);
+    try { const out=await transaction(async(client)=>{
+      const {rows}=await client.query(`SELECT allowed_bins FROM stock_import_movement_events
+        WHERE id=$1 AND company_id=$2`,[Number(req.params.id),companyId]);
+      if(!rows[0]){const e=new Error("Événement introuvable.");e.code="NOT_FOUND";e.httpStatus=404;throw e;}
+      return R.validerMouvement(client,{companyId,eventId:Number(req.params.id),
+        allocation:req.body?.allocation,bins:rows[0].allowed_bins||[],version:req.body?.version,
+        userId:req.user?.id}); });
+      res.json({success:true,evenement:out});
+    }catch(e){echec(res,e,"Erreur de répartition du mouvement.");}
+  });
+
+  router.post("/stock/import-em2s/movement-events/:id/reopen",authenticateToken,peutReouvrir,async(req,res)=>{
+    const companyId=await societeDe(req);if(!companyId)return sansSociete(res);
+    try{const out=await transaction((client)=>R.reouvrirMouvement(client,{companyId,
+      eventId:Number(req.params.id),motif:req.body?.motif,userId:req.user?.id}));
+      res.json({success:true,repartition:out});}
+    catch(e){echec(res,e,"Erreur de réouverture.");}
+  });
+
   /* ───────────────────────────────────────────── lever une anomalie ── */
 
   router.post("/stock/import-em2s/anomalies/:id/resolve", authenticateToken, peutResoudre,
@@ -248,6 +347,13 @@ module.exports = function createImportEm2sRouter(deps) {
 
           const resolution = req.body?.resolution || {};
           verifierResolution(anomalie, resolution);
+          if(anomalie.anomaly_type==="MULTI_BIN"){
+            const rep=await R.validerStock(client,{companyId,batchId:anomalie.batch_id,
+              sha:anomalie.file_sha256,feuille:anomalie.excel_sheet,ligne:anomalie.excel_row,
+              attendu:Number(anomalie.payload.quantiteAttendue),allocation:resolution.parBin,
+              bins:anomalie.payload.bins||[],userId:req.user?.id});
+            resolution.stockAllocationId=rep.id;
+          }
 
           await client.query(
             `UPDATE stock_import_anomalies
@@ -275,32 +381,15 @@ module.exports = function createImportEm2sRouter(deps) {
     const charge = anomalie.payload || {};
 
     if (anomalie.anomaly_type === "MULTI_BIN") {
+      if (resolution.parBinMouvement) {
+        refus("La répartition d'un mouvement se valide désormais sur sa fiche IN ou OUT distincte.",
+              "USE_MOVEMENT_EVENT_ENDPOINT");
+      }
       const parBin = resolution.parBin;
       if (!parBin || typeof parBin !== "object") refus("Indiquez la quantité de chaque bac.", "BINS_REQUIRED");
 
-      /* Deux questions distinctes vivent sur cette même ligne : où repose le
-         stock, et par quel bac le mouvement est passé. La seconde est
-         facultative — sans elle le mouvement attend — mais si elle est donnée,
-         elle doit tomber juste elle aussi. */
-      const parBinMouvement = resolution.parBinMouvement;
-      if (parBinMouvement) {
-        if (typeof parBinMouvement !== "object") {
-          refus("La répartition du mouvement doit donner une quantité par bac.", "MOVE_BINS_INVALID");
-        }
-        const binsMvt = Object.keys(parBinMouvement);
-        const horsLigne = binsMvt.filter((b) => !(charge.bins || []).includes(b));
-        if (horsLigne.length) refus(`Bac hors de cette ligne : ${horsLigne.join(", ")}.`, "BIN_UNKNOWN");
-        if (Object.values(parBinMouvement).some((q) => Number(q) < 0)) {
-          refus("Une quantité ne peut pas être négative.", "NEGATIVE");
-        }
-        const sommeMvt = Object.values(parBinMouvement).reduce((s, q) => s + Number(q || 0), 0);
-        const attenduMvt = Number(resolution.quantiteMouvement
-          ?? charge.entrees ?? charge.sorties);
-        if (Number.isFinite(attenduMvt) && sommeMvt !== attenduMvt) {
-          refus(`La répartition du mouvement totalise ${sommeMvt} au lieu de ${attenduMvt}.`,
-                "MOVE_ALLOCATION_MISMATCH");
-        }
-      }
+      /* Cette résolution ne répond qu'à « où repose le stock final ? ».
+         Chaque mouvement possède désormais sa propre fiche IN ou OUT. */
       const attendue = Number(charge.quantiteAttendue);
       const bins = Array.isArray(charge.bins) ? charge.bins : [];
       const inconnus = Object.keys(parBin).filter((b) => !bins.includes(b));
@@ -316,18 +405,8 @@ module.exports = function createImportEm2sRouter(deps) {
     }
 
     if (anomalie.anomaly_type === "DATES_MULTIPLES") {
-      const parDate = resolution.parDate;
-      if (!parDate || typeof parDate !== "object") refus("Indiquez la quantité de chaque date.", "DATES_REQUIRED");
-      const dates = Array.isArray(charge.dates) ? charge.dates : [];
-      const inconnues = Object.keys(parDate).filter((d) => !dates.includes(d));
-      if (inconnues.length) refus(`Date hors de cette cellule : ${inconnues.join(", ")}.`, "DATE_UNKNOWN");
-      const somme = Object.values(parDate).reduce((s, q) => s + Number(q || 0), 0);
-      const attendue = Number(resolution.quantiteTotale ?? charge.sorties ?? charge.entrees);
-      if (!Number.isFinite(attendue)) refus("Quantité totale inconnue pour cette cellule.", "EXPECTED_UNKNOWN");
-      if (somme !== attendue) {
-        refus(`Les quantités par date totalisent ${somme} au lieu de ${attendue}.`, "DATE_SPLIT_MISMATCH");
-      }
-      return;
+      refus("Ventilez séparément l'entrée et la sortie avec les fiches par événement.",
+            "USE_DATE_SPLIT_ENDPOINT");
     }
 
     if (anomalie.anomaly_type === "NEW_STOCK_INCOHERENT") {
@@ -387,12 +466,20 @@ module.exports = function createImportEm2sRouter(deps) {
             /* Le même contrôle de somme que pour une résolution isolée : une
                saisie en masse n'a pas le droit d'être plus permissive. */
             verifierResolution(anomalie, entree.resolution || {});
+            const resolution={...(entree.resolution||{})};
+            if(anomalie.anomaly_type==="MULTI_BIN"){
+              const rep=await R.validerStock(client,{companyId,batchId:anomalie.batch_id,
+                sha:anomalie.file_sha256,feuille:anomalie.excel_sheet,ligne:anomalie.excel_row,
+                attendu:Number(anomalie.payload.quantiteAttendue),allocation:resolution.parBin,
+                bins:anomalie.payload.bins||[],userId:req.user?.id});
+              resolution.stockAllocationId=rep.id;
+            }
 
             await client.query(
               `UPDATE stock_import_anomalies
                   SET status = 'RESOLVED', resolution = $1, resolved_by = $2, resolved_at = now()
                 WHERE id = $3`,
-              [JSON.stringify(entree.resolution), req.user?.id || null, anomalie.id]
+              [JSON.stringify(resolution), req.user?.id || null, anomalie.id]
             );
             faites.push({ id: anomalie.id, ligne: anomalie.excel_row, type: anomalie.anomaly_type });
           }

@@ -72,6 +72,10 @@ let TRIANGLE, FATMAT, SUPER, LECTEUR, IMPORTATEUR, FATMAT_SUPER, FATMAT_SIMPLE;
 const CLASSEUR = { nom: "fixture-em2s.xlsx", contenu: fixture.construire() };
 
 async function semer() {
+  await pool.query(`DELETE FROM stock_import_allocation_audit`);
+  await pool.query(`DELETE FROM stock_import_movement_allocations`);
+  await pool.query(`DELETE FROM stock_import_movement_events`);
+  await pool.query(`DELETE FROM stock_import_stock_allocations`);
   await pool.query(`DELETE FROM stock_import_anomalies`);
   await pool.query(`DELETE FROM stock_import_operations`);
   await pool.query(`DELETE FROM stock_reception_lines`);
@@ -115,7 +119,7 @@ async function semer() {
     [userId, TRIANGLE.id, action, effet]);
 
   for (const a of ["visible", "view"]) { await droit(LECTEUR.id, a); await droit(IMPORTATEUR.id, a); }
-  for (const a of ["import_preview", "import_execute", "import_resolve", "import_cancel"]) {
+  for (const a of ["import_preview", "import_execute", "import_resolve", "import_reopen", "import_cancel"]) {
     await droit(IMPORTATEUR.id, a);
   }
 }
@@ -279,6 +283,70 @@ async function main() {
 
   console.log("\n▸ LEVER UNE ANOMALIE");
   {
+    console.log("  — événements IN/OUT indépendants —");
+    const events167=(await pool.query(`SELECT e.*,a.status allocation_status,a.version
+      FROM stock_import_movement_events e JOIN stock_import_movement_allocations a ON a.movement_event_id=e.id
+      WHERE e.company_id=$1 AND e.file_sha256=$2 AND e.excel_row=167 ORDER BY direction`,
+      [TRIANGLE.id,apercu.fichier.sha256])).rows;
+    const sourceEvents=(await pool.query(`SELECT excel_row,array_agg(DISTINCT direction) directions
+      FROM stock_import_movement_events WHERE company_id=$1 AND file_sha256=$2
+      GROUP BY excel_row`,[TRIANGLE.id,apercu.fichier.sha256])).rows;
+    verifier("une ligne avec seulement une entrée ne crée qu'un événement IN",
+      sourceEvents.some((r)=>r.directions.length===1&&r.directions[0]==="IN"));
+    verifier("une ligne avec seulement une sortie ne crée qu'un événement OUT",
+      sourceEvents.some((r)=>r.directions.length===1&&r.directions[0]==="OUT"));
+    verifier("la ligne 167 produit exactement un événement IN et un événement OUT",
+      events167.length===2 && events167.some((e)=>e.direction==="IN"&&Number(e.quantity)===4)
+        && events167.some((e)=>e.direction==="OUT"&&Number(e.quantity)===2),JSON.stringify(events167));
+    const doublonsEvents=Number((await pool.query(`SELECT count(*)::int n FROM (
+      SELECT event_key FROM stock_import_movement_events WHERE company_id=$1
+      GROUP BY event_key HAVING count(*)>1) d`,[TRIANGLE.id])).rows[0].n);
+    verifier("le rejeu du fichier ne duplique aucun événement",doublonsEvents===0,`${doublonsEvents}`);
+    const evIn=events167.find((e)=>e.direction==="IN");
+    const evOut=events167.find((e)=>e.direction==="OUT");
+    const vIn=await appel("POST",`/stock/import-em2s/movement-events/${evIn.id}/allocation`,jImport,
+      {allocation:{BIN1:4,BIN2:0},version:evIn.version},chezTriangle);
+    verifier("l'entrée se valide seule",vIn.statut===200,`statut ${vIn.statut} ${vIn.corps.code||""}`);
+    const apresIn=(await pool.query(`SELECT movement_event_id,status,allocation FROM stock_import_movement_allocations
+      WHERE movement_event_id=ANY($1)`,[[evIn.id,evOut.id]])).rows;
+    verifier("valider l'entrée ne valide pas la sortie",
+      apresIn.find((a)=>Number(a.movement_event_id)===Number(evIn.id)).status==="VALIDATED"
+      && apresIn.find((a)=>Number(a.movement_event_id)===Number(evOut.id)).status==="OPEN");
+    const vOut=await appel("POST",`/stock/import-em2s/movement-events/${evOut.id}/allocation`,jImport,
+      {allocation:{BIN1:0,BIN2:2},version:evOut.version},chezTriangle);
+    verifier("la sortie accepte un bin différent de l'entrée",vOut.statut===200,
+      `statut ${vOut.statut} ${vOut.corps.code||""}`);
+    const rejeuEvent=await appel("POST",`/stock/import-em2s/movement-events/${evOut.id}/allocation`,jImport,
+      {allocation:{BIN1:0,BIN2:2}},chezTriangle);
+    verifier("le rejeu d'une validation ne crée aucun doublon",
+      rejeuEvent.statut===409&&rejeuEvent.corps.code==="ALREADY_VALIDATED");
+
+    const candidat=(await pool.query(`SELECT e.*,a.version FROM stock_import_movement_events e
+      JOIN stock_import_movement_allocations a ON a.movement_event_id=e.id
+      WHERE e.company_id=$1 AND jsonb_array_length(e.allowed_bins)>0
+        AND a.status='OPEN' AND e.id<>ALL($2) ORDER BY e.id LIMIT 1`,
+      [TRIANGLE.id,[evIn.id,evOut.id]])).rows[0];
+    if(candidat){
+      const bins=candidat.allowed_bins; const alloc=Object.fromEntries(bins.map((b,i)=>[b,i===0?Number(candidat.quantity):0]));
+      const [c1,c2]=await Promise.all([
+        appel("POST",`/stock/import-em2s/movement-events/${candidat.id}/allocation`,jImport,{allocation:alloc,version:candidat.version},chezTriangle),
+        appel("POST",`/stock/import-em2s/movement-events/${candidat.id}/allocation`,jImport,{allocation:alloc,version:candidat.version},chezTriangle),
+      ]);
+      verifier("deux validations concurrentes d'une fraction n'en valident qu'une",
+        [c1.statut,c2.statut].sort().join(",")==="200,409",`${c1.statut},${c2.statut}`);
+    }
+
+    const rouvert=await appel("POST",`/stock/import-em2s/movement-events/${evIn.id}/reopen`,jImport,
+      {motif:"Correction contrôlée du bin d'entrée."},chezTriangle);
+    verifier("une fraction peut être rouverte avec motif",rouvert.statut===200,
+      `statut ${rouvert.statut} ${rouvert.corps.code||""}`);
+    const corrige=await appel("POST",`/stock/import-em2s/movement-events/${evIn.id}/allocation`,jImport,
+      {allocation:{BIN1:0,BIN2:4},version:rouvert.corps.repartition?.version},chezTriangle);
+    const outApres=(await pool.query(`SELECT allocation FROM stock_import_movement_allocations
+      WHERE movement_event_id=$1`,[evOut.id])).rows[0].allocation;
+    verifier("corriger l'entrée ne modifie pas la sortie",corrige.statut===200&&Number(outApres.BIN2)===2,
+      JSON.stringify(outApres));
+
     const { rows } = await pool.query(
       `SELECT * FROM stock_import_anomalies
         WHERE company_id = $1 AND anomaly_type = 'MULTI_BIN' AND excel_row = 167`,
@@ -323,19 +391,24 @@ async function main() {
     const { rows: dates } = await pool.query(
       `SELECT * FROM stock_import_anomalies
         WHERE company_id = $1 AND anomaly_type = 'DATES_MULTIPLES'`, [TRIANGLE.id]);
-    const faux = await appel("POST", `/stock/import-em2s/anomalies/${dates[0].id}/resolve`,
-      jImport, { resolution: { quantiteTotale: 25,
-                               parDate: { "2026-08-19": 10, "2026-08-21": 10 } } }, chezTriangle);
+    const faux = await appel("POST", `/stock/import-em2s/anomalies/${dates[0].id}/date-split`,
+      jImport, { direction:"OUT", fractions:[
+        {date:"2026-08-19",quantity:10,sequence:1},
+        {date:"2026-08-21",quantity:10,sequence:2}] }, chezTriangle);
     verifier("une ventilation par date incomplète est refusée",
       faux.statut === 400 && faux.corps.code === "DATE_SPLIT_MISMATCH",
       `statut ${faux.statut} ${faux.corps.code}`);
 
-    const bon = await appel("POST", `/stock/import-em2s/anomalies/${dates[0].id}/resolve`,
-      jImport, { resolution: { quantiteTotale: 25,
-                               parDate: { "2026-08-19": 10, "2026-08-21": 10, "2026-08-25": 5 } } },
-      chezTriangle);
-    verifier("une ventilation exacte est acceptée", bon.statut === 200,
+    const bon = await appel("POST", `/stock/import-em2s/anomalies/${dates[0].id}/date-split`,
+      jImport, { direction:"OUT", fractions:[
+        {date:"2026-08-19",quantity:10,sequence:1},
+        {date:"2026-08-21",quantity:10,sequence:2},
+        {date:"2026-08-25",quantity:5,sequence:3}] }, chezTriangle);
+    verifier("plusieurs sorties par date deviennent des événements indépendants", bon.statut === 201
+      && bon.corps.evenements?.length===3,
       `statut ${bon.statut} ${bon.corps.code || ""}`);
+    const sommeFractions=(bon.corps.evenements||[]).reduce((s,e)=>s+Number(e.quantity),0);
+    verifier("la somme des fractions égale la quantité totale",sommeFractions===25,`${sommeFractions}`);
 
     const { rows: incoherente } = await pool.query(
       `SELECT * FROM stock_import_anomalies
@@ -503,31 +576,20 @@ async function main() {
       jImport, { resolution: { parBin: { BIN1: 400, BIN2: 300, BIN3: 180 },
                                parBinMouvement: { BIN1: 400, BIN2: 300, BIN3: 180 },
                                quantiteMouvement: 80 } }, chezTriangle);
-    verifier("une répartition de mouvement égale à celle du stock est refusée",
-      mauvaise.statut === 400 && mauvaise.corps.code === "MOVE_ALLOCATION_MISMATCH",
+    verifier("l'ancienne saisie mêlant stock et mouvement est refusée",
+      mauvaise.statut === 400 && mauvaise.corps.code === "USE_MOVEMENT_EVENT_ENDPOINT",
       `statut ${mauvaise.statut} ${mauvaise.corps.code}`);
 
-    const horsLigne = await appel("POST", `/stock/import-em2s/anomalies/${a.id}/resolve`,
-      jImport, { resolution: { parBin: { BIN1: 400, BIN2: 300, BIN3: 180 },
-                               parBinMouvement: { BIN9: 80 }, quantiteMouvement: 80 } },
-      chezTriangle);
-    verifier("un bac étranger dans la répartition du mouvement est refusé",
-      horsLigne.statut === 400 && horsLigne.corps.code === "BIN_UNKNOWN",
-      `statut ${horsLigne.statut} ${horsLigne.corps.code}`);
-
     const bonne = await appel("POST", `/stock/import-em2s/anomalies/${a.id}/resolve`,
-      jImport, { resolution: { parBin: { BIN1: 400, BIN2: 300, BIN3: 180 },
-                               parBinMouvement: { BIN1: 50, BIN3: 30 },
-                               quantiteMouvement: 80 } }, chezTriangle);
-    verifier("les deux répartitions cohabitent quand chacune tombe juste",
+      jImport, { resolution: { parBin: { BIN1: 400, BIN2: 300, BIN3: 180 } } }, chezTriangle);
+    verifier("la répartition du stock se valide indépendamment",
       bonne.statut === 200, `statut ${bonne.statut} ${bonne.corps.code || ""}`);
 
     const enregistree = (await pool.query(
-      `SELECT resolution FROM stock_import_anomalies WHERE id = $1`, [a.id])).rows[0].resolution;
-    verifier("les deux répartitions sont conservées séparément",
-      enregistree.parBin && enregistree.parBinMouvement
-        && Object.values(enregistree.parBin).reduce((s, q) => s + Number(q), 0) === 880
-        && Object.values(enregistree.parBinMouvement).reduce((s, q) => s + Number(q), 0) === 80,
+      `SELECT allocation FROM stock_import_stock_allocations WHERE company_id=$1
+        AND file_sha256=$2 AND excel_row=297`, [TRIANGLE.id,apercu.fichier.sha256])).rows[0];
+    verifier("le stock actuel vit dans son objet propre",
+      Object.values(enregistree.allocation).reduce((s, q) => s + Number(q), 0) === 880,
       JSON.stringify(enregistree));
   }
 

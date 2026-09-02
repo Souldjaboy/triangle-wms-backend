@@ -23,6 +23,7 @@
 
 const L = require("./stock-locations");
 const D = require("./import-em2s-db");
+const R = require("./import-em2s-repartitions");
 
 const BLOQUANTES = ["MULTI_BIN", "DATES_MULTIPLES", "NEW_STOCK_INCOHERENT"];
 
@@ -169,7 +170,11 @@ async function classer(client, { companyId, sha, apercu }) {
     const cleLigne = `${m.provenance.feuille}:${m.provenance.ligne}`;
     const etat = anomalies.get(cleLigne) || { ouvertes: [], resolues: [] };
 
-    if (etat.ouvertes.length > 0) {
+    /* Les répartitions MULTI_BIN et DATES_MULTIPLES ont désormais leur propre
+       cycle de vie. Seule l'incohérence du stock final reste une anomalie de
+       ligne qui bloque indistinctement ses mouvements. */
+    const ouvertesLigne = etat.ouvertes.filter((a)=>a.anomaly_type === "NEW_STOCK_INCOHERENT");
+    if (ouvertesLigne.length > 0) {
       bloquer(m, "anomalie non tranchée", { motifs: etat.ouvertes.map((a) => a.anomaly_type) });
       continue;
     }
@@ -182,20 +187,38 @@ async function classer(client, { companyId, sha, apercu }) {
       continue;
     }
 
-    const decisions = {};
-    for (const a of etat.resolues) Object.assign(decisions, a.resolution || {});
-
-    const parts = decomposer(m, decisions);
-    if (parts === null) {
-      bloquer(m, "le bac du mouvement n'est pas indiqué", { bacsPossibles: m.bins });
+    const {rows: evenements}=await client.query(
+      `SELECT e.*,a.allocation,a.status allocation_status
+         FROM stock_import_movement_events e
+         JOIN stock_import_movement_allocations a ON a.movement_event_id=e.id
+        WHERE e.company_id=$1 AND e.file_sha256=$2 AND e.excel_sheet=$3 AND e.excel_row=$4
+          AND e.direction=$5 AND e.status<>'CANCELLED'
+        ORDER BY e.effective_date,e.event_sequence`,
+      [companyId,sha,m.provenance.feuille,m.provenance.ligne,R.directionDe(m.sens)]);
+    if(evenements.length===0){
+      bloquer(m,(m.datesProposees||[]).length>1
+        ? "les quantités par date ne sont pas encore renseignées"
+        : "l'événement de mouvement n'est pas initialisé");
+      continue;
+    }
+    if(evenements.every((e)=>e.status==="IMPORTED")){
+      dejaFaits.push({ligne:cleLigne,article:m.description,sens:m.sens});
+      continue;
+    }
+    if(evenements.some((e)=>e.allocation_status!=="VALIDATED")){
+      bloquer(m,"la répartition par bin d'un événement n'est pas validée",{
+        evenements:evenements.filter((e)=>e.allocation_status!=="VALIDATED").map((e)=>e.id)});
+      continue;
+    }
+    const sommeEvenements=evenements.reduce((s,e)=>s+Number(e.quantity),0);
+    if(sommeEvenements!==Number(m.quantite)){
+      bloquer(m,`fractions incohérentes : ${sommeEvenements} au lieu de ${m.quantite}`);
       continue;
     }
 
-    const sommeParts = parts.reduce((s, p) => s + p.quantite, 0);
-    if (sommeParts !== m.quantite) {
-      bloquer(m, `décomposition incohérente : ${sommeParts} au lieu de ${m.quantite}`);
-      continue;
-    }
+    const parts=evenements.flatMap((event)=>Object.entries(event.allocation||{})
+      .filter(([,q])=>Number(q)>0).map(([bin,q])=>({quantite:Number(q),bin:bin==="__LOCATION__"?null:bin,
+        date:String(event.effective_date).slice(0,10),event})));
 
     /* Chaque part doit trouver son emplacement, et une sortie doit trouver de
        quoi sortir. On le vérifie ici, à froid : découvrir le manque au moment
@@ -290,7 +313,8 @@ async function ecrireMouvements(client, {
 
     for (const part of prete.parts) {
       const cle = D.cleIdempotence({
-        sha, kind: "MOVEMENT", libelle: m.description, sens: m.sens,
+        sha, kind: "MOVEMENT_EVENT", evenement: part.event.event_key,
+        libelle: m.description, sens: m.sens,
         quantite: part.quantite, date: part.date,
         emplacement: `${part.emplacement.id}`,
         feuille: m.provenance.feuille, ligne: m.provenance.ligne,
@@ -342,7 +366,6 @@ async function ecrireMouvements(client, {
           WHERE company_id = $2 AND idempotency_key = $3`,
         [out.movement?.id || null, companyId, cle]
       );
-
       rapport.ecrits += 1;
       if (m.sens === "Entrée") rapport.quantiteEntree += part.quantite;
       else rapport.quantiteSortie += part.quantite;
@@ -352,6 +375,21 @@ async function ecrireMouvements(client, {
         emplacement: part.emplacement.full_code, date: part.date,
         stockAvant: out.stockBefore, stockApres: out.stockAfter,
       });
+    }
+
+    /* Un événement peut être réparti sur plusieurs bins, donc produire
+       plusieurs mouvements de stock. Il ne devient IMPORTED qu'après que
+       toutes ses parts ont réussi dans la transaction. */
+    for (const event of [...new Map(prete.parts.map((p)=>[p.event.id,p.event])).values()]) {
+      const mouvementLie=rapport.details.slice().reverse().find((d)=>d.ligne===prete.cleLigne
+        && d.sens===m.sens && d.date===String(event.effective_date).slice(0,10));
+      await client.query(`UPDATE stock_import_movement_events SET status='IMPORTED',updated_at=now()
+        WHERE id=$1`,[event.id]);
+      await client.query(`INSERT INTO stock_import_allocation_audit
+        (company_id,entity_type,entity_id,action,after_value,actor_id)
+        VALUES ($1,'MOVEMENT_EVENT',$2,'IMPORT',$3,$4)`,
+        [companyId,event.id,JSON.stringify({eventKey:event.event_key,detail:mouvementLie||null}),
+         utilisateur?.id||null]);
     }
   }
 

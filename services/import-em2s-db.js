@@ -34,12 +34,16 @@ const P = require("./import-em2s");
  * inoffensif.
  */
 function cleIdempotence(parties) {
-  const texte = [
+  let texte = [
     parties.sha, parties.kind, parties.feuille ?? "", parties.ligne ?? "",
     parties.conteneur ?? "", parties.entrepot ?? "", parties.libelle ?? "",
     parties.emplacement ?? "", parties.sens ?? "", parties.quantite ?? "",
     parties.date ?? "",
   ].join("|");
+  /* Les anciens imports gardent exactement leur empreinte. Les mouvements de
+     la 070 ajoutent seulement leur identifiant stable d'événement : deux
+     fractions de même date, quantité et bin restent ainsi distinctes. */
+  if (parties.evenement) texte += `|event:${parties.evenement}`;
   return crypto.createHash("sha256").update(texte).digest("hex");
 }
 
@@ -221,6 +225,11 @@ async function previsualiser(client, { companyId, buffer, nomFichier }) {
           /* La date réelle de l'opération, pour que la grille montre quand
              c'est arrivé et pas seulement combien. */
           dateUnique: ligne.dateUnique,
+          evenementsSource: ligne.mouvements.filter((m) => m.nouveau).map((m) => ({
+            direction: m.sens === "Entrée" ? "IN" : "OUT",
+            quantite: m.quantite,
+            cellule: m.provenance.cellule,
+          })),
         },
       });
     }
