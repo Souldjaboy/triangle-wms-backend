@@ -711,6 +711,96 @@ async function main() {
       (await stockTotal(TRIANGLE.id)) === stockAvant,
       `${stockAvant} → ${await stockTotal(TRIANGLE.id)}`);
 
+  console.log("\n▸ ATOMICITÉ DU LOT");
+  {
+    const pre = await envoyer("/stock/import-em2s/movements/prevalidation",
+      jImport, {}, CLASSEUR, chezTriangle);
+    /* On éprouve la promesse la plus difficile à tenir : si la quatrième
+       ligne d'un lot échoue pour une raison technique, aucune des trois
+       précédentes ne doit rester écrite.
+
+       Le déclencheur ci-dessous fait échouer la Nième insertion de mouvement
+       de la transaction. Il vit le temps du test, et disparaît ensuite. */
+    const dejaEcrits = Number((await pool.query(
+      `SELECT count(*)::int AS n FROM stock_movements WHERE company_id = $1`,
+      [TRIANGLE.id])).rows[0].n);
+
+    /* Cette section s'exécute AVANT la première écriture : les lignes prêtes
+       le sont encore, et rien n'a été consommé. */
+    const etatAvant = await pool.query(
+      `SELECT (SELECT COALESCE(SUM(quantity),0)::numeric FROM stock_location_balances
+                WHERE company_id = $1) AS stock,
+              (SELECT count(*)::int FROM stock_movements WHERE company_id = $1) AS mouvements,
+              (SELECT count(*)::int FROM stock_import_operations
+                WHERE company_id = $1 AND kind = 'MOVEMENT') AS cles`,
+      [TRIANGLE.id]);
+
+    /* On combien de mouvements le lot va-t-il vraiment écrire ? La panne doit
+       tomber APRÈS le premier et AVANT le dernier, sinon elle ne prouve rien :
+       un seuil plus haut que le lot ne se déclenche jamais. */
+    const attendus = (pre?.corps?.classement?.listePretes || [])
+      .reduce((n, l) => n + (l.repartition?.length || 1), 0);
+    if (attendus < 1) {
+      console.log("  · aucune écriture prévue — atomicité non éprouvable ici");
+    } else {
+    /* La panne tombe sur l'écriture qui suit la `dejaEcrits`-ième : avec deux
+       lignes prêtes ou plus, elle interrompt un lot déjà entamé ; avec une
+       seule, elle interrompt la toute première. Dans les deux cas, la
+       transaction doit se refermer sans laisser la moindre trace. */
+    const seuil = dejaEcrits + (attendus >= 2 ? 1 : 0);
+    console.log(`  (${attendus} écriture(s) prévue(s), panne à la `
+              + `${seuil - dejaEcrits + 1}${seuil === dejaEcrits ? "re" : "e"})`);
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION essai_panne_mouvement() RETURNS trigger AS $$
+      DECLARE n integer;
+      BEGIN
+        SELECT count(*) INTO n FROM stock_movements WHERE company_id = NEW.company_id;
+        IF n >= ${seuil} THEN
+          RAISE EXCEPTION 'panne technique simulée sur le mouvement %', n + 1;
+        END IF;
+        RETURN NEW;
+      END $$ LANGUAGE plpgsql;`);
+    await pool.query(`DROP TRIGGER IF EXISTS essai_panne_trg ON stock_movements`);
+    await pool.query(
+      `CREATE TRIGGER essai_panne_trg BEFORE INSERT ON stock_movements
+         FOR EACH ROW EXECUTE FUNCTION essai_panne_mouvement()`);
+
+    const avecPanne = await envoyer("/stock/import-em2s/movements", jImport,
+      { sha256: apercu.fichier.sha256, importerLignesPretes: "1" }, CLASSEUR, chezTriangle);
+
+    await pool.query(`DROP TRIGGER IF EXISTS essai_panne_trg ON stock_movements`);
+    await pool.query(`DROP FUNCTION IF EXISTS essai_panne_mouvement()`);
+
+    const etatApres = await pool.query(
+      `SELECT (SELECT COALESCE(SUM(quantity),0)::numeric FROM stock_location_balances
+                WHERE company_id = $1) AS stock,
+              (SELECT count(*)::int FROM stock_movements WHERE company_id = $1) AS mouvements,
+              (SELECT count(*)::int FROM stock_import_operations
+                WHERE company_id = $1 AND kind = 'MOVEMENT') AS cles`,
+      [TRIANGLE.id]);
+
+    const aPlante = avecPanne.statut >= 400;
+    verifier("une panne technique fait échouer la requête", aPlante,
+      `statut ${avecPanne.statut}`);
+    if (aPlante) {
+      verifier("aucun mouvement du lot n'a survécu",
+        Number(etatApres.rows[0].mouvements) === Number(etatAvant.rows[0].mouvements),
+        `${etatAvant.rows[0].mouvements} → ${etatApres.rows[0].mouvements}`);
+      verifier("le stock est revenu à son état d'avant",
+        Number(etatApres.rows[0].stock) === Number(etatAvant.rows[0].stock),
+        `${etatAvant.rows[0].stock} → ${etatApres.rows[0].stock}`);
+      verifier("aucune clé d'idempotence n'est restée consommée",
+        Number(etatApres.rows[0].cles) === Number(etatAvant.rows[0].cles),
+        `${etatAvant.rows[0].cles} → ${etatApres.rows[0].cles}`);
+    }
+
+    /* La panne écartée, l'écriture normale reprend juste après : c'est la
+       section suivante qui le prouve, sur les mêmes lignes. */
+    }
+  }
+
+
+
     const reel = await envoyer("/stock/import-em2s/movements", jImport,
       { sha256: apercu.fichier.sha256, importerLignesPretes: "1" }, CLASSEUR, chezTriangle);
     verifier("l'écriture des mouvements aboutit", reel.statut === 201,
@@ -784,89 +874,6 @@ async function main() {
     verifier("les mouvements écrits portent leur date métier",
       mouvementsEnBase.rows[0].n === 0 || mouvementsEnBase.rows[0].datees > 0,
       JSON.stringify(mouvementsEnBase.rows[0]));
-  }
-
-  console.log("\n▸ ATOMICITÉ DU LOT");
-  {
-    /* On éprouve la promesse la plus difficile à tenir : si la quatrième
-       ligne d'un lot échoue pour une raison technique, aucune des trois
-       précédentes ne doit rester écrite.
-
-       Le déclencheur ci-dessous fait échouer la Nième insertion de mouvement
-       de la transaction. Il vit le temps du test, et disparaît ensuite. */
-    const dejaEcrits = Number((await pool.query(
-      `SELECT count(*)::int AS n FROM stock_movements WHERE company_id = $1`,
-      [TRIANGLE.id])).rows[0].n);
-
-    /* On efface les clés pour que le lot repasse, puis on fait échouer la
-       quatrième écriture. Le seuil est figé dans le corps de la fonction :
-       un réglage de session ne suivrait pas jusqu'au serveur. */
-    await pool.query(
-      `DELETE FROM stock_import_operations WHERE company_id = $1 AND kind = 'MOVEMENT'`,
-      [TRIANGLE.id]);
-
-    /* L'état de référence se relève APRÈS ce nettoyage : sinon on comparerait
-       l'après-panne à un avant qui n'existe plus. */
-    const etatAvant = await pool.query(
-      `SELECT (SELECT COALESCE(SUM(quantity),0)::numeric FROM stock_location_balances
-                WHERE company_id = $1) AS stock,
-              (SELECT count(*)::int FROM stock_movements WHERE company_id = $1) AS mouvements,
-              (SELECT count(*)::int FROM stock_import_operations
-                WHERE company_id = $1 AND kind = 'MOVEMENT') AS cles`,
-      [TRIANGLE.id]);
-
-    const seuil = dejaEcrits + 3;
-    await pool.query(`
-      CREATE OR REPLACE FUNCTION essai_panne_mouvement() RETURNS trigger AS $$
-      DECLARE n integer;
-      BEGIN
-        SELECT count(*) INTO n FROM stock_movements WHERE company_id = NEW.company_id;
-        IF n >= ${seuil} THEN
-          RAISE EXCEPTION 'panne technique simulée sur le mouvement %', n + 1;
-        END IF;
-        RETURN NEW;
-      END $$ LANGUAGE plpgsql;`);
-    await pool.query(`DROP TRIGGER IF EXISTS essai_panne_trg ON stock_movements`);
-    await pool.query(
-      `CREATE TRIGGER essai_panne_trg BEFORE INSERT ON stock_movements
-         FOR EACH ROW EXECUTE FUNCTION essai_panne_mouvement()`);
-
-    const avecPanne = await envoyer("/stock/import-em2s/movements", jImport,
-      { sha256: apercu.fichier.sha256, importerLignesPretes: "1" }, CLASSEUR, chezTriangle);
-
-    await pool.query(`DROP TRIGGER IF EXISTS essai_panne_trg ON stock_movements`);
-    await pool.query(`DROP FUNCTION IF EXISTS essai_panne_mouvement()`);
-
-    const etatApres = await pool.query(
-      `SELECT (SELECT COALESCE(SUM(quantity),0)::numeric FROM stock_location_balances
-                WHERE company_id = $1) AS stock,
-              (SELECT count(*)::int FROM stock_movements WHERE company_id = $1) AS mouvements,
-              (SELECT count(*)::int FROM stock_import_operations
-                WHERE company_id = $1 AND kind = 'MOVEMENT') AS cles`,
-      [TRIANGLE.id]);
-
-    const aPlante = avecPanne.statut >= 400;
-    verifier("une panne technique fait échouer la requête", aPlante,
-      `statut ${avecPanne.statut}`);
-    if (aPlante) {
-      verifier("aucun mouvement du lot n'a survécu",
-        Number(etatApres.rows[0].mouvements) === Number(etatAvant.rows[0].mouvements),
-        `${etatAvant.rows[0].mouvements} → ${etatApres.rows[0].mouvements}`);
-      verifier("le stock est revenu à son état d'avant",
-        Number(etatApres.rows[0].stock) === Number(etatAvant.rows[0].stock),
-        `${etatAvant.rows[0].stock} → ${etatApres.rows[0].stock}`);
-      verifier("aucune clé d'idempotence n'est restée consommée",
-        Number(etatApres.rows[0].cles) === Number(etatAvant.rows[0].cles),
-        `${etatAvant.rows[0].cles} → ${etatApres.rows[0].cles}`);
-    }
-
-    /* Après la panne, un import normal doit repasser sans rien avoir perdu. */
-    const reprise = await envoyer("/stock/import-em2s/movements", jImport,
-      { sha256: apercu.fichier.sha256, importerLignesPretes: "1" }, CLASSEUR, chezTriangle);
-    verifier("l'import repasse une fois la panne écartée", reprise.statut === 201,
-      `statut ${reprise.statut}`);
-    verifier("et réécrit bien les lignes prêtes",
-      (reprise.corps.rapport?.ecrits || 0) > 0, `${reprise.corps.rapport?.ecrits}`);
   }
 
   console.log("\n▸ CORRIGER UNE DATE APRÈS IMPRESSION");
