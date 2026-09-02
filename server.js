@@ -518,7 +518,7 @@ function isReadOnlyRole(user) {
 
 function canViewAllSalaries(user) {
   const role = normalizeRole(user?.role);
-  return user?.is_super_admin === true || role === "super_admin" || role === "direction";
+  return user?.is_super_admin === true || role === "super_admin" || role === "comptable";
 }
 
 function canCreateMeeting(user) {
@@ -14103,7 +14103,7 @@ app.get("/attendance/history/:userId", authenticateToken, async (req, res) => {
   }
 });
 
-app.post("/attendance/check", authenticateToken, async (req, res) => {
+app.post("/attendance/legacy/check", authenticateToken, async (req, res) => {
   try {
     const { user_id, action_type, device_info, ip_address, location_info } =
       req.body;
@@ -17361,7 +17361,7 @@ app.post("/payments/create", authenticateToken, async (req, res) => {
 });
 
 /* ATTENDANCE QR SCAN */
-app.post("/attendance/scan", async (req, res) => {
+app.post("/attendance/legacy/scan", authenticateToken, async (req, res) => {
   try {
     const { badge_code, action_type, latitude, longitude, accuracy } = req.body;
 
@@ -17924,6 +17924,15 @@ app.use(
     pool, authenticateToken, getEffectiveCompanyId, requirePermission,
     upload: inventoryImportUpload,
   })
+);
+
+/* Pointage opérationnel : effectif RH distinct des comptes, périmètres des
+   opérateurs et confidentialité salariale. Les anciennes routes restent
+   disponibles pendant la transition, mais les nouveaux écrans utilisent v2. */
+const createAttendanceWorkforceRouter = require("./routes/attendance-workforce");
+app.use(
+  "/",
+  createAttendanceWorkforceRouter({ pool, authenticateToken, getEffectiveCompanyId })
 );
 
 const createInventoryImportRouter = require("./routes/inventory-import");
