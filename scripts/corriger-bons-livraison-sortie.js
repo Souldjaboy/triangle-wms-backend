@@ -62,6 +62,12 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
    type et le préfixe d'un bon de sortie. */
 const SORTIE = { type: "Bon de sortie", prefixe: "BS" };
 
+/* Qui a annulé et pourquoi : un document annulé sans motif ni auteur n'est
+   pas auditable, et c'est justement ce qu'on reprochait aux suppressions. */
+const AUTEUR = "Correction automatique (script corriger-bons-livraison-sortie)";
+const MOTIF = "Bon de livraison émis à tort depuis une sortie de stock. "
+  + "Remplacé par un bon de sortie portant la quantité du mouvement.";
+
 /** Les bons de livraison nés d'un mouvement de sortie, avec leur contexte. */
 const REQUETE_CONCERNES = `
   SELECT d.id, d.company_id, d.document_number, d.document_type, d.created_at,
@@ -96,19 +102,28 @@ async function empreinteStock(client) {
   return rows[0];
 }
 
+/**
+ * Le numéro suivant de la série, EXACTEMENT comme `nextShortDocumentNumber`
+ * dans server.js : mêmes colonnes, même clé `PREFIX#AAMMJJ`, même séquence.
+ *
+ * Cette copie n'est pas un confort : si le script ouvrait sa propre série, il
+ * distribuerait des numéros que l'application redonnerait ensuite à d'autres
+ * bons. Toute divergence ici se paierait en doublons de numéros en production.
+ */
 async function numeroSuivant(client, companyId, prefixe) {
-  /* Même série que l'application : PREFIXE-AAMMJJ-NNN, adossée au compteur. */
-  const jour = new Date();
-  const cle = `${String(jour.getFullYear()).slice(2)}${String(jour.getMonth() + 1).padStart(2, "0")}${String(jour.getDate()).padStart(2, "0")}`;
+  const d = new Date();
+  const stamp = String(d.getFullYear()).slice(2)
+    + String(d.getMonth() + 1).padStart(2, "0")
+    + String(d.getDate()).padStart(2, "0");
   const { rows } = await client.query(
-    `INSERT INTO stock_request_counters (company_id, counter_key, last_value)
-     VALUES ($1, $2, 1)
-     ON CONFLICT (company_id, counter_key)
-     DO UPDATE SET last_value = stock_request_counters.last_value + 1
-     RETURNING last_value`,
-    [companyId, `${prefixe}-${cle}`]
+    `INSERT INTO stock_request_counters (company_id, year, prefix, last_seq)
+     VALUES ($1, $2, $3, 1)
+     ON CONFLICT (company_id, year, prefix)
+     DO UPDATE SET last_seq = stock_request_counters.last_seq + 1
+     RETURNING last_seq`,
+    [companyId || 0, d.getFullYear(), `${prefixe}#${stamp}`]
   );
-  return `${prefixe}-${cle}-${String(rows[0].last_value).padStart(3, "0")}`;
+  return `${prefixe}-${stamp}-${String(rows[0].last_seq).padStart(3, "0")}`;
 }
 
 async function main() {
@@ -186,6 +201,19 @@ async function main() {
 
       const numero = await numeroSuivant(client, d.company_id, SORTIE.prefixe);
 
+      /* L'ANNULATION VIENT D'ABORD. La base n'accepte qu'un seul document
+         actif par mouvement : insérer le remplaçant avant d'annuler l'ancien
+         fait deux actifs le temps d'une instruction, et l'index refuse. Cet
+         ordre n'est donc pas une préférence de style — c'est ce qui rend
+         l'opération possible. */
+      await client.query(
+        `UPDATE documents
+            SET cancelled_at = now(), cancelled_by = $1, cancelled_by_name = $2,
+                cancellation_reason = $3
+          WHERE id = $4`,
+        [null, AUTEUR, MOTIF, d.id]
+      );
+
       const { rows: nouveau } = await client.query(
         `INSERT INTO documents
            (company_id, document_type, document_number, stock_movement_id, client_name,
@@ -202,7 +230,9 @@ async function main() {
       );
 
       /* Les lignes du remplaçant viennent du MOUVEMENT, pas de l'ancien bon :
-         c'est la quantité réellement sortie qui fait foi. */
+         c'est la quantité réellement sortie qui fait foi. C'est ici que le
+         cumul disparaît — un bon qui portait 30 pour une sortie de 10 repart
+         à 10. */
       await client.query(
         `INSERT INTO document_items
            (document_id, product_reference, product_name, quantity, unit_price, total_price)
@@ -211,14 +241,11 @@ async function main() {
         [nouveau[0].id, d.mouvement_id]
       );
 
+      /* Le lien retour, une fois le remplaçant connu : on remonte la chaîne
+         dans les deux sens. */
       await client.query(
-        `UPDATE documents
-            SET cancelled_at = now(), cancelled_by_name = $1,
-                cancellation_reason = $2, replaced_by_document_id = $3
-          WHERE id = $4`,
-        ["Correction automatique",
-         "Bon de livraison émis à tort depuis une sortie de stock. Remplacé par un bon de sortie.",
-         nouveau[0].id, d.id]
+        `UPDATE documents SET replaced_by_document_id = $1 WHERE id = $2`,
+        [nouveau[0].id, d.id]
       );
 
       remplaces += 1;
