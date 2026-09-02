@@ -239,6 +239,9 @@ async function previsualiser(client, { companyId, buffer, nomFichier }) {
       mouvements.push({
         description: ligne.description, sens: m.sens, quantite: m.quantite,
         couleur: m.couleur, classe: m.classe,
+        /* Le stock final visé par la feuille : c'est la cible de la
+           réconciliation, jamais un mouvement de plus. */
+        stockInitial: ligne.stockInitial, nouveauStock: ligne.nouveauStock,
         date: ligne.dateUnique, datesProposees: ligne.datesProposees,
         rayon: ligne.rayon, location: ligne.location, niveau: ligne.niveau,
         bins: ligne.bins, zoneSansRack: ligne.zoneSansRack, unite: ligne.unite,
@@ -366,6 +369,82 @@ async function ecrireReceptions(client, { companyId, batchId, sha, apercu, utili
   return resultat;
 }
 
+/**
+ * Crée les produits que le classeur nomme et que la base ne connaît pas.
+ *
+ * Seulement ceux-là : un libellé qui correspond déjà à un produit, ou qui en
+ * désigne plusieurs, n'est PAS créé — dans le premier cas ce serait un
+ * doublon, dans le second on choisirait à la place de quelqu'un.
+ *
+ * Le libellé du classeur est conservé comme alias : au prochain import, la
+ * question ne se reposera pas, et « SPEACKER LA212 » retrouvera le produit
+ * qu'un humain lui a associé une fois pour toutes.
+ */
+async function creerProduitsManquants(client, { companyId, batchId, sha, apercu, utilisateur }) {
+  const aCreer = new Map();
+
+  const retenir = (libelle, statut, unite) => {
+    if (statut !== "NOUVEAU") return;
+    const norm = normaliserLibelle(libelle);
+    if (!norm || aCreer.has(norm)) return;
+    aCreer.set(norm, { libelle, unite: unite || "EACH" });
+  };
+
+  for (const r of apercu.receptions.liste) {
+    for (const l of r.lignes) retenir(l.libelle, l.statutProduit, l.unite);
+  }
+  for (const m of apercu.mouvements.liste) retenir(m.description, m.statutProduit, m.unite);
+
+  const rapport = { crees: 0, dejaPresents: 0, ambigus: 0, details: [] };
+
+  for (const [norm, info] of aCreer) {
+    const cle = cleIdempotence({ sha, kind: "PRODUCT", libelle: norm });
+
+    const { rowCount } = await client.query(
+      `INSERT INTO stock_import_operations
+         (company_id, batch_id, idempotency_key, kind, file_sha256, product_label, created_by)
+       VALUES ($1,$2,$3,'PRODUCT',$4,$5,$6)
+       ON CONFLICT (company_id, idempotency_key) DO NOTHING RETURNING id`,
+      [companyId, batchId, cle, sha, info.libelle, utilisateur?.id || null]
+    );
+    if (rowCount === 0) { rapport.dejaPresents += 1; continue; }
+
+    const { rows } = await client.query(
+      `INSERT INTO products (company_id, name, unit, stock)
+       VALUES ($1,$2,$3,0) RETURNING id, name`,
+      [companyId, info.libelle, info.unite]
+    );
+    const produit = rows[0];
+
+    await client.query(
+      `UPDATE stock_import_operations SET product_id = $1
+        WHERE company_id = $2 AND idempotency_key = $3`,
+      [produit.id, companyId, cle]
+    );
+
+    /* L'alias porte la forme normalisée : c'est elle qu'on comparera. */
+    await client.query(
+      `INSERT INTO product_import_aliases (company_id, alias, alias_norm, product_id, confirmed_by)
+       VALUES ($1,$2,$3,$4,$5) ON CONFLICT (company_id, alias_norm) DO NOTHING`,
+      [companyId, info.libelle, norm, produit.id, utilisateur?.id || null]
+    );
+
+    rapport.crees += 1;
+    rapport.details.push({ libelle: info.libelle, produitId: produit.id });
+  }
+
+  /* Les libellés qui désignent plusieurs produits restent en attente : c'est
+     une décision humaine, pas un tri automatique. */
+  rapport.ambigus = new Set([
+    ...apercu.receptions.liste.flatMap((r) => r.lignes)
+      .filter((l) => l.statutProduit === "AMBIGU").map((l) => l.libelle),
+    ...apercu.mouvements.liste
+      .filter((m) => m.statutProduit === "AMBIGU").map((m) => m.description),
+  ]).size;
+
+  return rapport;
+}
+
 /** Ouvre les anomalies du lot. Une anomalie déjà ouverte n'est pas rouverte. */
 async function ecrireAnomalies(client, { companyId, batchId, sha, apercu }) {
   let ouvertes = 0, deja = 0;
@@ -391,5 +470,6 @@ async function ecrireAnomalies(client, { companyId, batchId, sha, apercu }) {
 
 module.exports = {
   cleIdempotence, normaliserLibelle, chargerIndexProduits, trouverProduit, trouverEmplacement,
-  previsualiser, ecrireReceptions, ecrireAnomalies, NUMERO_RECEPTION,
+  previsualiser, ecrireReceptions, ecrireAnomalies, creerProduitsManquants,
+  NUMERO_RECEPTION,
 };

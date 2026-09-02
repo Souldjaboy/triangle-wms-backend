@@ -20,6 +20,8 @@ const express = require("express");
 const P = require("../services/import-em2s");
 const D = require("../services/import-em2s-db");
 const contexteSociete = require("../services/company-context");
+const M = require("../services/import-em2s-mouvements");
+const permissionsService = require("../services/permissions");
 
 module.exports = function createImportEm2sRouter(deps) {
   const { pool, authenticateToken, getEffectiveCompanyId, requirePermission, upload } = deps;
@@ -274,6 +276,30 @@ module.exports = function createImportEm2sRouter(deps) {
     if (anomalie.anomaly_type === "MULTI_BIN") {
       const parBin = resolution.parBin;
       if (!parBin || typeof parBin !== "object") refus("Indiquez la quantité de chaque bac.", "BINS_REQUIRED");
+
+      /* Deux questions distinctes vivent sur cette même ligne : où repose le
+         stock, et par quel bac le mouvement est passé. La seconde est
+         facultative — sans elle le mouvement attend — mais si elle est donnée,
+         elle doit tomber juste elle aussi. */
+      const parBinMouvement = resolution.parBinMouvement;
+      if (parBinMouvement) {
+        if (typeof parBinMouvement !== "object") {
+          refus("La répartition du mouvement doit donner une quantité par bac.", "MOVE_BINS_INVALID");
+        }
+        const binsMvt = Object.keys(parBinMouvement);
+        const horsLigne = binsMvt.filter((b) => !(charge.bins || []).includes(b));
+        if (horsLigne.length) refus(`Bac hors de cette ligne : ${horsLigne.join(", ")}.`, "BIN_UNKNOWN");
+        if (Object.values(parBinMouvement).some((q) => Number(q) < 0)) {
+          refus("Une quantité ne peut pas être négative.", "NEGATIVE");
+        }
+        const sommeMvt = Object.values(parBinMouvement).reduce((s, q) => s + Number(q || 0), 0);
+        const attenduMvt = Number(resolution.quantiteMouvement
+          ?? charge.entrees ?? charge.sorties);
+        if (Number.isFinite(attenduMvt) && sommeMvt !== attenduMvt) {
+          refus(`La répartition du mouvement totalise ${sommeMvt} au lieu de ${attenduMvt}.`,
+                "MOVE_ALLOCATION_MISMATCH");
+        }
+      }
       const attendue = Number(charge.quantiteAttendue);
       const bins = Array.isArray(charge.bins) ? charge.bins : [];
       const inconnus = Object.keys(parBin).filter((b) => !bins.includes(b));
@@ -317,6 +343,282 @@ module.exports = function createImportEm2sRouter(deps) {
       refus("Aucune décision fournie.", "RESOLUTION_REQUIRED");
     }
   }
+
+  /* ──────────────────────────────── lever plusieurs anomalies d'un coup ── */
+
+  /**
+   * Cent soixante-cinq lignes à répartir : les enregistrer une par une ferait
+   * cent soixante-cinq allers-retours. Ici, tout le lot passe ou rien — une
+   * saisie à moitié enregistrée laisserait l'opérateur sans savoir où il en est.
+   */
+  router.post("/stock/import-em2s/anomalies/bulk-resolve", authenticateToken, peutResoudre,
+    async (req, res) => {
+      const companyId = await societeDe(req);
+      if (!companyId) return sansSociete(res);
+
+      const entrees = Array.isArray(req.body?.resolutions) ? req.body.resolutions : [];
+      if (entrees.length === 0) {
+        return res.status(400).json({ error: "Aucune résolution fournie.", code: "EMPTY" });
+      }
+      if (entrees.length > 500) {
+        return res.status(400).json({ error: "Trop de lignes en une fois (500 au plus).", code: "TOO_MANY" });
+      }
+
+      try {
+        const out = await transaction(async (client) => {
+          const faites = [];
+          for (const entree of entrees) {
+            const { rows } = await client.query(
+              `SELECT * FROM stock_import_anomalies
+                WHERE id = $1 AND company_id = $2 FOR UPDATE`,
+              [Number(entree.id), companyId]
+            );
+            const anomalie = rows[0];
+            if (!anomalie) {
+              const e = new Error(`Anomalie ${entree.id} introuvable.`);
+              e.httpStatus = 404; e.code = "NOT_FOUND"; throw e;
+            }
+            if (anomalie.status !== "OPEN") {
+              const e = new Error(`L'anomalie ${anomalie.id} (ligne ${anomalie.excel_row}) est déjà tranchée.`);
+              e.httpStatus = 409; e.code = "ALREADY_RESOLVED"; throw e;
+            }
+
+            /* Le même contrôle de somme que pour une résolution isolée : une
+               saisie en masse n'a pas le droit d'être plus permissive. */
+            verifierResolution(anomalie, entree.resolution || {});
+
+            await client.query(
+              `UPDATE stock_import_anomalies
+                  SET status = 'RESOLVED', resolution = $1, resolved_by = $2, resolved_at = now()
+                WHERE id = $3`,
+              [JSON.stringify(entree.resolution), req.user?.id || null, anomalie.id]
+            );
+            faites.push({ id: anomalie.id, ligne: anomalie.excel_row, type: anomalie.anomaly_type });
+          }
+          return { tranchees: faites.length, detail: faites };
+        });
+        res.json({ success: true, ...out });
+      } catch (e) { echec(res, e, "Erreur de résolution groupée."); }
+    });
+
+  /* ─────────────────────────────────── créer les produits manquants ── */
+
+  /**
+   * Étape distincte, et volontairement : créer un produit engage le
+   * catalogue. On ne le fait pas en passant, au milieu d'un import de
+   * réceptions, sans que personne ait regardé la liste.
+   */
+  router.post("/stock/import-em2s/products", authenticateToken, peutEcrire,
+    upload.single("file"), async (req, res) => {
+      const companyId = await societeDe(req);
+      if (!companyId) return sansSociete(res);
+      try {
+        const { buffer, nom } = fichierDe(req);
+        const attendue = String(req.body?.sha256 || "").trim().toLowerCase();
+
+        const out = await transaction(async (client) => {
+          const apercu = await D.previsualiser(client, { companyId, buffer, nomFichier: nom });
+          if (attendue && attendue !== apercu.fichier.sha256) {
+            const e = new Error("Le fichier a changé depuis la prévisualisation.");
+            e.httpStatus = 409; e.code = "FILE_CHANGED"; throw e;
+          }
+          const { rows: lots } = await client.query(
+            `SELECT id FROM stock_import_batches
+              WHERE company_id = $1 AND file_sha256 = $2 AND status <> 'CANCELLED'
+              ORDER BY id DESC LIMIT 1`,
+            [companyId, apercu.fichier.sha256]);
+          if (!lots[0]) {
+            const e = new Error("Ce fichier n'a pas encore été importé.");
+            e.httpStatus = 409; e.code = "BATCH_REQUIRED"; throw e;
+          }
+          return D.creerProduitsManquants(client, {
+            companyId, batchId: lots[0].id, sha: apercu.fichier.sha256,
+            apercu, utilisateur: utilisateurDe(req),
+          });
+        });
+        res.status(201).json({ success: true, ...out });
+      } catch (e) { echec(res, e, "Erreur de création des produits."); }
+    });
+
+  /* ─────────────────────────── écrire les mouvements enfin exploitables ── */
+
+  /**
+   * La seule route de tout l'import qui touche au stock. Elle vient après que
+   * tout a été tranché : une ligne encore bloquée n'écrit rien.
+   */
+  router.post("/stock/import-em2s/movements", authenticateToken, peutEcrire,
+    upload.single("file"), async (req, res) => {
+      const companyId = await societeDe(req);
+      if (!companyId) return sansSociete(res);
+      try {
+        const { buffer, nom } = fichierDe(req);
+        const attendue = String(req.body?.sha256 || "").trim().toLowerCase();
+        const simulation = String(req.body?.simulation || "") === "1";
+
+        const out = await transaction(async (client) => {
+          const apercu = await D.previsualiser(client, { companyId, buffer, nomFichier: nom });
+          if (attendue && attendue !== apercu.fichier.sha256) {
+            const e = new Error("Le fichier a changé depuis la prévisualisation.");
+            e.httpStatus = 409; e.code = "FILE_CHANGED"; throw e;
+          }
+
+          const { rows: lots } = await client.query(
+            `SELECT id FROM stock_import_batches
+              WHERE company_id = $1 AND file_sha256 = $2 AND status <> 'CANCELLED'
+              ORDER BY id DESC LIMIT 1`,
+            [companyId, apercu.fichier.sha256]
+          );
+          if (!lots[0]) {
+            const e = new Error("Ce fichier n'a pas encore été importé : lancez d'abord l'import des réceptions.");
+            e.httpStatus = 409; e.code = "BATCH_REQUIRED"; throw e;
+          }
+
+          const avant = await client.query(
+            `SELECT COALESCE(SUM(quantity),0)::numeric AS stock FROM stock_location_balances
+              WHERE company_id = $1`, [companyId]);
+
+          const rapport = await M.ecrireMouvements(client, {
+            companyId, batchId: lots[0].id, sha: apercu.fichier.sha256,
+            apercu, utilisateur: utilisateurDe(req),
+          });
+
+          const apres = await client.query(
+            `SELECT COALESCE(SUM(quantity),0)::numeric AS stock FROM stock_location_balances
+              WHERE company_id = $1`, [companyId]);
+
+          const reconciliation = await M.reconcilier(client, { companyId, apercu });
+
+          /* Une simulation lit tout, écrit tout, puis annule : c'est la seule
+             façon de montrer le résultat exact sans le subir. */
+          if (simulation) {
+            const e = new Error("SIMULATION");
+            e.simulation = { rapport, reconciliation,
+              stockAvant: Number(avant.rows[0].stock), stockApres: Number(apres.rows[0].stock) };
+            throw e;
+          }
+
+          return { batchId: lots[0].id, rapport, reconciliation,
+                   stockAvant: Number(avant.rows[0].stock),
+                   stockApres: Number(apres.rows[0].stock) };
+        }).catch((e) => {
+          if (e.simulation) return { simulation: true, ...e.simulation };
+          throw e;
+        });
+
+        res.status(out.simulation ? 200 : 201).json({ success: true, ...out });
+      } catch (e) { echec(res, e, "Erreur d'écriture des mouvements."); }
+    });
+
+  /* ───────────────────────────────────────────────── réconciliation ── */
+
+  router.post("/stock/import-em2s/reconciliation", authenticateToken, peutVoir,
+    upload.single("file"), async (req, res) => {
+      const companyId = await societeDe(req);
+      if (!companyId) return sansSociete(res);
+      const client = await pool.connect();
+      try {
+        const { buffer, nom } = fichierDe(req);
+        const apercu = await D.previsualiser(client, { companyId, buffer, nomFichier: nom });
+        const reconciliation = await M.reconcilier(client, { companyId, apercu });
+        res.json({ success: true, fichier: apercu.fichier, reconciliation });
+      } catch (e) { echec(res, e, "Erreur de réconciliation."); }
+      finally { client.release(); }
+    });
+
+  /* ──────────────────────── corriger la date d'un bon déjà imprimé ── */
+
+  /**
+   * Avant impression, corriger une date est une correction de saisie. Après,
+   * c'est autre chose : le bon est parti quelque part, et l'écart doit
+   * pouvoir s'expliquer. D'où le motif obligatoire, la révision, et
+   * l'ancienne valeur conservée.
+   */
+  router.patch("/stock/receptions/:id/dates", authenticateToken,
+    requirePermission("reception", "update"), async (req, res) => {
+      const companyId = await societeDe(req);
+      if (!companyId) return sansSociete(res);
+      try {
+        const out = await transaction(async (client) => {
+          const { rows } = await client.query(
+            `SELECT * FROM stock_receptions WHERE id = $1 AND company_id = $2 FOR UPDATE`,
+            [Number(req.params.id), companyId]
+          );
+          const rec = rows[0];
+          if (!rec) { const e = new Error("Réception introuvable."); e.httpStatus = 404; e.code = "NOT_FOUND"; throw e; }
+
+          const nouvelle = String(req.body?.document_datetime || "").trim();
+          if (!nouvelle) {
+            const e = new Error("Indiquez la date métier du bon.");
+            e.httpStatus = 400; e.code = "DATE_REQUIRED"; throw e;
+          }
+          const instant = new Date(nouvelle);
+          if (Number.isNaN(instant.getTime())) {
+            const e = new Error("Date illisible."); e.httpStatus = 400; e.code = "DATE_INVALID"; throw e;
+          }
+
+          const dejaImprime = Number(rec.print_count || 0) > 0;
+          const motif = String(req.body?.reason || "").trim();
+
+          if (dejaImprime) {
+            if (!motif) {
+              const e = new Error("Ce bon a déjà été imprimé : un motif est obligatoire pour corriger sa date.");
+              e.httpStatus = 400; e.code = "REASON_REQUIRED"; throw e;
+            }
+            const ctx = await permissionsService.chargerContexte(pool, req.user);
+            const verdict = permissionsService.decider(ctx, "reception", "edit_date_after_print");
+            if (!verdict.autorise) {
+              const e = new Error("Corriger la date d'un bon déjà imprimé demande un droit distinct.");
+              e.httpStatus = 403; e.code = "AFTER_PRINT_FORBIDDEN"; throw e;
+            }
+          }
+
+          const revision = Number(rec.document_revision || 0) + 1;
+
+          /* L'ancienne valeur est écrite AVANT la nouvelle : si quoi que ce
+             soit échoue ensuite, la transaction annule les deux, et on ne se
+             retrouve jamais avec une date changée sans trace. */
+          await client.query(
+            `INSERT INTO stock_reception_date_revisions
+               (company_id, reception_id, revision, field, old_value, new_value,
+                reason, after_print, changed_by, changed_by_name)
+             VALUES ($1,$2,$3,'document_datetime',$4,$5,$6,$7,$8,$9)`,
+            [companyId, rec.id, revision, rec.document_datetime, instant,
+             motif || null, dejaImprime, req.user?.id || null,
+             req.user?.fullname || req.user?.email || null]
+          );
+
+          const { rows: apres } = await client.query(
+            `UPDATE stock_receptions
+                SET document_datetime = $1, operation_effective_at = $1,
+                    document_revision = $2, updated_at = now()
+              WHERE id = $3
+              RETURNING id, reception_number, document_datetime, created_at,
+                        document_revision, print_count, printed_at`,
+            [instant, revision, rec.id]
+          );
+
+          /* `created_at` n'est jamais touché : il dit quand la ligne est née
+             dans la base, et cette vérité-là ne se corrige pas. */
+          return { reception: apres[0], revision, apresImpression: dejaImprime,
+                   ancienneValeur: rec.document_datetime };
+        });
+        res.json({ success: true, ...out });
+      } catch (e) { echec(res, e, "Erreur de correction de date."); }
+    });
+
+  router.get("/stock/receptions/:id/date-revisions", authenticateToken, peutVoir,
+    async (req, res) => {
+      const companyId = await societeDe(req);
+      if (!companyId) return sansSociete(res);
+      try {
+        const { rows } = await pool.query(
+          `SELECT * FROM stock_reception_date_revisions
+            WHERE reception_id = $1 AND company_id = $2 ORDER BY revision`,
+          [Number(req.params.id), companyId]
+        );
+        res.json({ success: true, revisions: rows });
+      } catch (e) { echec(res, e, "Erreur de lecture des révisions."); }
+    });
 
   /* ────────────────────────────────────────────────────── annulation ── */
 
@@ -388,8 +690,8 @@ module.exports = function createImportEm2sRouter(deps) {
          vérifié ici plutôt qu'en refusant après coup. */
       const premiere = Number(rec.print_count || 0) === 0;
       if (!premiere) {
-        const ctx = await require("../services/permissions").chargerContexte(pool, req.user);
-        const verdict = require("../services/permissions").decider(ctx, "reception", "reprint");
+        const ctx = await permissionsService.chargerContexte(pool, req.user);
+        const verdict = permissionsService.decider(ctx, "reception", "reprint");
         if (!verdict.autorise) {
           return res.status(403).json({
             error: "Ce bon a déjà été imprimé : la réimpression demande un droit distinct.",

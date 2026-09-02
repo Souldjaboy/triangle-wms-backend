@@ -403,11 +403,160 @@ async function main() {
     verifier("annuler ne touche pas le stock", (await stockTotal(TRIANGLE.id)) === stockAvant);
   }
 
-  console.log("\n▸ BILAN");
+  console.log("\n▸ SAISIE EN MASSE DES RÉPARTITIONS");
   {
-    verifier("le stock total est strictement identique au départ",
+    const restantes = (await pool.query(
+      `SELECT * FROM stock_import_anomalies
+        WHERE company_id = $1 AND anomaly_type = 'MULTI_BIN' AND status = 'OPEN'
+        ORDER BY excel_row`, [TRIANGLE.id])).rows;
+
+    const juste = restantes.map((a) => {
+      const bins = a.payload.bins || [];
+      const total = Number(a.payload.quantiteAttendue || 0);
+      const part = Math.floor(total / bins.length);
+      const valeurs = Object.fromEntries(bins.map((b, i) =>
+        [b, i === bins.length - 1 ? total - part * (bins.length - 1) : part]));
+      return { id: a.id, resolution: { parBin: valeurs } };
+    });
+
+    if (juste.length > 0) {
+      /* Une seule ligne fausse doit faire échouer TOUT le lot : une saisie à
+         moitié enregistrée laisserait l'opérateur sans savoir où il en est. */
+      const avecUneFausse = juste.map((x, i) => i === 0
+        ? { ...x, resolution: { parBin: Object.fromEntries(
+            Object.entries(x.resolution.parBin).map(([b], j) => [b, j === 0 ? 999999 : 0])) } }
+        : x);
+      const refus = await appel("POST", "/stock/import-em2s/anomalies/bulk-resolve",
+        jImport, { resolutions: avecUneFausse }, chezTriangle);
+      verifier("une seule ligne fausse fait échouer tout le lot",
+        refus.statut === 400 && refus.corps.code === "ALLOCATION_MISMATCH",
+        `statut ${refus.statut} ${refus.corps.code}`);
+
+      const ouvertesApres = Number((await pool.query(
+        `SELECT count(*)::int AS n FROM stock_import_anomalies
+          WHERE company_id = $1 AND anomaly_type = 'MULTI_BIN' AND status = 'OPEN'`,
+        [TRIANGLE.id])).rows[0].n);
+      verifier("aucune ligne du lot refusé n'a été enregistrée",
+        ouvertesApres === restantes.length, `${ouvertesApres} / ${restantes.length}`);
+
+      const ok = await appel("POST", "/stock/import-em2s/anomalies/bulk-resolve",
+        jImport, { resolutions: juste }, chezTriangle);
+      verifier("un lot entièrement juste passe d'un coup",
+        ok.statut === 200 && ok.corps.tranchees === juste.length,
+        `statut ${ok.statut} ${ok.corps.tranchees}/${juste.length}`);
+    }
+
+    verifier("la saisie en masse ne touche pas le stock",
+      (await stockTotal(TRIANGLE.id)) === stockAvant);
+  }
+
+  console.log("\n▸ ÉCRITURE DES MOUVEMENTS");
+  {
+    const incoherente = (await pool.query(
+      `SELECT * FROM stock_import_anomalies
+        WHERE company_id = $1 AND anomaly_type = 'NEW_STOCK_INCOHERENT' AND status = 'OPEN'`,
+      [TRIANGLE.id])).rows[0];
+    if (incoherente) {
+      await appel("POST", `/stock/import-em2s/anomalies/${incoherente.id}/resolve`, jImport,
+        { resolution: { valeurRetenue: "ATTENDU", motif: "Recomptage physique du 2 septembre." } },
+        chezTriangle);
+    }
+
+    const simulation = await envoyer("/stock/import-em2s/movements", jImport,
+      { sha256: apercu.fichier.sha256, simulation: "1" }, CLASSEUR, chezTriangle);
+    verifier("la simulation rend un rapport", simulation.statut === 200 && simulation.corps.simulation === true,
+      `statut ${simulation.statut}`);
+    verifier("la simulation n'écrit rien",
       (await stockTotal(TRIANGLE.id)) === stockAvant,
       `${stockAvant} → ${await stockTotal(TRIANGLE.id)}`);
+
+    const reel = await envoyer("/stock/import-em2s/movements", jImport,
+      { sha256: apercu.fichier.sha256 }, CLASSEUR, chezTriangle);
+    verifier("l'écriture des mouvements aboutit", reel.statut === 201,
+      `statut ${reel.statut} ${JSON.stringify(reel.corps).slice(0, 160)}`);
+
+    const rapport = reel.corps.rapport || {};
+    verifier("le rapport distingue écrits, bloqués et ignorés",
+      typeof rapport.ecrits === "number" && typeof rapport.bloques === "number",
+      JSON.stringify({ e: rapport.ecrits, b: rapport.bloques, i: rapport.ignores }));
+    verifier("les lignes encore bloquées n'ont rien écrit",
+      (rapport.details || []).filter((d) => d.etat === "bloqué")
+        .every((d) => d.quantite === undefined));
+
+    const rejeu = await envoyer("/stock/import-em2s/movements", jImport,
+      { sha256: apercu.fichier.sha256 }, CLASSEUR, chezTriangle);
+    verifier("rejouer l'écriture n'ajoute aucun mouvement",
+      rejeu.statut === 201 && (rejeu.corps.rapport?.ecrits || 0) === 0,
+      `${rejeu.corps.rapport?.ecrits} écrit(s)`);
+    verifier("le stock est le même après le rejeu",
+      Number(rejeu.corps.stockAvant) === Number(rejeu.corps.stockApres),
+      `${rejeu.corps.stockAvant} → ${rejeu.corps.stockApres}`);
+
+    verifier("la réconciliation constate sans corriger",
+      reel.corps.reconciliation && typeof reel.corps.reconciliation.ecarts === "number",
+      JSON.stringify(reel.corps.reconciliation?.ecarts));
+
+    const negatifs = Number((await pool.query(
+      `SELECT count(*)::int AS n FROM stock_location_balances WHERE quantity < 0`)).rows[0].n);
+    verifier("aucune balance négative", negatifs === 0, `${negatifs}`);
+  }
+
+  console.log("\n▸ CORRIGER UNE DATE APRÈS IMPRESSION");
+  {
+    const { rows } = await pool.query(
+      `SELECT * FROM stock_receptions WHERE company_id = $1 ORDER BY id LIMIT 1`, [TRIANGLE.id]);
+    const rec = rows[0];
+    const creationAvant = rec.created_at;
+
+    const avant = await appel("PATCH", `/stock/receptions/${rec.id}/dates`, jSuper,
+      { document_datetime: "2026-06-20T09:00:00Z" }, chezTriangle);
+    verifier("avant impression, la date se corrige sans motif", avant.statut === 200,
+      `statut ${avant.statut} ${avant.corps.code || ""}`);
+
+    await appel("GET", `/stock/receptions/${rec.id}/print`, jSuper, null, chezTriangle);
+
+    const sansMotif = await appel("PATCH", `/stock/receptions/${rec.id}/dates`, jSuper,
+      { document_datetime: "2026-06-21T09:00:00Z" }, chezTriangle);
+    verifier("après impression, le motif devient obligatoire",
+      sansMotif.statut === 400 && sansMotif.corps.code === "REASON_REQUIRED",
+      `statut ${sansMotif.statut} ${sansMotif.corps.code}`);
+
+    const avecMotif = await appel("PATCH", `/stock/receptions/${rec.id}/dates`, jSuper,
+      { document_datetime: "2026-06-21T09:00:00Z", reason: "Bon de transport reçu après coup." },
+      chezTriangle);
+    verifier("avec motif, la correction passe et crée une révision",
+      avecMotif.statut === 200 && avecMotif.corps.revision >= 2,
+      `statut ${avecMotif.statut} révision ${avecMotif.corps.revision}`);
+
+    const revisions = await appel("GET", `/stock/receptions/${rec.id}/date-revisions`,
+      jSuper, null, chezTriangle);
+    verifier("l'historique garde l'ancienne valeur",
+      revisions.statut === 200 && revisions.corps.revisions.length >= 2
+        && revisions.corps.revisions.some((r) => r.after_print === true && r.reason),
+      `${revisions.corps.revisions?.length} révision(s)`);
+
+    const apres = await pool.query(
+      `SELECT created_at, document_datetime, print_count FROM stock_receptions WHERE id = $1`, [rec.id]);
+    verifier("created_at n'a pas bougé",
+      new Date(apres.rows[0].created_at).getTime() === new Date(creationAvant).getTime());
+    verifier("print_count a bien été incrémenté par l'impression",
+      Number(apres.rows[0].print_count) >= 1, `${apres.rows[0].print_count}`);
+  }
+
+  console.log("\n▸ BILAN");
+  {
+    /* Le stock a pu bouger — c'est le but de l'écriture des mouvements. Ce
+       qui doit rester vrai, c'est qu'il n'a bougé QUE par des mouvements
+       tracés : autant de quantité écrite que de quantité constatée. */
+    const parMouvements = Number((await pool.query(
+      `SELECT COALESCE(SUM(CASE WHEN movement_kind = 'Entrée' THEN quantity
+                                ELSE -quantity END), 0)::numeric AS q
+         FROM stock_import_operations
+        WHERE company_id = $1 AND kind = 'MOVEMENT' AND movement_id IS NOT NULL`,
+      [TRIANGLE.id])).rows[0].q);
+    verifier("le stock n'a bougé que par des mouvements tracés",
+      (await stockTotal(TRIANGLE.id)) === stockAvant + parMouvements,
+      `${stockAvant} + ${parMouvements} ≠ ${await stockTotal(TRIANGLE.id)}`);
     verifier("aucun stock négatif n'est apparu",
       Number((await pool.query(
         `SELECT count(*)::int AS n FROM stock_location_balances WHERE quantity < 0`)).rows[0].n) === 0);
