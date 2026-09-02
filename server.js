@@ -8770,6 +8770,22 @@ app.put("/super-admin/modules/company/:companyId", authenticateToken, async (req
 });
 
 /* DOCUMENTS SAAS */
+/* Documents : generation groupee transactionnelle, correction du contenu
+   imprime, annulation avec remplacement.
+
+   Monte AVANT les routes `/documents/...` declarees plus bas : Express
+   essaie les routes dans l'ordre, et `/documents/:id` prendrait
+   « pending-movements » pour un identifiant. */
+const createDocumentsContentRouter = require("./routes/documents-content");
+app.use(
+  "/",
+  createDocumentsContentRouter({
+    pool, authenticateToken, getEffectiveCompanyId, requirePermission,
+    nextShortDocumentNumber,
+    permissionsService: require("./services/permissions"),
+  })
+);
+
 app.get("/documents", authenticateToken, requirePermission("document", "view"), async (req, res) => {
   try {
 
@@ -9199,7 +9215,11 @@ app.post("/documents/from-movement/:id", authenticateToken, requirePermission("d
       if (movement.type === "Entrée") {
         finalType = "Bon de réception";
       } else if (movement.type === "Sortie") {
-        finalType = "Bon de livraison";
+          /* Un bon de livraison accompagne une marchandise vendue et livrée à
+             quelqu'un. Une sortie de stock peut être une casse, un départ vers
+             un chantier, une consommation interne : lui coller un BL fait
+             sortir des livraisons que personne n'a commandées. */
+          finalType = "Bon de sortie";
       } else if (movement.type === "Transfert") {
         finalType = "Bon de transfert";
       } else if (movement.type === "Inventaire") {

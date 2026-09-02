@@ -13,6 +13,13 @@
  * de savoir que la ligne a été créée le 25.
  */
 
+/* Les attendus de ce fichier sont écrits à l'heure de Bamako, celle du VPS et
+   celle du client. Sur une machine réglée ailleurs — un poste en Europe est à
+   +2 l'été — les mêmes horodatages s'affichaient deux heures plus tôt et six
+   contrôles viraient au rouge sans qu'aucun code n'ait changé. Le fuseau est
+   donc fixé ici, avant toute manipulation de date. */
+process.env.TZ = "Africa/Bamako";
+
 const express = require("express");
 const { Pool } = require("pg");
 const creerRouteur = require("../routes/documents-dates");
