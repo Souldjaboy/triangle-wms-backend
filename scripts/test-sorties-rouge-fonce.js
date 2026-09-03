@@ -251,15 +251,29 @@ async function main() {
 
     const bons = await q(
       `SELECT d.document_number, d.document_datetime::date::text AS dd,
-              e.effective_date::text AS de, d.observation
+              e.effective_date::text AS de, d.observation,
+              e.excel_row AS ev_ligne, e.excel_cell AS ev_cellule
          FROM documents d JOIN stock_import_movement_events e
            ON e.id = d.stock_import_movement_event_id
         WHERE d.cancelled_at IS NULL`);
     verifier("chaque bon porte la date métier de son événement",
       bons.length === 20 && bons.every((b) => b.dd === b.de),
       JSON.stringify(bons.filter((b) => b.dd !== b.de)));
-    verifier("chaque bon cite sa ligne Excel et sa cellule",
-      bons.every((b) => /ligne \d+ · cellule M\d+/.test(b.observation || "")));
+    /* `observation` est un champ CLIENT. Les bons NOUVELLEMENT CRÉÉS par ce
+       script y restent muets (observation vide). Les bons CONSERVÉS —
+       rattachés à leur événement sans être recréés — gardent l'observation
+       qu'ils avaient déjà, écrite par un autre chemin ; ce script ne la
+       touche pas. Dans les deux cas, aucun bon ne doit porter le jargon
+       propre à ce script : fichier, feuille, ligne, cellule, couleur. */
+    verifier("aucun bon ne porte le jargon technique de la reconstruction",
+      bons.every((b) => !/feuille|cellule|rouge foncé|VERSION MÉTIER/.test(b.observation || "")),
+      JSON.stringify(bons.filter((b) => /feuille|cellule|rouge foncé|VERSION MÉTIER/
+        .test(b.observation || "")).map((b) => b.document_number)));
+    verifier("les bons nouvellement créés ont une observation vide",
+      bons.filter((b) => !["BS-260902-129", "BS-260902-128"].includes(b.document_number))
+        .every((b) => !(b.observation || "").trim()));
+    verifier("chaque événement lié garde sa ligne Excel et sa cellule",
+      bons.every((b) => b.ev_ligne && /^M\d+$/.test(b.ev_cellule)));
   }
 
   /* ────────────────────────────────────────────────────────────────── */

@@ -927,24 +927,18 @@ async function main() {
           rattacher sans les dater les laisserait porter une date fausse.
           Une date déjà saisie n'est jamais écrasée : quelqu'un l'a voulue. */
     for (const g of plan.garder) {
-      const provenance = `Sortie EM2S — ${imp.file_name} · feuille ${g.evenement.excel_sheet}`
-        + ` · ligne ${g.evenement.excel_row} · cellule ${g.evenement.excel_cell}`
-        + ` · rouge foncé ${COULEUR_NOUVELLE_SORTIE}`
-        + (auditVersionMetier
-          ? ` · VERSION MÉTIER VALIDÉE (empreinte import ${String(imp.file_hash).slice(0, 12)}…,`
-            + ` fichier relu ${lu.sha256.slice(0, 12)}…)`
-          : "");
+      /* La preuve — fichier, feuille, ligne, cellule, mouvement, empreintes,
+         alias — vit dans stock_import_movement_events.source_context, jamais
+         sur le bon lui-même. Un client qui reçoit ce document ne doit jamais
+         lire de jargon technique ; `observation` reste donc intacte ici,
+         sans y injecter la provenance de l'événement. */
       await client.query(
         `UPDATE documents
             SET stock_import_movement_event_id = $1,
                 document_datetime = COALESCE(document_datetime, $2::timestamptz),
-                observation = CASE
-                  WHEN observation IS NULL OR observation = '' THEN $3
-                  WHEN position($3 in observation) > 0 THEN observation
-                  ELSE observation || ' — ' || $3 END,
                 updated_at = now()
-          WHERE id = $4 AND cancelled_at IS NULL`,
-        [g.evenement.id, `${g.evenement.effective_date}T12:00:00Z`, provenance, g.doc.id]);
+          WHERE id = $3 AND cancelled_at IS NULL`,
+        [g.evenement.id, `${g.evenement.effective_date}T12:00:00Z`, g.doc.id]);
       bilan.gardes += 1;
     }
 
@@ -988,26 +982,23 @@ async function main() {
       if (dejaFaits.has(e.event_key)) continue;
       const mvt = mouvements.find((m) => m.id === e.movement_id);
       const numero = await nextShortDocumentNumber("BS", societe, client);
-      const provenance = `Sortie EM2S — ${imp.file_name} · feuille ${e.excel_sheet}`
-        + ` · ligne ${e.excel_row} · cellule ${e.excel_cell} · rouge foncé ${COULEUR_NOUVELLE_SORTIE}`
-        + (e.movement_id ? ` · mouvement #${e.movement_id}` : " · sans mouvement rattaché")
-        /* Un bon né d'une version métier le dit sur lui-même : celui qui le
-           lira dans un an n'aura pas à retrouver ce script. */
-        + (auditVersionMetier
-          ? ` · VERSION MÉTIER VALIDÉE (empreinte import ${String(imp.file_hash).slice(0, 12)}…,`
-            + ` fichier relu ${lu.sha256.slice(0, 12)}…) — ${EXCEPTION.motif}`
-          : "");
-
+      /* `observation` est un champ CLIENT : un bon imprimé part parfois chez
+         quelqu'un d'extérieur, et rien de technique — fichier, feuille,
+         cellule, empreintes, mention « VERSION MÉTIER VALIDÉE » — n'a sa
+         place là. Toute cette preuve est déjà écrite, complète, dans
+         `stock_import_movement_events.source_context` (et son
+         `audit_version_metier` le cas échéant), accessible via
+         `stock_import_movement_event_id`. Le bon reste donc muet ici. */
       const { rows: doc } = await client.query(
         `INSERT INTO documents
            (document_type, document_number, client_name, client_phone, client_address,
             total_amount, observation, created_by, company_id,
             related_entity_type, related_entity_id, stock_movement_id,
             stock_import_movement_event_id, warehouse_id, status, document_datetime)
-         VALUES ('Bon de sortie',$1,'','','',0,$2,$3,$4,'stock_import_movement_event',
-                 $5::integer,$6::integer,$5::bigint,$7::integer,'Validé',$8::timestamptz)
+         VALUES ('Bon de sortie',$1,'','','',0,'',$2,$3,'stock_import_movement_event',
+                 $4::integer,$5::integer,$4::bigint,$6::integer,'Validé',$7::timestamptz)
          RETURNING id, document_number`,
-        [numero, provenance, "Reconstruction EM2S", societe,
+        [numero, "Reconstruction EM2S", societe,
          e.id, e.movement_id, mvt?.warehouse_id || null,
          `${e.effective_date}T12:00:00Z`]);
 

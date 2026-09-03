@@ -432,16 +432,31 @@ async function main() {
       ev.filter((e) => e.source_context.alias_certifie).length === 1);
 
     const bons = await q(
-      `SELECT observation, (SELECT sum(quantity) FROM document_items i
-         WHERE i.document_id = d.id) AS q
+      `SELECT d.observation, d.stock_import_movement_event_id AS ev_id,
+              (SELECT sum(quantity) FROM document_items i WHERE i.document_id = d.id) AS q
          FROM documents d WHERE d.cancelled_at IS NULL AND d.stock_import_movement_event_id IS NOT NULL`);
     verifier("21 bons actifs", bons.length === 21, String(bons.length));
     verifier("ils totalisent 739", bons.reduce((s, b) => s + Number(b.q), 0) === 739);
-    verifier("chaque bon porte la mention de version métier",
-      bons.every((b) => /VERSION MÉTIER VALIDÉE/.test(b.observation || "")));
-    verifier("chaque bon cite les deux empreintes",
-      bons.every((b) => /61b7104201a1/.test(b.observation)
-        && /2ceb0871526e/.test(b.observation)));
+    /* `observation` est un champ CLIENT : aucun bon ne doit y porter la
+       moindre trace technique. La preuve de version métier vit uniquement
+       dans l'événement lié (déjà vérifié plus haut sur `officiency`), jamais
+       sur le document lui-même. */
+    verifier("aucun bon ne porte la mention de version métier dans observation",
+      bons.every((b) => !/VERSION MÉTIER VALIDÉE/.test(b.observation || "")));
+    verifier("aucun bon ne cite d'empreinte dans observation",
+      bons.every((b) => !/61b7104201a1/.test(b.observation || "")
+        && !/2ceb0871526e/.test(b.observation || "")));
+    /* Deux des 21 sont des bons CONSERVÉS (rattachés à leur événement sans
+       être recréés) : ils gardent l'observation qu'ils avaient déjà, écrite
+       par un autre chemin, que ce script ne touche jamais. Les 19 autres
+       sont nouvellement créés et restent muets. */
+    const conserves = bons.filter((b) => (b.observation || "").trim());
+    verifier("seuls les bons conservés (pas nouvellement créés) gardent une observation",
+      conserves.every((b) => !/feuille|cellule|rouge foncé|VERSION MÉTIER|61b7104201a1|2ceb0871526e/
+        .test(b.observation)),
+      JSON.stringify(conserves));
+    verifier("les bons nouvellement créés ont une observation vide",
+      bons.length - conserves.length === 19, `${bons.length - conserves.length} vides sur ${bons.length}`);
 
     verifier("l'empreinte enregistrée en base n'a PAS été modifiée",
       (await q(`SELECT file_hash FROM inventory_imports WHERE id = 3`))[0].file_hash
