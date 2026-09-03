@@ -52,6 +52,21 @@
  * Inventer un mouvement. Un événement sans mouvement correspondant — c'est le
  * cas de MAMBRANE — est créé, signalé « non rattaché », et n'obtient un
  * document que si on le demande explicitement.
+ *
+ * ── L'EXCEPTION DE VERSION MÉTIER ──────────────────────────────────────────
+ *
+ * Une empreinte différente est REFUSÉE. Le binaire importé le 2 septembre
+ * n'existe plus ; le fichier restant a le même contenu métier mais d'autres
+ * octets. Pour ce seul cas, une exception nommée s'ouvre — et seulement si
+ * société, import, nom de fichier, les deux empreintes, les 21 lignes
+ * certifiées et les totaux enregistrés concordent TOUS :
+ *
+ *   --autoriser-version-metier \
+ *   --empreinte-import-attendue=61b7104201a1… \
+ *   --confirmer-version-metier=OUI-JE-CONFIRME-LA-VERSION-METIER
+ *
+ * `inventory_imports.file_hash` n'est jamais modifié. Les deux empreintes et
+ * le motif sont inscrits dans chaque événement et chaque bon créés.
  */
 
 const { Pool } = require("pg");
@@ -75,6 +90,75 @@ const FEUILLE = "LISTE DES STOCK";
 const COULEUR_NOUVELLE_SORTIE = "C00000";
 const PHRASE = "OUI-JE-RECONSTRUIS";
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   L'EXCEPTION DE VERSION MÉTIER
+   ═══════════════════════════════════════════════════════════════════════════
+
+   Le classeur importé le 2 septembre portait l'empreinte 61b710… ; ce binaire
+   n'existe plus. Le fichier encore disponible porte 2ceb08… — même contenu
+   métier, octets différents : un classeur Excel ré-enregistré change de
+   binaire sans que rien du métier ne bouge.
+
+   Refuser tout net serait défendable mais bloquant : sans le binaire d'origine,
+   les 21 bons de sortie ne pourraient jamais être émis. Accepter sur le seul
+   nom du fichier serait pire — c'est exactement ainsi qu'on reconstruit des
+   événements à partir d'une version retouchée à la main.
+
+   La sortie est donc une exception NOMMÉE, valable pour ce seul cas, et qui ne
+   s'ouvre que si TOUT concorde en même temps : la société, l'import, le nom du
+   fichier, les deux empreintes attendues, le contenu ligne à ligne du
+   classeur, et les totaux enregistrés de l'import. Une seule divergence, et
+   rien ne s'écrit — pas même en prévisualisation.
+
+   L'empreinte enregistrée n'est JAMAIS modifiée : la base continue de dire la
+   vérité sur ce qui a été importé. Ce sont les événements et les bons créés
+   qui portent la trace des deux empreintes et du motif. */
+
+const EXCEPTION = {
+  companyId: 1,
+  importId: 3,
+  fileName: "Copie de dernier actualisation bby me.xlsx",
+  empreinteEnregistree: "61b7104201a146f27812c6b2603ee3b9dbc790879282b0c081d81e6379690e9e",
+  empreinteFournie: "2ceb0871526eb452a003fdab0852c2881892e131cfbd41974242b9a737f5bc42",
+  phrase: "OUI-JE-CONFIRME-LA-VERSION-METIER",
+  motif: "Binaire d'origine indisponible ; version métier identique validée "
+       + "ligne à ligne contre le relevé certifié et les totaux de l'import n°3.",
+  /* Le résumé enregistré de l'import n°3, tel qu'il figure en base. */
+  totaux: {
+    totalIn: 6073, totalOut: 12193, totalWriteOff: 3,
+    stockBefore: 151244, stockAfter: 149840,
+    rows_read: 235, rows_imported: 200, rows_skipped: 5,
+  },
+};
+
+/* Les 21 sorties rouge foncé, certifiées : ligne, cellule, produit, quantité,
+   date. C'est contre CELA que le classeur est relu, cellule par cellule.
+   Comparer des totaux ne suffirait pas : deux erreurs qui se compensent
+   passeraient. */
+const MANIFESTE_CERTIFIE = [
+  [167, "M167", "PROFESSIONAL AMPLIFIER POWER", 2, "2026-07-29"],
+  [171, "M171", "AUDIO DEVISE", 6, "2026-07-20"],
+  [175, "M175", "OFFICIENCY AMPLIFIER", 8, "2026-07-27"],
+  [196, "M196", "PROFESSIONAL SPEAKER (GRAND)", 8, "2026-07-20"],
+  [199, "M199", "POWER SEQUENCY", 7, "2026-07-27"],
+  [205, "M205", "STADE 4 AOUT", 7, "2026-08-31"],
+  [207, "M207", "STADE 4 AOUT", 7, "2026-08-31"],
+  [208, "M208", "STADE 4 AOUT", 6, "2026-08-31"],
+  [234, "M234", "ROULEAU CABLE NOIR 30M", 2, "2026-08-17"],
+  [248, "M248", "MAMBRANE", 25, "2026-08-25"],
+  [250, "M250", "MICRO BALADEUR BL X24", 8, "2026-07-31"],
+  [253, "M253", "PROCESSEUR NUMERIQUE", 6, "2026-07-24"],
+  [255, "M255", "MG 16XU", 2, "2026-08-17"],
+  [256, "M256", "TETE DE JACK", 504, "2026-07-27"],
+  [260, "M260", "MICRO CONFERENCE", 2, "2026-08-17"],
+  [263, "M263", "MICROPHONE ST 9380", 1, "2026-07-09"],
+  [265, "M265", "AUDIO DEVISE", 1, "2026-08-25"],
+  [266, "M266", "HIGHT EFFICIENCY AMPLIFIER POWER", 6, "2026-08-25"],
+  [267, "M267", "PROFESSIONAL AMPLIFIER POWER", 3, "2026-08-25"],
+  [297, "M297", "FAUX PLAFOND D", 80, "2026-08-20"],
+  [342, "M342", "WALL LAMP", 48, "2026-08-21"],
+];
+
 const args = process.argv.slice(2);
 const opt = (nom) => {
   const t = args.find((a) => a.startsWith(`--${nom}=`));
@@ -84,6 +168,7 @@ const PREVIEW = args.includes("--preview");
 const APPLY = args.includes("--apply");
 const DOCUMENTER_NON_RATTACHES = args.includes("--documenter-non-rattaches");
 const SANS_DOCUMENTS = args.includes("--sans-documents");
+const AUTORISER_VERSION_METIER = args.includes("--autoriser-version-metier");
 
 function stop(message) { console.error(`${R}${message}${Z}`); process.exit(1); }
 
@@ -214,6 +299,144 @@ function cleEvenement(sha256, e) {
   return `EM2S:${sha256.slice(0, 12)}:${e.excel_sheet}:R${e.excel_row}:${e.direction}:${e.effective_date}`;
 }
 
+/* ═══════════════════════════ VALIDATION DE LA VERSION MÉTIER ══ */
+
+/** Le résumé d'import nomme ses totaux différemment selon la version qui
+    l'a écrit. On accepte les graphies connues plutôt que d'échouer sur un
+    détail de nommage — mais une valeur introuvable reste une divergence. */
+function valeurResume(resume, ...cles) {
+  if (!resume || typeof resume !== "object") return undefined;
+  const plat = { ...resume, ...(resume.totaux || {}), ...(resume.totals || {}) };
+  for (const cle of cles) {
+    for (const variante of [cle, cle.toLowerCase(),
+      cle.replace(/([a-z])([A-Z])/g, "$1_$2").toLowerCase()]) {
+      if (plat[variante] !== undefined && plat[variante] !== null) return Number(plat[variante]);
+    }
+  }
+  return undefined;
+}
+
+/**
+ * L'exception n'est accordée que si TOUT concorde.
+ *
+ * Chaque contrôle produit une preuve affichée, ou une divergence. Une seule
+ * divergence suffit à tout arrêter : le but n'est pas de trouver une raison
+ * d'accepter, c'est de rendre impossible d'accepter le mauvais fichier.
+ */
+async function validerVersionMetier({ lu, imp, societe, mouvements }) {
+  const preuves = [];
+  const divergences = [];
+  const controle = (titre, ok, attendu, obtenu) => {
+    (ok ? preuves : divergences).push({ titre, attendu, obtenu });
+  };
+
+  /* ── 1. Le périmètre de l'exception, terme à terme ── */
+  controle("société", societe === EXCEPTION.companyId, EXCEPTION.companyId, societe);
+  controle("import", Number(imp.id) === EXCEPTION.importId, EXCEPTION.importId, Number(imp.id));
+  controle("nom exact du fichier", imp.file_name === EXCEPTION.fileName,
+    EXCEPTION.fileName, imp.file_name);
+  controle("empreinte enregistrée en base",
+    imp.file_hash === EXCEPTION.empreinteEnregistree,
+    EXCEPTION.empreinteEnregistree, imp.file_hash);
+  controle("empreinte du fichier fourni",
+    lu.sha256 === EXCEPTION.empreinteFournie,
+    EXCEPTION.empreinteFournie, lu.sha256);
+  controle("empreinte attendue annoncée par l'opérateur",
+    opt("empreinte-import-attendue") === EXCEPTION.empreinteEnregistree,
+    EXCEPTION.empreinteEnregistree, opt("empreinte-import-attendue") || "(absente)");
+  controle("phrase de confirmation",
+    opt("confirmer-version-metier") === EXCEPTION.phrase,
+    EXCEPTION.phrase, opt("confirmer-version-metier") || "(absente)");
+
+  /* ── 2. Le contenu du classeur, ligne à ligne ── */
+  controle("feuille lue", FEUILLE === "LISTE DES STOCK", "LISTE DES STOCK", FEUILLE);
+  controle("nombre de sorties rouge foncé",
+    lu.evenements.length === MANIFESTE_CERTIFIE.length,
+    MANIFESTE_CERTIFIE.length, lu.evenements.length);
+  controle("total des unités", lu.total === ATTENDU_UNITES, ATTENDU_UNITES, lu.total);
+
+  const parLigne = new Map(lu.evenements.map((e) => [e.excel_row, e]));
+  let lignesConformes = 0;
+  for (const [ligne, cellule, produit, quantite, date] of MANIFESTE_CERTIFIE) {
+    const e = parLigne.get(ligne);
+    if (!e) {
+      divergences.push({ titre: `ligne ${ligne}`, attendu: `${produit} ${quantite} le ${date}`,
+        obtenu: "absente du classeur" });
+      continue;
+    }
+    const memeCellule = e.excel_cell === cellule;
+    const memeProduit = compacter(e.produit) === compacter(produit);
+    const memeQuantite = Number(e.quantity) === quantite;
+    const memeDate = e.effective_date === date;
+    if (memeCellule && memeProduit && memeQuantite && memeDate) { lignesConformes += 1; continue; }
+    divergences.push({
+      titre: `ligne ${ligne}`,
+      attendu: `${cellule} · ${produit} · ${quantite} · ${date}`,
+      obtenu: `${e.excel_cell} · ${e.produit} · ${Number(e.quantity)} · ${e.effective_date}`,
+    });
+  }
+  controle(`les ${MANIFESTE_CERTIFIE.length} lignes certifiées (cellule, produit, quantité, date)`,
+    lignesConformes === MANIFESTE_CERTIFIE.length,
+    `${MANIFESTE_CERTIFIE.length} conformes`, `${lignesConformes} conformes`);
+
+  /* Aucune ligne rouge foncé EN PLUS de celles certifiées : une sortie
+     ajoutée dans une version retouchée doit se voir. */
+  const enTrop = lu.evenements
+    .filter((e) => !MANIFESTE_CERTIFIE.some(([l]) => l === e.excel_row))
+    .map((e) => `ligne ${e.excel_row} (${e.produit} ${e.quantity})`);
+  controle("aucune sortie rouge foncé hors du relevé certifié",
+    enTrop.length === 0, "aucune", enTrop.join(", ") || "aucune");
+
+  /* ── 3. Cohérence avec les mouvements consolidés de l'import ── */
+  const parProduit = new Map();
+  for (const e of lu.evenements) {
+    const k = compacter(e.produit);
+    parProduit.set(k, (parProduit.get(k) || 0) + e.quantity);
+  }
+  const sansCorrespondance = [];
+  for (const [produit, somme] of parProduit) {
+    const candidats = mouvements.filter((m) => compacter(m.product_name) === produit);
+    const trouve = candidats.some((m) => Number(m.quantity) === somme)
+      || candidats.some((m) => Number(m.quantity) === somme && candidats.length === 1);
+    if (!trouve) sansCorrespondance.push(`${produit} (${somme})`);
+  }
+  /* MAMBRANE est le seul produit connu sans mouvement dans cet import. Tout
+     autre produit sans correspondance signale un classeur qui ne décrit pas
+     le même import. */
+  const inattendus = sansCorrespondance.filter((s) => !s.startsWith("MAMBRANE"));
+  controle("chaque produit correspond à un mouvement consolidé de l'import "
+    + "(hors MAMBRANE, connue sans mouvement)",
+    inattendus.length === 0, "aucun écart", inattendus.join(", ") || "aucun écart");
+
+  const totalSorties = mouvements.reduce((s, m) => s + Number(m.quantity), 0);
+  controle("somme réelle des sorties de l'import",
+    totalSorties === EXCEPTION.totaux.totalOut, EXCEPTION.totaux.totalOut, totalSorties);
+  controle("nombre de mouvements de sortie", mouvements.length === 43, 43, mouvements.length);
+
+  /* ── 4. Les totaux enregistrés de l'import ── */
+  const resume = imp.summary || {};
+  const attendus = [
+    ["totalIn", valeurResume(resume, "totalIn", "total_in", "totalEntrees"), EXCEPTION.totaux.totalIn],
+    ["totalOut", valeurResume(resume, "totalOut", "total_out", "totalSorties"), EXCEPTION.totaux.totalOut],
+    ["totalWriteOff", valeurResume(resume, "totalWriteOff", "total_write_off", "totalWriteOffs"), EXCEPTION.totaux.totalWriteOff],
+    ["stockBefore", valeurResume(resume, "stockBefore", "stock_before", "stockAvant"), EXCEPTION.totaux.stockBefore],
+    ["stockAfter", valeurResume(resume, "stockAfter", "stock_after", "stockApres"), EXCEPTION.totaux.stockAfter],
+  ];
+  for (const [nom, obtenu, attendu] of attendus) {
+    controle(`résumé enregistré · ${nom}`, obtenu === attendu, attendu,
+      obtenu === undefined ? "(absent du résumé)" : obtenu);
+  }
+  for (const [colonne, attendu] of [
+    ["rows_read", EXCEPTION.totaux.rows_read],
+    ["rows_imported", EXCEPTION.totaux.rows_imported],
+    ["rows_skipped", EXCEPTION.totaux.rows_skipped],
+  ]) {
+    controle(`import · ${colonne}`, Number(imp[colonne]) === attendu, attendu, imp[colonne]);
+  }
+
+  return { preuves, divergences };
+}
+
 /* ═════════════════════════════════════════ EMPREINTE DE STOCK ══ */
 
 async function empreinteStock(client) {
@@ -267,27 +490,13 @@ async function main() {
         + "Précisez-le avec --import=<id>.");
   }
 
-  /* Le SHA-256 est la seule preuve que le fichier relu est bien celui qui a
-     été importé. Un fichier « du même nom » ne suffit pas : c'est ainsi qu'on
-     reconstruit des événements à partir d'une version corrigée à la main. */
-  if (imp.file_hash && imp.file_hash !== lu.sha256) {
-    stop(`\nL'import n°${imp.id} porte l'empreinte ${String(imp.file_hash).slice(0, 16)}…\n`
-       + `Le fichier fourni porte    ${lu.sha256.slice(0, 16)}…\n`
-       + "Ce n'est pas le classeur qui a été importé. Arrêt.");
-  }
-
   const societe = opt("societe") ? Number(opt("societe")) : imp.company_id;
+  const empreinteDifferente = Boolean(imp.file_hash) && imp.file_hash !== lu.sha256;
+
   console.log(`\n${G}IMPORT VISÉ${Z}`);
   console.log(`  n°${imp.id} — ${imp.file_name}`);
   console.log(`  société ${societe} · statut ${imp.status} · ${new Date(imp.created_at).toISOString().slice(0, 19).replace("T", " ")}`);
-  console.log(`  empreinte ${imp.file_hash ? (imp.file_hash === lu.sha256 ? V + "conforme" + Z : R + "DIFFÉRENTE" + Z) : J + "non enregistrée" + Z}`);
-
-  /* ── Le lot d'import, s'il existe ───────────────────────────────────── */
-  const { rows: lots } = await pool.query(
-    `SELECT id, status FROM stock_import_batches
-      WHERE company_id = $1 AND file_sha256 = $2 ORDER BY id DESC LIMIT 1`,
-    [societe, lu.sha256]);
-  const batchId = lots[0]?.id || null;
+  console.log(`  empreinte ${imp.file_hash ? (empreinteDifferente ? R + "DIFFÉRENTE" + Z : V + "conforme" + Z) : J + "non enregistrée" + Z}`);
 
   /* ── L'état actuel ──────────────────────────────────────────────────── */
   const { rows: mouvements } = await pool.query(
@@ -297,6 +506,71 @@ async function main() {
       ORDER BY id`,
     [societe, imp.id]);
   const totalMouvements = mouvements.reduce((s, m) => s + Number(m.quantity), 0);
+
+  /* ── Le SHA-256, seule preuve que le fichier relu est celui qui a été
+        importé. Un fichier « du même nom » ne suffit pas : c'est ainsi qu'on
+        reconstruit des événements à partir d'une version retouchée. ────── */
+  let auditVersionMetier = null;
+
+  if (empreinteDifferente && !AUTORISER_VERSION_METIER) {
+    stop(`\nL'import n°${imp.id} porte l'empreinte ${String(imp.file_hash).slice(0, 16)}…\n`
+       + `Le fichier fourni porte    ${lu.sha256.slice(0, 16)}…\n`
+       + "Ce n'est pas le classeur qui a été importé. Arrêt.");
+  }
+
+  if (empreinteDifferente) {
+    console.log(`\n${R}${G}EMPREINTE BINAIRE DIFFÉRENTE${Z}`);
+    console.log(`  enregistrée à l'import : ${imp.file_hash}`);
+    console.log(`  fichier fourni         : ${lu.sha256}`);
+    console.log(`  Le binaire d'origine n'est plus disponible. La version métier`);
+    console.log(`  doit donc être validée pièce par pièce avant toute écriture.\n`);
+
+    const { preuves, divergences } = await validerVersionMetier(
+      { lu, imp, societe, mouvements });
+
+    console.log(`${G}PREUVES COMPARÉES${Z}`);
+    for (const p of preuves) {
+      console.log(`  ${V}✓${Z} ${p.titre.padEnd(62)} ${String(p.obtenu).slice(0, 40)}`);
+    }
+    if (divergences.length) {
+      console.log(`\n${R}${G}DIVERGENCES${Z}`);
+      for (const d of divergences) {
+        console.log(`  ${R}✗${Z} ${d.titre}`);
+        console.log(`      attendu : ${d.attendu}`);
+        console.log(`      obtenu  : ${d.obtenu}`);
+      }
+      stop(`\n${divergences.length} divergence(s). La version métier n'est PAS validée. `
+         + "Rien n'a été lu plus loin, rien n'a été écrit. Arrêt.");
+    }
+
+    console.log(`\n${V}${G}VERSION MÉTIER STRICTEMENT VALIDÉE${Z}`);
+    console.log(`  ${preuves.length} contrôles concordants, 0 divergence.`);
+    console.log(`  L'empreinte enregistrée en base n'est pas modifiée.`);
+    console.log(`  Les deux empreintes et le motif sont inscrits dans chaque`);
+    console.log(`  événement et chaque document créés.\n`);
+
+    auditVersionMetier = {
+      version_metier_acceptee: true,
+      empreinte_enregistree: imp.file_hash,
+      empreinte_fichier_relu: lu.sha256,
+      motif: EXCEPTION.motif,
+      controles_concordants: preuves.length,
+      valide_le: new Date().toISOString(),
+    };
+  }
+
+  /* L'identité d'un événement est celle de son IMPORT, pas celle du binaire
+     qu'on a sous la main. En version métier, les événements portent donc
+     l'empreinte ENREGISTRÉE : c'est elle qui les rattache à l'import n°3, et
+     c'est sur elle que l'écran Documents les retrouve. */
+  const empreinteImport = imp.file_hash || lu.sha256;
+
+  /* ── Le lot d'import, s'il existe ───────────────────────────────────── */
+  const { rows: lots } = await pool.query(
+    `SELECT id, status FROM stock_import_batches
+      WHERE company_id = $1 AND file_sha256 = ANY($2::text[]) ORDER BY id DESC LIMIT 1`,
+    [societe, [...new Set([empreinteImport, lu.sha256])]]);
+  const batchId = lots[0]?.id || null;
 
   const { rows: evExistants } = await pool.query(
     `SELECT count(*) FILTER (WHERE direction = 'OUT') AS sorties, count(*) AS total
@@ -309,7 +583,7 @@ async function main() {
 
   /* ── Rattachement ───────────────────────────────────────────────────── */
   rattacher(lu.evenements, mouvements);
-  for (const e of lu.evenements) e.event_key = cleEvenement(lu.sha256, e);
+  for (const e of lu.evenements) e.event_key = cleEvenement(empreinteImport, e);
 
   const { rows: dejaEcrits } = await pool.query(
     `SELECT event_key, id, movement_id FROM stock_import_movement_events
@@ -456,7 +730,7 @@ async function main() {
        ROLLBACK, même si le script meurt. */
     await client.query(
       `SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))`,
-      ["reconstruire-sorties-rouge-fonce", `${societe}:${lu.sha256}`]);
+      ["reconstruire-sorties-rouge-fonce", `${societe}:${empreinteImport}`]);
 
     const avant = await empreinteStock(client);
 
@@ -483,7 +757,7 @@ async function main() {
                                       EXCLUDED.movement_id),
                updated_at = now()
          RETURNING id, (xmax = 0) AS cree`,
-        [societe, batchId, lu.sha256, e.excel_sheet, e.excel_row, e.excel_cell,
+        [societe, batchId, empreinteImport, e.excel_sheet, e.excel_row, e.excel_cell,
          e.event_key, e.effective_date, e.quantity,
          JSON.stringify({
            produit: e.produit, couleur: COULEUR_NOUVELLE_SORTIE,
@@ -492,6 +766,11 @@ async function main() {
            dates_proposees: e.datesProposees,
            rattachement: e.rattachement,
            reconstruit_le: new Date().toISOString(),
+           /* Les deux empreintes voyagent avec l'événement : dans six mois,
+              on doit pouvoir dire d'où vient ce bon sans relire ce script. */
+           empreinte_import: empreinteImport,
+           empreinte_fichier_relu: lu.sha256,
+           ...(auditVersionMetier ? { audit_version_metier: auditVersionMetier } : {}),
          }),
          e.movement_id ? "IMPORTED" : "READY",
          e.movement_id]
@@ -508,7 +787,11 @@ async function main() {
     for (const g of plan.garder) {
       const provenance = `Sortie EM2S — ${imp.file_name} · feuille ${g.evenement.excel_sheet}`
         + ` · ligne ${g.evenement.excel_row} · cellule ${g.evenement.excel_cell}`
-        + ` · rouge foncé ${COULEUR_NOUVELLE_SORTIE}`;
+        + ` · rouge foncé ${COULEUR_NOUVELLE_SORTIE}`
+        + (auditVersionMetier
+          ? ` · VERSION MÉTIER VALIDÉE (empreinte import ${String(imp.file_hash).slice(0, 12)}…,`
+            + ` fichier relu ${lu.sha256.slice(0, 12)}…)`
+          : "");
       await client.query(
         `UPDATE documents
             SET stock_import_movement_event_id = $1,
@@ -565,7 +848,13 @@ async function main() {
       const numero = await nextShortDocumentNumber("BS", societe, client);
       const provenance = `Sortie EM2S — ${imp.file_name} · feuille ${e.excel_sheet}`
         + ` · ligne ${e.excel_row} · cellule ${e.excel_cell} · rouge foncé ${COULEUR_NOUVELLE_SORTIE}`
-        + (e.movement_id ? ` · mouvement #${e.movement_id}` : " · sans mouvement rattaché");
+        + (e.movement_id ? ` · mouvement #${e.movement_id}` : " · sans mouvement rattaché")
+        /* Un bon né d'une version métier le dit sur lui-même : celui qui le
+           lira dans un an n'aura pas à retrouver ce script. */
+        + (auditVersionMetier
+          ? ` · VERSION MÉTIER VALIDÉE (empreinte import ${String(imp.file_hash).slice(0, 12)}…,`
+            + ` fichier relu ${lu.sha256.slice(0, 12)}…) — ${EXCEPTION.motif}`
+          : "");
 
       const { rows: doc } = await client.query(
         `INSERT INTO documents

@@ -41,6 +41,24 @@ if (/5432|prod|production/i.test(process.env.DATABASE_URL)) {
 const FICHIER = process.env.CLASSEUR_EM2S
   || `${process.env.HOME}/Downloads/administratif/Copie de dernier actualisation bby me.xlsx`;
 
+/* L'empreinte RÉELLEMENT enregistrée en production pour l'import n°3. Le
+   binaire qui la portait n'existe plus : le fichier encore disponible a le
+   même contenu métier mais d'autres octets. Le jeu d'essai reproduit donc
+   l'écart tel quel, sinon les garde-fous de version métier ne seraient
+   jamais exercés.
+   VERSION_METIER=0 rétablit l'empreinte du fichier, pour les essais qui
+   veulent le cas nominal. */
+const EMPREINTE_PRODUCTION =
+  "61b7104201a146f27812c6b2603ee3b9dbc790879282b0c081d81e6379690e9e";
+const ECART_EMPREINTE = process.env.VERSION_METIER !== "0";
+
+/* Le résumé enregistré de l'import n°3, tel qu'il figure en production. */
+const RESUME_IMPORT = {
+  totalIn: 6073, totalOut: 12193, totalWriteOff: 3,
+  stockBefore: 151244, stockAfter: 149840,
+};
+const LIGNES_IMPORT = { rows_read: 235, rows_imported: 200, rows_skipped: 5 };
+
 /* Les sorties nouvelles, consolidées par produit — exactement ce que
    l'ancien chemin d'import a écrit. MAMBRANE (25) est absente à dessein. */
 const CONSOLIDES = [
@@ -102,10 +120,15 @@ async function main() {
     /* L'import porte le numéro 3, comme en production. */
     await c.query(`SELECT setval(pg_get_serial_sequence('inventory_imports','id'), 2, true)`);
     const imp = (await c.query(
-      `INSERT INTO inventory_imports (company_id, file_name, file_hash, status, created_at)
-       VALUES ($1, 'Copie de dernier actualisation bby me.xlsx', $2, 'COMPLETED',
-               '2026-09-02 05:59:45+00') RETURNING id`,
-      [societe, sha])).rows[0].id;
+      `INSERT INTO inventory_imports
+         (company_id, file_name, file_hash, status, summary,
+          rows_read, rows_imported, rows_skipped, created_at)
+       VALUES ($1, 'Copie de dernier actualisation bby me.xlsx', $2, 'COMPLETED', $3,
+               $4, $5, $6, '2026-09-02 05:59:45+00') RETURNING id`,
+      [societe, ECART_EMPREINTE ? EMPREINTE_PRODUCTION : sha,
+       JSON.stringify(RESUME_IMPORT),
+       LIGNES_IMPORT.rows_read, LIGNES_IMPORT.rows_imported,
+       LIGNES_IMPORT.rows_skipped])).rows[0].id;
 
     /* Du stock réel, qui devra rester au chiffre près. */
     const produits = {};
@@ -180,7 +203,10 @@ async function main() {
     await c.query("COMMIT");
 
     console.log(JSON.stringify({
-      societe, import_id: imp, sha256: sha.slice(0, 16) + "…",
+      societe, import_id: imp,
+      empreinte_enregistree: (ECART_EMPREINTE ? EMPREINTE_PRODUCTION : sha).slice(0, 16) + "…",
+      empreinte_fichier: sha.slice(0, 16) + "…",
+      ecart_empreinte: ECART_EMPREINTE,
       mouvements_sortie: NB_SORTIES,
       total_unites: TOTAL_SORTIES,
       consolides: Object.fromEntries(

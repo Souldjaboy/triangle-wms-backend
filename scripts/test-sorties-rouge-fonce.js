@@ -66,8 +66,13 @@ const lancerAsync = (...args) => new Promise((resolve) => {
     (err, stdout, stderr) => resolve({ code: err ? (err.code || 1) : 0, sortie: `${stdout}${stderr}` }));
 });
 
+/* Cette suite couvre le chemin NOMINAL : le fichier fourni est celui qui a
+   été importé. Le jeu d'essai reproduit donc une empreinte concordante.
+   L'écart d'empreinte réel de la production — et l'exception de version
+   métier qu'il ouvre — est couvert par test-version-metier.js. */
 function poserLeJeu() {
-  execFileSync(process.execPath, [JEU], { encoding: "utf8", env: process.env });
+  execFileSync(process.execPath, [JEU],
+    { encoding: "utf8", env: { ...process.env, VERSION_METIER: "0" } });
 }
 
 async function q(sql, params = []) { return (await pool.query(sql, params)).rows; }
