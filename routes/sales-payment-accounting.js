@@ -149,4 +149,122 @@ async function recordSalePaymentAccounting(client, {
   };
 }
 
-module.exports = { listActiveBanks, recordSalePaymentAccounting, CASH_LABEL };
+/**
+ * Contrepasse un encaissement déjà comptabilisé : l'exact miroir de
+ * `recordSalePaymentAccounting`. L'argent RESSORT de la même destination qui
+ * l'avait reçu, la vente est débitée au lieu d'être créditée, deux écritures
+ * toujours équilibrées.
+ *
+ * Le paiement d'origine n'est jamais modifié ni supprimé — c'est
+ * l'INDEX UNIQUE `sand_payment_reversals(company_id, original_payment_id)`,
+ * posé par la migration 075, qui garantit qu'un même paiement ne se
+ * contrepasse qu'une fois, même en cas de rejeu ou de concurrence.
+ *
+ * @returns {{transaction: object, destination: {type, bank_id, label}}}
+ */
+async function reverseSalePaymentAccounting(client, {
+  companyId,
+  module,            // "cement" | "sand"
+  payment,           // ligne sand_payments ORIGINALE (jamais modifiée)
+  amount,
+  invoiceNumber,
+  partnerName,
+  userId,
+  accounting,
+  reversalSourceId,  // id de la ligne sand_payment_reversals
+}) {
+  if (!accounting || typeof accounting.nextAccountingNumber !== "function"
+      || typeof accounting.createAccountingEntry !== "function") {
+    throw new Error("Helpers comptables absents : contrepassation impossible.");
+  }
+
+  const isCement = module === "cement";
+  const salesAccount = isCement ? "Ventes ciment" : "Ventes sable";
+  const sourceType = isCement ? "cement_payment_reversal" : "sand_payment_reversal";
+  const bankId = payment.bank_id || null;
+
+  let destinationLabel = CASH_LABEL;
+  let destinationType = "CASH";
+
+  if (bankId) {
+    /* La même banque qui avait reçu l'argent, verrouillée le temps de la
+       contrepassation. Si elle a été désactivée depuis, on refuse plutôt que
+       de faire disparaître de l'argent d'une banque qu'on ne peut plus voir. */
+    const bank = (await client.query(
+      `SELECT * FROM accounting_banks WHERE id = $1 AND company_id = $2 FOR UPDATE`,
+      [bankId, companyId]
+    )).rows[0];
+    if (!bank) {
+      const err = new Error("Banque d'origine introuvable : contrepassation impossible.");
+      err.httpStatus = 409;
+      err.code = "REVERSAL_BANK_MISSING";
+      throw err;
+    }
+    await client.query(
+      `UPDATE accounting_banks
+          SET current_balance = COALESCE(current_balance, 0) - $1,
+              updated_at = CURRENT_TIMESTAMP, updated_by = $2
+        WHERE id = $3 AND company_id = $4`,
+      [amount, userId, bank.id, companyId]
+    );
+    destinationLabel = bank.bank_name;
+    destinationType = "BANK";
+  } else {
+    await client.query(
+      `UPDATE treasury_accounts
+          SET current_balance = COALESCE(current_balance, 0) - $1,
+              updated_by = $2, updated_at = NOW()
+        WHERE company_id = $3`,
+      [amount, userId, companyId]
+    );
+  }
+
+  const transactionNumber = await accounting.nextAccountingNumber(
+    client, "accounting_transactions", "transaction_number",
+    isCement ? "REV-CIM" : "REV-SAB", companyId
+  );
+
+  const transaction = (await client.query(
+    `INSERT INTO accounting_transactions
+       (company_id, transaction_number, transaction_type, source_type, source_id,
+        bank_id, caisse_id, amount, currency, direction, category, partner_name,
+        description, status, source_label, destination_label,
+        created_by, validated_by, validated_at, created_at, updated_at)
+     VALUES ($1,$2,$3,$4,$5,$6,NULL,$7,'FCFA','sortie',$8,$9,$10,'validé',$11,$12,
+             $13,$13,CURRENT_TIMESTAMP,NOW(),NOW())
+     RETURNING *`,
+    [
+      companyId, transactionNumber,
+      isCement ? "contrepassation_ciment" : "contrepassation_sable",
+      sourceType, reversalSourceId,
+      bankId || null, amount,
+      isCement ? "Ciment" : "Sable",
+      partnerName || null,
+      `Contrepassation facture ${invoiceNumber}`,
+      isCement ? "Ciment" : "Sable",
+      destinationLabel,
+      userId,
+    ]
+  )).rows[0];
+
+  // Deux écritures ÉQUILIBRÉES, débit/crédit inversés par rapport à l'encaissement.
+  await accounting.createAccountingEntry(client, {
+    companyId, sourceType, sourceId: reversalSourceId,
+    accountLabel: salesAccount, debit: amount, credit: 0,
+    description: `Contrepassation facture ${invoiceNumber}`, createdBy: userId,
+  });
+  await accounting.createAccountingEntry(client, {
+    companyId, sourceType, sourceId: reversalSourceId,
+    accountLabel: destinationLabel, debit: 0, credit: amount,
+    description: `Contrepassation facture ${invoiceNumber}`, createdBy: userId,
+  });
+
+  return {
+    transaction,
+    destination: { type: destinationType, bank_id: bankId || null, label: destinationLabel },
+  };
+}
+
+module.exports = {
+  listActiveBanks, recordSalePaymentAccounting, reverseSalePaymentAccounting, CASH_LABEL,
+};

@@ -17950,6 +17950,15 @@ app.use(
   })
 );
 
+/* Corriger un pointage déjà enregistré, avec motif obligatoire et trace
+   avant/après. Même règle d'accès que pointer : qui peut pointer un employé
+   peut corriger son pointage. */
+const createAttendanceCorrectionsRouter = require("./routes/attendance-corrections");
+app.use(
+  "/",
+  createAttendanceCorrectionsRouter({ pool, authenticateToken, getEffectiveCompanyId })
+);
+
 const createInventoryImportRouter = require("./routes/inventory-import");
 app.use(
   "/",
@@ -18017,6 +18026,26 @@ app.use(
     requireCompanyModule,
     createNotification,
     // Encaissements : on réutilise le moteur comptable existant, pas de second.
+    accounting: { nextAccountingNumber, createAccountingEntry }
+  })
+);
+
+// Modifier un brouillon, le supprimer, annuler ou corriger une vente
+// validée, contrepasser un paiement. Monté avant /sand/sales/:id (déjà
+// défini ci-dessus) car Express dispatche à la première route qui matche :
+// une méthode différente (PATCH/DELETE/POST) sur le même chemin ne se
+// confond jamais avec le GET existant, donc l'ordre de montage n'a pas
+// d'incidence ici — mais il est gardé immédiatement après par lisibilité.
+const createSandSalesCancellationRouter = require("./routes/sand-sales-cancellation");
+
+app.use(
+  "/",
+  createSandSalesCancellationRouter({
+    pool,
+    authenticateToken,
+    getEffectiveCompanyId,
+    requirePermission,
+    requireCompanyModule,
     accounting: { nextAccountingNumber, createAccountingEntry }
   })
 );
