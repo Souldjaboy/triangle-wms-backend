@@ -131,6 +131,36 @@ const EXCEPTION = {
   },
 };
 
+/* ── ALIAS CERTIFIÉS ──────────────────────────────────────────────────────
+   Le classeur écrit « OFFICIENCY AMPLIFIER » ; la base porte
+   « EFFICIENCY AMPLIFIER ». Une lettre, une faute de frappe d'origine, et le
+   rapprochement échoue — le preview production s'est arrêté là, à juste titre.
+
+   Un rapprochement approximatif serait la mauvaise réponse. Une distance de
+   Levenshtein accepterait « OFFICIENCY AMPLIFIER » pour
+   « HIGHT EFFICIENCY AMPLIFIER POWER », qui est un AUTRE produit du même
+   classeur, avec une autre quantité et une autre date. Coller un bon sur le
+   mauvais mouvement est pire que de ne pas le coller.
+
+   Chaque alias est donc NOMMÉ et ancré : une société, un import, un mouvement,
+   un produit, une quantité. Il ne s'applique que si tout cela concorde et que
+   les deux empreintes sont celles de la version métier certifiée. Ailleurs, il
+   n'existe pas. */
+const ALIAS_CERTIFIES = [{
+  libelleExcel: "OFFICIENCY AMPLIFIER",
+  libelleMouvement: "EFFICIENCY AMPLIFIER",
+  excelRow: 175,
+  companyId: 1,
+  importId: 3,
+  movementId: 671,
+  productId: 87,
+  quantite: 8,
+  motif: "Faute de frappe du classeur d'origine : le O initial de "
+       + "« OFFICIENCY » n'existe pas dans la base, qui porte "
+       + "« EFFICIENCY AMPLIFIER ». Même article, vérifié sur le mouvement "
+       + "#671 (product_id 87, sortie de 8) de l'import n°3.",
+}];
+
 /* Les 21 sorties rouge foncé, certifiées : ligne, cellule, produit, quantité,
    date. C'est contre CELA que le classeur est relu, cellule par cellule.
    Comparer des totaux ne suffirait pas : deux erreurs qui se compensent
@@ -250,7 +280,40 @@ function lireSortiesRougeFonce() {
  * l'événement reste non rattaché et c'est dit. Deviner ici reviendrait à
  * coller un bon sur un mouvement qui décrit autre chose.
  */
-function rattacher(evenements, mouvements) {
+/**
+ * L'alias applicable à ce groupe, ou rien.
+ *
+ * Toutes les conditions sont exigées ensemble. Il n'y a pas de « presque » :
+ * un mouvement de 7 au lieu de 8, un autre import, un autre `product_id`, et
+ * l'alias ne s'applique pas — le produit ressort non rattaché, ce qui est le
+ * comportement sûr.
+ *
+ * `product_id` n'est vérifié que s'il est renseigné : une base où la colonne
+ * est vide ne doit pas faire échouer un rapprochement par ailleurs prouvé,
+ * mais une valeur PRÉSENTE et différente est un refus.
+ */
+function aliasApplicable({ produit, somme, mouvements, contexte }) {
+  if (!contexte.aliasAutorise) return null;
+
+  for (const alias of ALIAS_CERTIFIES) {
+    if (compacter(alias.libelleExcel) !== produit) continue;
+    if (alias.companyId !== contexte.societe) continue;
+    if (alias.importId !== contexte.importId) continue;
+    if (alias.quantite !== somme) continue;
+
+    const mouvement = mouvements.find((m) => Number(m.id) === alias.movementId);
+    if (!mouvement) continue;
+    if (compacter(mouvement.product_name) !== compacter(alias.libelleMouvement)) continue;
+    if (Number(mouvement.quantity) !== alias.quantite) continue;
+    if (mouvement.type !== "Sortie") continue;
+    if (mouvement.product_id != null && Number(mouvement.product_id) !== alias.productId) continue;
+
+    return { alias, mouvement };
+  }
+  return null;
+}
+
+function rattacher(evenements, mouvements, contexte) {
   const parProduit = new Map();
   for (const e of evenements) {
     if (!parProduit.has(e.produitCompacte)) parProduit.set(e.produitCompacte, []);
@@ -258,20 +321,42 @@ function rattacher(evenements, mouvements) {
   }
 
   const dejaPris = new Set();
+  const aliasUtilises = [];
 
   for (const [produit, groupe] of parProduit) {
     const somme = groupe.reduce((s, e) => s + e.quantity, 0);
-    const candidats = mouvements.filter(
+    let candidats = mouvements.filter(
       (m) => compacter(m.product_name) === produit && !dejaPris.has(m.id));
+
+    /* Rien sous ce libellé : un alias certifié peut désigner le mouvement,
+       et lui seul. */
+    if (candidats.length === 0) {
+      const trouve = aliasApplicable({ produit, somme, mouvements, contexte });
+      if (trouve && !dejaPris.has(trouve.mouvement.id)) {
+        candidats = [trouve.mouvement];
+        for (const e of groupe) {
+          e.alias = {
+            libelle_excel: trouve.alias.libelleExcel,
+            libelle_mouvement: trouve.alias.libelleMouvement,
+            mouvement_id: trouve.mouvement.id,
+            product_id: trouve.mouvement.product_id ?? null,
+            quantite: trouve.alias.quantite,
+            motif: trouve.alias.motif,
+          };
+        }
+        aliasUtilises.push(groupe[0].alias);
+      }
+    }
 
     const consolide = candidats.find((m) => Number(m.quantity) === somme);
     if (consolide) {
       dejaPris.add(consolide.id);
       for (const e of groupe) {
         e.movement_id = consolide.id;
-        e.rattachement = groupe.length > 1
+        e.rattachement = (groupe.length > 1
           ? `mouvement consolidé #${consolide.id} (${somme} = ${groupe.map((x) => x.quantity).join(" + ")})`
-          : `mouvement #${consolide.id}`;
+          : `mouvement #${consolide.id}`)
+          + (e.alias ? ` · alias certifié « ${e.alias.libelle_excel} » → « ${e.alias.libelle_mouvement} »` : "");
       }
       continue;
     }
@@ -283,7 +368,8 @@ function rattacher(evenements, mouvements) {
       if (seul) {
         dejaPris.add(seul.id);
         e.movement_id = seul.id;
-        e.rattachement = `mouvement #${seul.id}`;
+        e.rattachement = `mouvement #${seul.id}`
+          + (e.alias ? ` · alias certifié « ${e.alias.libelle_excel} » → « ${e.alias.libelle_mouvement} »` : "");
       } else {
         e.movement_id = null;
         e.rattachement = candidats.length
@@ -292,6 +378,8 @@ function rattacher(evenements, mouvements) {
       }
     }
   }
+
+  return aliasUtilises;
 }
 
 /** Clé stable : rejouer le script ne recrée jamais un événement déjà écrit. */
@@ -393,12 +481,36 @@ async function validerVersionMetier({ lu, imp, societe, mouvements }) {
     const k = compacter(e.produit);
     parProduit.set(k, (parProduit.get(k) || 0) + e.quantity);
   }
+  /* L'alias n'est consultable que si les deux empreintes sont exactement
+     celles de la version métier certifiée : c'est la même porte, pas une
+     seconde. */
+  const aliasAutorise = imp.file_hash === EXCEPTION.empreinteEnregistree
+    && lu.sha256 === EXCEPTION.empreinteFournie;
+  const aliasVus = [];
+
   const sansCorrespondance = [];
   for (const [produit, somme] of parProduit) {
     const candidats = mouvements.filter((m) => compacter(m.product_name) === produit);
-    const trouve = candidats.some((m) => Number(m.quantity) === somme)
-      || candidats.some((m) => Number(m.quantity) === somme && candidats.length === 1);
-    if (!trouve) sansCorrespondance.push(`${produit} (${somme})`);
+    if (candidats.some((m) => Number(m.quantity) === somme)) continue;
+
+    const parAlias = candidats.length === 0
+      ? aliasApplicable({ produit, somme, mouvements,
+        contexte: { societe, importId: Number(imp.id), aliasAutorise } })
+      : null;
+    if (parAlias) {
+      aliasVus.push(`« ${parAlias.alias.libelleExcel} » → `
+        + `« ${parAlias.alias.libelleMouvement} », mouvement #${parAlias.mouvement.id}, `
+        + `quantité ${parAlias.alias.quantite}`
+        + (parAlias.mouvement.product_id != null
+          ? `, product_id ${parAlias.mouvement.product_id}` : ""));
+      continue;
+    }
+    sansCorrespondance.push(`${produit} (${somme})`);
+  }
+
+  if (aliasVus.length) {
+    controle(`alias certifié appliqué : ${aliasVus.join(" ; ")}`, true,
+      "alias nommé et ancré", aliasVus.join(" ; "));
   }
   /* MAMBRANE est le seul produit connu sans mouvement dans cet import. Tout
      autre produit sans correspondance signale un classeur qui ne décrit pas
@@ -500,7 +612,8 @@ async function main() {
 
   /* ── L'état actuel ──────────────────────────────────────────────────── */
   const { rows: mouvements } = await pool.query(
-    `SELECT id, type, product_name, product_reference, quantity, warehouse_id, location_code
+    `SELECT id, type, product_id, product_name, product_reference, quantity,
+            warehouse_id, location_code
        FROM stock_movements
       WHERE company_id = $1 AND import_id = $2 AND type = 'Sortie'
       ORDER BY id`,
@@ -582,7 +695,12 @@ async function main() {
   console.log(`  lot d'import correspondant         : ${batchId ? `#${batchId} (${lots[0].status})` : "aucun"}`);
 
   /* ── Rattachement ───────────────────────────────────────────────────── */
-  rattacher(lu.evenements, mouvements);
+  /* L'alias n'existe que dans le cadre certifié : mêmes empreintes, même
+     société, même import. Hors de là, il n'est jamais consulté. */
+  const aliasAutorise = imp.file_hash === EXCEPTION.empreinteEnregistree
+    && lu.sha256 === EXCEPTION.empreinteFournie;
+  const aliasUtilises = rattacher(lu.evenements, mouvements,
+    { societe, importId: Number(imp.id), aliasAutorise });
   for (const e of lu.evenements) e.event_key = cleEvenement(empreinteImport, e);
 
   const { rows: dejaEcrits } = await pool.query(
@@ -598,6 +716,16 @@ async function main() {
     console.log(`  L${String(e.excel_row).padStart(4)} ${e.excel_cell.padEnd(6)}`
       + ` ${String(e.quantity).padStart(4)}  ${e.effective_date}  ${e.produit.slice(0, 34).padEnd(34)} ${etat}`);
     console.log(`        ${" ".repeat(6)}      → ${lien}`);
+  }
+
+  if (aliasUtilises.length) {
+    console.log(`\n${G}ALIAS CERTIFIÉS UTILISÉS${Z}`);
+    for (const a of aliasUtilises) {
+      console.log(`  « ${a.libelle_excel} » → « ${a.libelle_mouvement} »`
+        + `, mouvement #${a.mouvement_id}, quantité ${a.quantite}`
+        + (a.product_id != null ? `, product_id ${a.product_id}` : ""));
+      console.log(`    ${a.motif}`);
+    }
   }
 
   const nonRattaches = lu.evenements.filter((e) => !e.movement_id);
@@ -706,6 +834,7 @@ async function main() {
     console.log(`\n${G}RÉSUMÉ${Z}`);
     console.log(`  événements à écrire      : ${lu.evenements.filter((e) => !parCle.has(e.event_key)).length} (sur ${lu.evenements.length})`);
     console.log(`  dont non rattachés       : ${nonRattaches.length}`);
+    console.log(`  alias certifiés utilisés : ${aliasUtilises.length}`);
     console.log(`  mouvements modifiés      : 0`);
     console.log(`  stock modifié            : 0`);
     console.log(`\n${V}Prévisualisation terminée. Rien n'a été écrit.${Z}`);
@@ -770,7 +899,20 @@ async function main() {
               on doit pouvoir dire d'où vient ce bon sans relire ce script. */
            empreinte_import: empreinteImport,
            empreinte_fichier_relu: lu.sha256,
-           ...(auditVersionMetier ? { audit_version_metier: auditVersionMetier } : {}),
+           /* Les deux libellés restent lisibles côte à côte : celui du
+              classeur et celui de la base. Sans cela, on ne saurait plus
+              pourquoi un bon « OFFICIENCY » pointe vers « EFFICIENCY ». */
+           ...(e.alias ? { alias_certifie: e.alias } : {}),
+           ...(auditVersionMetier ? {
+             audit_version_metier: {
+               ...auditVersionMetier,
+               ...(e.alias ? {
+                 libelle_excel: e.alias.libelle_excel,
+                 libelle_mouvement: e.alias.libelle_mouvement,
+                 alias_motif: e.alias.motif,
+               } : {}),
+             },
+           } : {}),
          }),
          e.movement_id ? "IMPORTED" : "READY",
          e.movement_id]

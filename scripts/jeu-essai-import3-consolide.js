@@ -64,7 +64,12 @@ const LIGNES_IMPORT = { rows_read: 235, rows_imported: 200, rows_skipped: 5 };
 const CONSOLIDES = [
   ["PROFESSIONAL AMPLIFIER POWER", 5],       // 2 + 3
   ["AUDIO DEVISE", 7],                       // 6 + 1
-  ["OFFICIENCY AMPLIFIER", 8],
+  /* La base porte « EFFICIENCY AMPLIFIER » là où le classeur écrit
+     « OFFICIENCY » — la faute de frappe d'origine, telle qu'elle est en
+     production. C'est elle qui exerce l'alias certifié.
+     LIBELLE_EXACT=1 rétablit le libellé du classeur. */
+  [process.env.LIBELLE_EXACT === "1"
+    ? "OFFICIENCY AMPLIFIER" : "EFFICIENCY AMPLIFIER", 8],
   ["PROFESSIONAL SPEAKER (grand)", 8],
   ["POWER SEQUENCY", 7],
   ["STADE 4 AOUT", 20],                      // 7 + 7 + 6
@@ -151,18 +156,32 @@ async function main() {
          VALUES ($1,$2,$3,$4)`, [societe, produits[nom], emplacement, quantite]);
     }
 
-    const mouvement = async (nom, quantite) => (await c.query(
-      `INSERT INTO stock_movements
-         (company_id, type, product_name, product_reference, quantity, status, import_id,
-          created_by_name, created_at)
-       VALUES ($1,'Sortie',$2,$3,$4,'Validé',$5,'Import EM2S','2026-09-02 05:59:45+00')
-       RETURNING id`,
-      [societe, nom, `REF-${nom.slice(0, 6).replace(/\s/g, "")}`, quantite, imp])).rows[0].id;
+    const mouvement = async (nom, quantite, forcer = {}) => {
+      /* Le mouvement de l'alias porte les identifiants réels de la
+         production : #671 et product_id 87. Sans eux, l'alias ne
+         s'appliquerait pas et le test ne prouverait rien. */
+      if (forcer.id) {
+        await c.query(
+          `SELECT setval(pg_get_serial_sequence('stock_movements','id'), $1, false)`,
+          [forcer.id]);
+      }
+      const { rows } = await c.query(
+        `INSERT INTO stock_movements
+           (company_id, type, product_id, product_name, product_reference, quantity,
+            status, import_id, created_by_name, created_at)
+         VALUES ($1,'Sortie',$2,$3,$4,$5,'Validé',$6,'Import EM2S','2026-09-02 05:59:45+00')
+         RETURNING id`,
+        [societe, forcer.productId || null, nom,
+         `REF-${nom.slice(0, 6).replace(/\s/g, "")}`, quantite, imp]);
+      return rows[0].id;
+    };
 
     const mouvements = {};
     let cumul = 0;
     for (const [nom, quantite] of CONSOLIDES) {
-      mouvements[nom] = await mouvement(nom, quantite);
+      const forcer = /EFFICIENCY AMPLIFIER$/.test(nom) && !/HIGHT/.test(nom)
+        ? { id: 671, productId: 87 } : {};
+      mouvements[nom] = await mouvement(nom, quantite, forcer);
       cumul += quantite;
     }
 

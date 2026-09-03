@@ -277,6 +277,94 @@ async function main() {
   }
 
   /* ────────────────────────────────────────────────────────────────── */
+  console.log(`\n${G}L'ALIAS CERTIFIÉ OFFICIENCY → EFFICIENCY${Z}`);
+  {
+    /* Le classeur écrit « OFFICIENCY AMPLIFIER » ; la production porte
+       « EFFICIENCY AMPLIFIER » sur le mouvement #671, product_id 87,
+       sortie de 8. Sans alias, le preview s'arrête là — c'est ce qui s'est
+       passé en production. */
+    const mvt = (await q(`SELECT id, product_id, product_name, quantity, type
+       FROM stock_movements WHERE id = 671`))[0];
+    verifier("le jeu reproduit bien le libellé de la production",
+      mvt && mvt.product_name === "EFFICIENCY AMPLIFIER"
+      && Number(mvt.product_id) === 87 && Number(mvt.quantity) === 8,
+      JSON.stringify(mvt));
+
+    const ok = lancer(CLASSEUR, "--preview", "--import=3", ...METIER);
+    verifier("l'alias exact est accepté", ok.code === 0, ok.sortie.slice(-400));
+    verifier("le preview annonce l'alias utilisé",
+      /ALIAS CERTIFIÉS UTILISÉS/.test(ok.sortie));
+    verifier("il nomme les deux libellés, le mouvement et la quantité",
+      /« OFFICIENCY AMPLIFIER » → « EFFICIENCY AMPLIFIER », mouvement #671, quantité 8/
+        .test(ok.sortie));
+    verifier("il cite le product_id contrôlé", /product_id 87/.test(ok.sortie));
+    verifier("il en compte exactement un",
+      /alias certifiés utilisés : 1/.test(ok.sortie));
+    verifier("la ligne 175 est rattachée au mouvement #671",
+      /L 175[\s\S]{0,120}mouvement #671/.test(ok.sortie));
+
+    /* ── Ce que l'alias ne doit PAS accepter ── */
+    const modifier = async (sql, params) => { await pool.query(sql, params); };
+
+    await modifier(`UPDATE stock_movements SET quantity = 7 WHERE id = 671`);
+    const rq = lancer(CLASSEUR, "--preview", "--import=3", ...METIER);
+    verifier("une quantité différente de 8 est refusée", rq.code !== 0);
+    verifier("le refus signale le produit sans correspondance",
+      /OFFICIENCY AMPLIFIER \(8\)/.test(rq.sortie), rq.sortie.slice(-400));
+    await modifier(`UPDATE stock_movements SET quantity = 8 WHERE id = 671`);
+
+    await modifier(`UPDATE stock_movements SET product_id = 88 WHERE id = 671`);
+    const rp = lancer(CLASSEUR, "--preview", "--import=3", ...METIER);
+    verifier("un autre product_id est refusé", rp.code !== 0);
+    await modifier(`UPDATE stock_movements SET product_id = 87 WHERE id = 671`);
+
+    await modifier(`UPDATE stock_movements SET product_id = NULL WHERE id = 671`);
+    const rn = lancer(CLASSEUR, "--preview", "--import=3", ...METIER);
+    verifier("un product_id absent n'empêche pas le rapprochement prouvé par ailleurs",
+      rn.code === 0, rn.sortie.slice(-300));
+    await modifier(`UPDATE stock_movements SET product_id = 87 WHERE id = 671`);
+
+    await modifier(`UPDATE stock_movements SET product_name = $1 WHERE id = 671`,
+      ["EFFICIENCY AMPLIFIER PRO"]);
+    const rl = lancer(CLASSEUR, "--preview", "--import=3", ...METIER);
+    verifier("un libellé seulement proche est refusé", rl.code !== 0);
+    await modifier(`UPDATE stock_movements SET product_name = $1 WHERE id = 671`,
+      ["EFFICIENCY AMPLIFIER"]);
+
+    /* HIGHT EFFICIENCY AMPLIFIER POWER est un AUTRE article du même classeur.
+       Un rapprochement approximatif l'aurait pris pour cible. */
+    const hight = (await q(`SELECT id, quantity FROM stock_movements
+       WHERE product_name = 'HIGHT EFFICIENCY AMPLIFIER POWER'`))[0];
+    verifier("l'article voisin existe bien et vaut 6",
+      hight && Number(hight.quantity) === 6, JSON.stringify(hight));
+    await modifier(`DELETE FROM documents WHERE stock_movement_id = 671`);
+    await modifier(`UPDATE stock_movements SET product_name = 'AUTRE ARTICLE' WHERE id = 671`);
+    const rv = lancer(CLASSEUR, "--preview", "--import=3", ...METIER);
+    verifier("sans le mouvement #671, OFFICIENCY n'est jamais collée à l'article voisin",
+      rv.code !== 0 && !/OFFICIENCY[\s\S]{0,80}HIGHT/.test(rv.sortie));
+    await modifier(`UPDATE stock_movements SET product_name = 'EFFICIENCY AMPLIFIER' WHERE id = 671`);
+
+    /* L'alias vit dans le cadre certifié, pas ailleurs. */
+    await modifier(`UPDATE inventory_imports SET file_hash = $1 WHERE id = 3`,
+      ["2ceb0871526eb452a003fdab0852c2881892e131cfbd41974242b9a737f5bc42"]);
+    const rh = lancer(CLASSEUR, "--preview", "--import=3");
+    verifier("hors version métier, l'alias n'existe pas : OFFICIENCY reste non rattachée",
+      /OFFICIENCY AMPLIFIER[\s\S]{0,160}AUCUN mouvement/.test(rh.sortie),
+      rh.sortie.slice(-500));
+    await modifier(`UPDATE inventory_imports SET file_hash = $1 WHERE id = 3`,
+      [EMPREINTE_ENREGISTREE]);
+
+    verifier("aucune de ces tentatives n'a créé d'événement",
+      Number((await q(`SELECT count(*) n FROM stock_import_movement_events`))[0].n) === 0);
+    const remis = (await q(`SELECT id, product_id, product_name, quantity
+       FROM stock_movements WHERE id = 671`))[0];
+    verifier("le mouvement #671 est revenu exactement à son état d'origine",
+      Number(remis.id) === 671 && Number(remis.product_id) === 87
+      && remis.product_name === "EFFICIENCY AMPLIFIER" && Number(remis.quantity) === 8,
+      JSON.stringify(remis));
+  }
+
+  /* ────────────────────────────────────────────────────────────────── */
   console.log(`\n${G}LA VERSION MÉTIER EXACTE EST ACCEPTÉE EN PREVIEW${Z}`);
   {
     const r = lancer(CLASSEUR, "--preview", "--import=3", ...METIER);
@@ -324,6 +412,24 @@ async function main() {
       ev.every((e) => e.source_context.audit_version_metier?.version_metier_acceptee === true));
     verifier("l'audit porte le motif", ev.every((e) =>
       /Binaire d'origine indisponible/.test(e.source_context.audit_version_metier?.motif || "")));
+
+    const officiency = ev.find((e) => e.excel_row === 175);
+    verifier("l'événement OFFICIENCY est rattaché au mouvement #671",
+      officiency && Number(officiency.movement_id) === 671,
+      officiency && String(officiency.movement_id));
+    verifier("il garde les DEUX libellés dans son alias",
+      officiency?.source_context.alias_certifie?.libelle_excel === "OFFICIENCY AMPLIFIER"
+      && officiency?.source_context.alias_certifie?.libelle_mouvement === "EFFICIENCY AMPLIFIER",
+      JSON.stringify(officiency?.source_context.alias_certifie));
+    verifier("les deux libellés figurent aussi dans l'audit de version métier",
+      officiency?.source_context.audit_version_metier?.libelle_excel === "OFFICIENCY AMPLIFIER"
+      && officiency?.source_context.audit_version_metier?.libelle_mouvement
+        === "EFFICIENCY AMPLIFIER");
+    verifier("l'audit porte le motif de l'alias",
+      /Faute de frappe du classeur/.test(
+        officiency?.source_context.audit_version_metier?.alias_motif || ""));
+    verifier("les autres événements n'ont aucun alias",
+      ev.filter((e) => e.source_context.alias_certifie).length === 1);
 
     const bons = await q(
       `SELECT observation, (SELECT sum(quantity) FROM document_items i

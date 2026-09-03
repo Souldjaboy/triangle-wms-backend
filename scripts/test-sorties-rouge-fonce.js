@@ -72,7 +72,12 @@ const lancerAsync = (...args) => new Promise((resolve) => {
    métier qu'il ouvre — est couvert par test-version-metier.js. */
 function poserLeJeu() {
   execFileSync(process.execPath, [JEU],
-    { encoding: "utf8", env: { ...process.env, VERSION_METIER: "0" } });
+    { encoding: "utf8",
+      /* Chemin nominal : empreinte concordante ET libellés du classeur. La
+         faute de frappe « OFFICIENCY / EFFICIENCY » de la production, et
+         l'alias certifié qu'elle demande, sont couverts par
+         test-version-metier.js. */
+      env: { ...process.env, VERSION_METIER: "0", LIBELLE_EXACT: "1" } });
 }
 
 async function q(sql, params = []) { return (await pool.query(sql, params)).rows; }
