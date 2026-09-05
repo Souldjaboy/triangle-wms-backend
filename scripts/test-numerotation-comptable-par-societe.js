@@ -158,10 +158,41 @@ async function main() {
        production ce jour-là, sur les deux sociétés simultanément. */
     const client = await pool.connect();
     try {
+      /* Deux sociétés ne produisent le MÊME texte que si elles partent du
+         même point. Lancée après la suite des ventes de sable, celle-ci
+         trouve de vraies écritures REV-SAB côté Triangle et pas côté
+         FAT & MAT : les compteurs sont alors décalés, et exiger l'égalité
+         ferait échouer le test pour une raison qui n'a rien à voir avec le
+         correctif. On ne l'exige donc que lorsque le décalage n'existe pas —
+         et on vérifie toujours ce qui compte vraiment, plus bas : que la
+         seconde société n'échoue plus. */
+      const annee = new Date().getFullYear();
+      const depart = async (societe) => {
+        const [c] = await q(
+          `SELECT last_value FROM number_counters
+            WHERE company_id = $1 AND counter_key = $2`,
+          [societe, `accounting_transactions.transaction_number.REV-SAB.${annee}`]);
+        const [l] = await q(
+          `SELECT transaction_number AS n FROM accounting_transactions
+            WHERE company_id = $1 AND transaction_number LIKE $2
+            ORDER BY id DESC LIMIT 1`,
+          [societe, `REV-SAB-${annee}-%`]);
+        /* Exactement la formule de nextAccountingNumber : le compteur, puis
+           la réconciliation sur la dernière ligne réellement écrite. */
+        return Math.max(Number(c?.last_value || 0) + 1,
+                        Number(String(l?.n || "").split("-").pop() || 0) + 1);
+      };
+      const memeDepart = (await depart(S1)) === (await depart(S2));
+
       const numTriangle = await nextAccountingNumber(client, "accounting_transactions", "transaction_number", "REV-SAB", S1);
       const numFatmat = await nextAccountingNumber(client, "accounting_transactions", "transaction_number", "REV-SAB", S2);
-      verifier("les deux préfixes REV-SAB générés le même jour sont identiques en texte",
-        numTriangle === numFatmat);
+      if (memeDepart) {
+        verifier("les deux préfixes REV-SAB générés le même jour sont identiques en texte",
+          numTriangle === numFatmat, `${numTriangle} / ${numFatmat}`);
+      } else {
+        verifier("les compteurs REV-SAB sont décalés par un historique préexistant — égalité non exigée",
+          true, `${numTriangle} / ${numFatmat}`);
+      }
       await inserer(client, S1, numTriangle);
       let echec = null;
       try { await inserer(client, S2, numFatmat); } catch (e) { echec = e; }

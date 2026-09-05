@@ -22,6 +22,7 @@ const crypto = require("crypto");
 const nodemailer = require("nodemailer");
 /* Entreprise d'appartenance et badge : une seule règle, côté serveur. */
 const companyContext = require("./services/company-context");
+const accesSocietes = require("./services/acces-societes");
 const identifiants = require("./services/identifiants");
 const stockLocations = require("./services/stock-locations");
 const locationHierarchy = require("./services/location-hierarchy");
@@ -375,11 +376,47 @@ function getRequestedActiveCompanyId(req) {
   return Number.isInteger(numeric) && numeric > 0 ? numeric : null;
 }
 
+/**
+ * SOCIÉTÉS QU'UN COMPTE NON SUPER ADMIN PEUT ATTEINDRE.
+ *
+ * Rempli par `authenticateToken` à partir de `user_company_access`
+ * (migration 079). Absent ou vide, on retombe sur le comportement d'avant :
+ * la seule société d'origine. Une liste manquante ne doit jamais élargir.
+ */
+function societesHabilitees(user) {
+  const liste = Array.isArray(user?.societes_autorisees) ? user.societes_autorisees : [];
+  return liste.map(Number).filter((n) => Number.isInteger(n) && n > 0);
+}
+
+/**
+ * La bascule demandée est-elle légitime pour ce compte ?
+ *
+ * Volontairement plus stricte que pour un super admin : on n'accepte QUE
+ * l'en-tête ou le paramètre d'URL, jamais `req.body.company_id`. Le corps
+ * d'une requête décrit une donnée — un employé, un document — et porte
+ * couramment un `company_id` qui ne demande aucune bascule. L'accorder ici
+ * ferait écrire un comptable habilité dans l'autre société sans qu'il l'ait
+ * demandé.
+ */
+function societeDemandeeAutorisee(req) {
+  const habilitees = societesHabilitees(req.user);
+  if (!habilitees.length) return null;
+  const brut =
+    req?.headers?.["x-active-company-id"] ||
+    req?.headers?.["x-company-id"] ||
+    req?.query?.active_company_id;
+  const demande = Number(brut);
+  if (!Number.isInteger(demande) || demande <= 0) return null;
+  return habilitees.includes(demande) ? demande : null;
+}
+
 function getEffectiveCompanyId(req, fallback = null) {
   if (isSuperAdminUser(req.user)) {
     return getRequestedActiveCompanyId(req) || Number(req.user?.company_id || 0) || fallback || null;
   }
-  return Number(req.user?.company_id || 0) || fallback || null;
+  return (
+    societeDemandeeAutorisee(req) || Number(req.user?.company_id || 0) || fallback || null
+  );
 }
 
 /**
@@ -406,7 +443,11 @@ function getEffectiveCompanyIdStrict(req, fallback = null) {
     const explicite = Number.isInteger(demande) && demande > 0 ? demande : null;
     return explicite || Number(req.user?.company_id || 0) || fallback || null;
   }
-  return Number(req.user?.company_id || 0) || fallback || null;
+  /* Un compte habilité (079) bascule aux mêmes conditions : en-tête ou
+     paramètre d'URL, jamais le corps. */
+  return (
+    societeDemandeeAutorisee(req) || Number(req.user?.company_id || 0) || fallback || null
+  );
 }
 
 async function getCompanySettingsForCompany(clientOrPool, companyId) {
@@ -1028,9 +1069,25 @@ async function authenticateToken(req, res, next) {
       });
     }
 
+    /* Les sociétés atteignables sont résolues ici, une fois, plutôt qu'à
+       chaque appel de getEffectiveCompanyId — qui est synchrone et appelé des
+       dizaines de fois par requête. En cas d'incident base, on n'élargit
+       jamais : la liste vide ramène au comportement d'avant (la seule société
+       d'origine). */
+    let societesAutorisees = [];
+    try {
+      societesAutorisees = await accesSocietes.societesAccessibles(
+        pool, user, requestTenant || null
+      );
+    } catch (e) {
+      console.error("Sociétés accessibles : lecture impossible —", e.message);
+      societesAutorisees = [];
+    }
+
     req.user = {
       ...user,
-      tenant_id: tokenTenant || requestTenant
+      tenant_id: tokenTenant || requestTenant,
+      societes_autorisees: societesAutorisees
     };
     req.tenant_id = requestTenant;
 
@@ -17920,6 +17977,13 @@ app.use(
    /permissions/me réponde même si un module plus bas est masqué. */
 const createPermissionsRouter = require("./routes/permissions");
 app.use("/", createPermissionsRouter({ pool, authenticateToken, getEffectiveCompanyId }));
+
+/* Accès multi-sociétés : le comptable et le directeur travaillent pour les
+   deux sociétés sans second compte ni élévation en super admin. Monté ici,
+   juste après le centre des droits, parce que le sélecteur d'entreprise
+   interroge /acces-societes/mes-societes au tout premier chargement. */
+const createAccesSocietesRouter = require("./routes/acces-societes");
+app.use("/", createAccesSocietesRouter({ pool, authenticateToken, requirePermission }));
 
 const createDocumentsPrintRouter = require("./routes/documents-print");
 app.use(

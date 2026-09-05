@@ -75,3 +75,31 @@ Aucun accès VPS, aucun déploiement, aucune fusion.
 | # | Chantier | État |
 |---|----------|------|
 | 078 | Unicité par société : `laboratory_cases.case_number`, `documents.document_number` | en cours |
+| 079 | Accès multi-sociétés (`user_company_access`) — bascule sans second compte | **fait** — 24/24 |
+
+### Décision 079
+Il n'existait aucune table d'accès multi-sociétés : `societesAutorisees()` ne
+laissait basculer que le `super_admin`. Les deux issues sans elle étaient un
+second compte (deux mots de passe, deux audits, deux jeux de droits qui
+divergent) ou une élévation en super_admin (bien trop large). D'où
+`user_company_access` + `user_company_access_log`.
+
+Points de sécurité retenus :
+- la bascule d'un compte habilité ne s'obtient QUE par l'en-tête
+  `x-active-company-id` ou le paramètre d'URL, **jamais** par
+  `req.body.company_id` — c'est un nom de champ de donnée avant d'être une
+  commande (piège déjà documenté sur `getEffectiveCompanyIdStrict`) ;
+- une habilitation n'accorde aucun droit métier : le RBAC est réévalué avec le
+  `company_id` effectif ;
+- une habilitation ne franchit jamais la frontière d'un `tenant_id` ;
+- la liste est résolue une fois par requête dans `authenticateToken`, avec un
+  cache de 30 s invalidé à chaque écriture ; en cas de panne base la liste est
+  **vide** (on n'élargit jamais sur incident).
+
+### Correction d'une fragilité de la suite 077
+`test-numerotation-comptable-par-societe.js` exigeait que les deux sociétés
+produisent le même texte `REV-SAB`. Lancée après la suite des ventes de sable,
+elle trouvait des compteurs décalés par de vraies écritures et échouait pour
+une raison étrangère au correctif. L'égalité n'est désormais exigée que si les
+deux compteurs partent réellement du même point ; l'assertion qui compte — la
+seconde société n'échoue plus — est inconditionnelle.

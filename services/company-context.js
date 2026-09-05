@@ -1,5 +1,7 @@
 "use strict";
 
+const acces = require("./acces-societes");
+
 /**
  * À QUELLE ENTREPRISE APPARTIENT CE QUE L'ON CRÉE.
  *
@@ -20,20 +22,18 @@
  *      préfixe écrit en dur.
  */
 
-/** Sociétés qu'un compte peut légitimement administrer. */
-async function societesAutorisees(pool, user) {
-  const estSuper =
-    user?.is_super_admin === true ||
-    String(user?.role || "").toLowerCase() === "super_admin";
-
-  if (!estSuper) {
-    const id = Number(user?.company_id || 0);
-    return id ? [id] : [];
-  }
-  const { rows } = await pool.query(
-    `SELECT id FROM companies WHERE COALESCE(status,'active') <> 'deleted' ORDER BY id`
-  );
-  return rows.map((r) => Number(r.id));
+/**
+ * Sociétés qu'un compte peut légitimement administrer.
+ *
+ * Depuis la migration 079, ce n'est plus le seul privilège de super admin :
+ * un compte peut être habilité explicitement sur d'autres sociétés
+ * (`user_company_access`), sans qu'on lui crée un second compte ni qu'on
+ * l'élève en super admin. La résolution vit dans `acces-societes.js`, pour
+ * que la question « quelles sociétés ? » n'ait qu'une seule réponse dans
+ * l'application.
+ */
+async function societesAutorisees(pool, user, tenantId = null) {
+  return acces.societesAccessibles(pool, user, tenantId);
 }
 
 /**
