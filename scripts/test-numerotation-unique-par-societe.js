@@ -18,6 +18,11 @@
  *     Le doublon doit maintenant être refusé, la coexistence inter-sociétés
  *     rester possible.
  *
+ *   • la FAMILLE ENTIÈRE (082) — les huit colonnes alimentées par
+ *     nextAccountingNumber sont uniques PAR SOCIÉTÉ, et la plus critique
+ *     d'entre elles, accounting_entries.entry_number, est éprouvée pour de
+ *     vrai : elle est écrite par TOUTE opération financière.
+ *
  *   • laboratory_cases.result_code — vérifie la NON-modification délibérée :
  *     ce code est tiré au hasard et interrogé par une route publique sans
  *     société ; son unicité doit rester GLOBALE. Un test qui « passerait »
@@ -84,6 +89,8 @@ const insererDocument = (c, companyId, numero) =>
            VALUES ($1,$2,$3,$4) RETURNING id`, [companyId, numero, MARQUE, MARQUE]);
 
 async function nettoyer() {
+  await pool.query(`DELETE FROM accounting_entries WHERE description = $1 OR source_type = $1`, [MARQUE]);
+  await pool.query(`DELETE FROM number_counters WHERE counter_key LIKE '%ESSAI082%'`);
   await pool.query(`DELETE FROM laboratory_cases WHERE status = $1`, [MARQUE]);
   await pool.query(`DELETE FROM documents WHERE document_type = $1`, [MARQUE]);
   await pool.query(`DELETE FROM number_counters WHERE counter_key LIKE '%ESSAI078%'`);
@@ -219,6 +226,78 @@ async function main() {
       try { await insererDocument(c, S2, r2); } catch (e) { echec = e; }
       verifier("le reçu de la seconde société s'enregistre sans collision",
         !echec, echec ? `${echec.code} ${echec.message}` : "");
+    } finally { c.release(); }
+  }
+
+  // ────────────────────────────────────────────────────────────────────
+  console.log(`\n${G}LA FAMILLE ENTIÈRE, PAS SEULEMENT LES PREMIERS CAS (082)${Z}`);
+  {
+    /* Les huit colonnes que nextAccountingNumber alimente doivent porter une
+       unicité qui COMMENCE par company_id. La lister ici plutôt que de la
+       supposer : c'est en croyant la famille limitée à trois membres qu'on a
+       laissé passer les cinq autres. */
+    const attendues = [
+      ["accounting_transactions", "transaction_number"],
+      ["accounting_entries",      "entry_number"],
+      ["journal_entries",         "entry_number"],
+      ["expense_requests",        "request_number"],
+      ["cash_vouchers",           "voucher_number"],
+      ["laboratory_cases",        "case_number"],
+      ["documents",               "document_number"],
+      ["payroll_vouchers",        "voucher_number"],
+    ];
+    for (const [table, colonne] of attendues) {
+      const [trouvee] = await q(
+        `SELECT c.conname
+           FROM pg_constraint c
+           JOIN pg_attribute a1 ON a1.attrelid = c.conrelid AND a1.attnum = c.conkey[1]
+           JOIN pg_attribute a2 ON a2.attrelid = c.conrelid AND a2.attnum = c.conkey[2]
+          WHERE c.conrelid = $1::regclass AND c.contype = 'u'
+            AND array_length(c.conkey, 1) = 2
+            AND a1.attname = 'company_id' AND a2.attname = $2`,
+        [table, colonne]);
+      verifier(`${table}.${colonne} est unique par société`, Boolean(trouvee), "protection globale restante");
+    }
+
+    /* marketplace_orders reste GLOBAL, volontairement : la table n'a pas de
+       company_id, et nextAccountingNumber s'y réconcilie déjà globalement.
+       Un test qui exigerait l'inverse signalerait une régression. */
+    const [mkp] = await q(
+      `SELECT conname FROM pg_constraint
+        WHERE conrelid = 'marketplace_orders'::regclass AND contype = 'u'`);
+    verifier("marketplace_orders.order_number reste global (pas de company_id sur la table)",
+      mkp?.conname === "marketplace_orders_order_number_key", JSON.stringify(mkp));
+  }
+
+  // ────────────────────────────────────────────────────────────────────
+  console.log(`\n${G}ÉCRITURES COMPTABLES : LE CAS LE PLUS COÛTEUX${Z}`);
+  {
+    /* createAccountingEntry() est appelée par TOUTE opération financière —
+       salaire, vente, encaissement, contrepassation. Avant 082, deux sociétés
+       atteignant la même séquence ECR le même jour faisaient échouer la
+       seconde en pleine transaction financière. */
+    const c = await pool.connect();
+    try {
+      const e1 = await nextAccountingNumber(c, "accounting_entries", "entry_number", "ECR-ESSAI082", S1);
+      const e2 = await nextAccountingNumber(c, "accounting_entries", "entry_number", "ECR-ESSAI082", S2);
+      verifier("les deux sociétés produisent le même numéro d'écriture", e1 === e2, `${e1} / ${e2}`);
+
+      const ecrire = (societe, numero) => c.query(
+        `INSERT INTO accounting_entries
+           (company_id, entry_number, source_type, source_id, account_label, debit, credit, description)
+         VALUES ($1,$2,$3,1,'Essai',1,0,$3) RETURNING id`,
+        [societe, numero, MARQUE]);
+
+      await ecrire(S1, e1);
+      let echec = null;
+      try { await ecrire(S2, e2); } catch (e) { echec = e; }
+      verifier("l'écriture de la seconde société n'échoue plus — c'est le correctif 082",
+        !echec, echec ? `${echec.code} ${echec.message}` : "");
+
+      let memeSociete = null;
+      try { await ecrire(S1, e1); } catch (e) { memeSociete = e; }
+      verifier("la même société ne peut toujours pas dupliquer une écriture",
+        Boolean(memeSociete), memeSociete ? "refusé comme attendu" : "ACCEPTÉ À TORT");
     } finally { c.release(); }
   }
 

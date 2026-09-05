@@ -323,6 +323,52 @@ module.exports = function createAttendanceWorkforceRouter(deps) {
     const client=await pool.connect();
     try {
       if(!await P.canManagePayroll(client,companyId,req.user,"pay")) return res.status(403).json({error:"Paiement de salaire refusé."});
+
+      /* LE VERROU (migration 081) : payer exige une autorisation de la
+         Direction. Le contrôle ne porte pas sur le rôle de celui qui clique —
+         un rôle se change à l'écran des droits — mais sur l'état d'un objet
+         que quelqu'un d'AUTRE a dû toucher : une `payroll_requests` VALIDEE,
+         décidée par un compte différent de celui qui a soumis.
+
+         Une paie sans période et sans demande reste payable : ce sont les
+         paies mensuelles enregistrées avant ce chantier, et les bloquer
+         rétroactivement empêcherait de solder ce qui est en cours. Dès qu'une
+         demande existe pour cette paie, en revanche, elle fait autorité. */
+      {
+        const { rows: etat } = await client.query(
+          `SELECT r.id AS run_id, r.status AS run_status,
+                  (SELECT status FROM payroll_requests q
+                    WHERE q.payroll_run_id = r.id
+                    ORDER BY q.submitted_at DESC, q.id DESC LIMIT 1) AS demande_status
+             FROM attendance_payroll_items_v2 i
+             JOIN attendance_payroll_runs_v2 r ON r.id = i.payroll_run_id
+            WHERE i.id = $1 AND i.company_id = $2`,
+          [Number(req.params.id), companyId]
+        );
+        const ligne = etat[0];
+        if (!ligne) return res.status(404).json({ error: "Salaire introuvable.", code: "PAYROLL_ITEM_NOT_FOUND" });
+
+        if (ligne.demande_status && ligne.demande_status !== "VALIDEE") {
+          const explications = {
+            EN_ATTENTE_DIRECTION: "Cette paie attend encore la décision de la Direction.",
+            REFUSEE:              "Cette paie a été refusée par la Direction.",
+            CORRECTION_DEMANDEE:  "La Direction a demandé une correction : corrigez puis soumettez à nouveau.",
+            ANNULEE:              "La demande de paiement a été annulée.",
+          };
+          return res.status(409).json({
+            error: explications[ligne.demande_status] || "Cette paie n'est pas autorisée au paiement.",
+            code: "PAYROLL_NOT_AUTHORIZED",
+            statut_demande: ligne.demande_status,
+          });
+        }
+        if (["EN_ATTENTE_DIRECTION", "REFUSEE", "CORRECTION_DEMANDEE"].includes(ligne.run_status)) {
+          return res.status(409).json({
+            error: "Cette paie n'est pas autorisée au paiement.",
+            code: "PAYROLL_NOT_AUTHORIZED", statut_paie: ligne.run_status,
+          });
+        }
+      }
+
       const method=P.assertPaymentMethod(req.body?.payment_method);
       if(["BANK","TRANSFER","CHECK"].includes(method) && !req.body?.bank_id)
         return res.status(400).json({error:"Sélectionnez la banque utilisée.",code:"PAYROLL_BANK_REQUIRED"});
@@ -374,6 +420,15 @@ module.exports = function createAttendanceWorkforceRouter(deps) {
            ELSE 'PARTIALLY_PAID' END,updated_at=now()
          WHERE r.id=$1 RETURNING r.*`,[item.payroll_run_id]
       )).rows[0];
+      /* La période suit son unique paie : tout payé, elle passe à PAYEE et
+         devient clôturable. Un paiement partiel la laisse où elle est. */
+      if (run?.period_id && run.status === "PAID") {
+        await client.query(
+          `UPDATE attendance_periods SET status='PAYEE', updated_at=now()
+            WHERE id=$1 AND status IN ('AUTORISEE_AU_PAIEMENT','VALIDEE_DIRECTION')`,
+          [run.period_id]
+        );
+      }
       await client.query("COMMIT"); res.json({item,run});
     } catch(error){await client.query("ROLLBACK").catch(()=>{});fail(res,error,"Erreur paiement du salaire.");}
     finally{client.release();}

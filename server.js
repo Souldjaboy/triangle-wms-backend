@@ -18032,6 +18032,18 @@ app.use(
   createAttendanceQrRouter({ pool, authenticateToken, getEffectiveCompanyId, requirePermission })
 );
 
+/* Périodes du 25 au 24, validation du pointage et chemin d'une paie jusqu'au
+   bon signé. Le passage par la Direction n'est pas une consigne : la route de
+   paiement exige une demande VALIDEE, décidée par un autre compte que celui
+   qui l'a soumise. */
+const createPaieWorkflowRouter = require("./routes/paie-workflow");
+app.use(
+  "/",
+  createPaieWorkflowRouter({
+    pool, authenticateToken, getEffectiveCompanyId, requirePermission, nextAccountingNumber,
+  })
+);
+
 const createInventoryImportRouter = require("./routes/inventory-import");
 app.use(
   "/",

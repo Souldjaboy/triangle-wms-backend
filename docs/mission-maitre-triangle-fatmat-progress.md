@@ -161,3 +161,40 @@ derrière un contrôle `pg_constraint` (le piège `duplicate_table`).
 Les deux suites de test sont conservées : la mienne (17 vérifications) couvre
 en plus la non-régression volontaire de `result_code` face à une seconde
 société, le vrai chemin des reçus `REC-LAB`, et les numéros NULL multiples.
+| 081 | Périodes 25→24, calendrier, workflow paie + Direction, bons | **fait** — 50/50 |
+| 082 | Toute la famille de numérotation par société (5 tables restantes) | **fait** — 28/28 |
+
+### Décision 081
+- `attendance_periods` avec **contrainte d'exclusion GiST** : ce qu'il faut
+  interdire n'est pas la répétition d'une date mais le **chevauchement** de
+  deux périodes — deux paies qui se recouvrent paieraient deux fois les mêmes
+  journées sans que rien ne le remarque. Éprouvé par insertion directe en base.
+- Machine à états explicite (`TRANSITIONS`) : ce qui n'est pas listé est
+  refusé. Une machine qui interdit par défaut ne laisse pas passer
+  l'enchaînement auquel personne n'avait pensé.
+- Le passage par la Direction ne repose **pas** sur le rôle de celui qui clique
+  (un rôle se change à l'écran des droits) mais sur l'état d'un objet qu'un
+  **autre compte** a dû toucher : `payroll_requests` VALIDEE, avec refus
+  explicite de l'auto-validation (`SELF_APPROVAL_FORBIDDEN`) — éprouvé en
+  accordant volontairement au comptable le droit `paie|validate`.
+- Le bon de paiement **recopie** son contenu (`payload` jsonb) au lieu de le
+  relire par jointure : un bon signé doit dire ce qu'il disait le jour de la
+  signature.
+- Les paies antérieures, sans période ni demande, restent payables : les
+  bloquer rétroactivement empêcherait de solder ce qui est en cours.
+
+### Défaut réel trouvé pendant l'écriture de la suite 081
+Le paiement d'un salaire a échoué sur
+`accounting_entries_entry_number_key` — contrainte **globale** sur une colonne
+alimentée par un compteur **par société**. L'inventaire exhaustif des
+appelants de `nextAccountingNumber` a montré que la famille comptait **huit**
+membres, pas les trois traités par 077 et 078. Les cinq restants
+(`accounting_entries`, `journal_entries`, `expense_requests`, `cash_vouchers`,
+et le cas volontairement non traité de `marketplace_orders`) sont corrigés par
+082, qui pose en plus un **garde-fou** : son bloc de contrôle vérifie les huit
+colonnes et avertit si une nouvelle table numérotée arrive un jour sans
+unicité par société.
+
+`accounting_entries` était le plus coûteux : `createAccountingEntry()` est
+appelée par **toute** opération financière — salaire, vente, encaissement,
+contrepassation.
