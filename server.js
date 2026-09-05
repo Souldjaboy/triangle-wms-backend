@@ -18068,6 +18068,18 @@ app.use(
   })
 );
 
+/* Fiscalité. Aucun taux n'est actif au départ : une règle ne calcule rien tant
+   qu'une personne ne l'a pas validée avec sa référence de texte officiel. Et
+   aucune pénalité n'est inventée — sans règle validée, l'application le dit. */
+const createFiscaliteRouter = require("./routes/fiscalite");
+app.use(
+  "/",
+  createFiscaliteRouter({
+    pool, authenticateToken, getEffectiveCompanyId, requirePermission,
+    nextAccountingNumber, createAccountingEntry,
+  })
+);
+
 const createInventoryImportRouter = require("./routes/inventory-import");
 app.use(
   "/",

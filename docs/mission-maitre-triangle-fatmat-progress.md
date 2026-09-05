@@ -280,3 +280,39 @@ activité à chaque écriture — ce qui assure aussi l'isolation inter-sociét�
 L'état du dépôt recalcule son solde **ligne à ligne** et signale
 (`coherent: false`) toute divergence avec la fiche : un état doit pouvoir se
 vérifier à la main.
+| 085 | Fiscalité Mali — moteur versionné, **aucun taux activé** | **fait** — 57/57 |
+
+### Décision 085 — ce qui n'est volontairement PAS activé
+**Aucune règle n'est posée avec un taux actif. Pas une.**
+
+Les valeurs qui circulent (CFE 3,5 %, CGS 0,5 %, TFP 2 %, TEJ 2 %, taxe
+logement 1 %, impôt synthétique 3 %) sont des **candidats**, pas des vérités :
+elles dépendent du régime réel de la société, de son activité, de sa
+localisation et de la loi de finances en vigueur. La patente n'a jamais de
+montant unique universel.
+
+Recherche menée le 2026-09-04. Sources consultées :
+- Direction Générale des Impôts du Mali — https://www.dgi.gouv.ml/
+- Code général des impôts — https://www.dgi.gouv.ml/CGI/
+- Ministère de l'Économie et des Finances — https://finances.ml/node/264
+- Loi de finances / budget — https://budget.gouv.ml/
+
+**Un seul chiffre a pu être corroboré, et encore indirectement** : la CFE à
+3,5 % sur les rémunérations brutes. Aucune de ces sources n'a pu être lue
+article par article depuis cet environnement. Inscrire ces taux comme actifs
+reviendrait à faire calculer des montants que personne n'a vérifiés — et qu'un
+comptable déclarerait ensuite à l'administration.
+
+Le catalogue est donc chargé avec **15 types** (code, nom, explication simple,
+organisme, base, périodicité) et **zéro taux**. Une règle naît toujours
+`A_VERIFIER`, quel que soit ce que le client envoie ; elle ne calcule rien tant
+qu'une personne ne l'a pas validée **avec sa référence de texte officiel** —
+exigence portée par une contrainte PostgreSQL, pas seulement par la route.
+
+Aucune pénalité n'est inventée : sans règle validée, l'API renvoie le message
+convenu « Taux de pénalité non configuré — vérifier auprès de la DGI ou du
+comptable. »
+
+Déclarer crée une **dette** (écritures au passif) **sans toucher la
+trésorerie** ; seul le paiement débite, une fois, et produit une quittance.
+Vérifié explicitement par la suite.
