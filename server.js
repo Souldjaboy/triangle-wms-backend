@@ -18023,6 +18023,15 @@ app.use(
   createAttendanceCorrectionsRouter({ pool, authenticateToken, getEffectiveCompanyId })
 );
 
+/* Pointage QR et badges. Écran, route et droit distincts du pointage manuel —
+   on ne transforme pas l'un en l'autre — mais un seul moteur d'écriture,
+   partagé avec lui : le mode change qui déclenche, pas la règle métier. */
+const createAttendanceQrRouter = require("./routes/attendance-qr");
+app.use(
+  "/",
+  createAttendanceQrRouter({ pool, authenticateToken, getEffectiveCompanyId, requirePermission })
+);
+
 const createInventoryImportRouter = require("./routes/inventory-import");
 app.use(
   "/",

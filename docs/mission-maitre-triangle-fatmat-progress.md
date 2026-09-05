@@ -103,3 +103,43 @@ elle trouvait des compteurs décalés par de vraies écritures et échouait pour
 une raison étrangère au correctif. L'égalité n'est désormais exigée que si les
 deux compteurs partent réellement du même point ; l'assertion qui compte — la
 seconde société n'échoue plus — est inconditionnelle.
+| 080 | Badges QR + pointage QR distinct du manuel | **fait** — 50/50 |
+
+### Décision 080
+Les badges vivaient sur `users.badge_code` : un employé de pointage sans compte
+utilisateur ne pouvait donc pas en porter, et le code, lisible et séquentiel,
+servait aussi de clé de scan — le badge suivant se devinait en ajoutant 1.
+
+Un badge porte désormais **deux** identifiants : `badge_code` (imprimé,
+lisible, sans valeur d'authentification) et `qr_token` (24 octets aléatoires,
+~192 bits, seul à valoir pointage). Le QR n'encode que le jeton : ni nom, ni
+matricule, ni société.
+
+- un badge d'une autre société est refusé du **même message** qu'un badge
+  inconnu — sinon, scanner sur les deux postes révélerait à qui appartient une
+  carte trouvée par terre ;
+- `pg_advisory_xact_lock` par badge + fenêtre anti-rebond de 20 s : deux
+  lectures rapprochées renvoient le pointage déjà écrit au lieu d'une erreur ;
+- un seul badge actif par employé (index partiel) ; le remplacement invalide
+  l'ancien **avant** d'émettre le nouveau ;
+- `attendance_qr_scans` trace les refus, avec un indice de jeton (4 derniers
+  caractères) et jamais le jeton en clair.
+
+QR et manuel restent **deux** écrans, deux routes, deux droits
+(`pointage.qr|scan` vs `pointage.manuel|create`) mais partagent un **seul**
+moteur d'écriture, `A.enregistrerPointage` — le mode change qui déclenche, pas
+la règle métier. La route manuelle a été rebranchée dessus sans changement de
+comportement (39/39 avant comme après).
+
+`attendance_employees.site_id` référence `attendance_work_sites`, **pas**
+`attendance_sites` (l'ancienne table GPS). Les confondre fait échouer la clé
+étrangère.
+
+### Fragilité corrigée dans trois suites
+`test-durcissement` réécrit `role_permissions` selon les rôles réellement
+présents en base. Les suites qui s'appuyaient sur les droits posés par une
+migration (sable/075, QR/080) échouaient donc selon l'ordre d'exécution, pour
+une raison étrangère à ce qu'elles vérifient. Chaque jeu d'essai accorde
+maintenant **nommément** les droits dont il a besoin — jamais plus larges, afin
+que les tests de refus prouvent encore quelque chose. Les suites 079 et QR
+créent aussi leurs propres comptes au lieu d'identifiants écrits en dur.

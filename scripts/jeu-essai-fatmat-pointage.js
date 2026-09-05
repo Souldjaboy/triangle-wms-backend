@@ -46,6 +46,15 @@ async function main() {
     await c.query(`DELETE FROM attendance_event_log_v2`);
     await c.query(`DELETE FROM attendance_day_records_v2`);
     await c.query(`DELETE FROM attendance_salary_settings_v2`);
+    /* La paie référence les employés : la relancer sans effacer d'abord les
+       bulletins fait échouer la suite sur une clé étrangère, alors que rien
+       ne va mal — c'est seulement l'ordre du ménage qui manquait. */
+    await c.query(`DELETE FROM attendance_salary_adjustments_v2`);
+    await c.query(`DELETE FROM attendance_payroll_items_v2`);
+    await c.query(`DELETE FROM attendance_payroll_runs_v2`);
+    await c.query(`DELETE FROM attendance_badge_events`);
+    await c.query(`DELETE FROM attendance_qr_scans`);
+    await c.query(`DELETE FROM attendance_badges`);
     await c.query(`DELETE FROM attendance_employees`);
     await c.query(`DELETE FROM attendance_schedule_days`);
     await c.query(`DELETE FROM attendance_work_schedules`);

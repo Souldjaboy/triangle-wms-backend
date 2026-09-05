@@ -52,13 +52,31 @@ async function appel(methode, chemin, token, corps, entetes = {}) {
   return { statut: r.status, corps: json };
 }
 
-/* Comptable Triangle (société 1) : le cas réel de Souleymane Fofana. */
-const COMPTABLE = 4, TRIANGLE = 1, FATMAT = 2, SUPER = 1, EMPLOYE = 3;
+const TRIANGLE = 1, FATMAT = 2;
+
+/* La suite crée SES propres comptes plutôt que de compter sur ceux du socle :
+   les autres suites remplacent les comptes fixtures, et un identifiant écrit
+   en dur ici ferait échouer celle-ci selon l'ordre d'exécution — pour une
+   raison sans aucun rapport avec ce qu'elle vérifie. */
+let COMPTABLE = 0, SUPER = 0, EMPLOYE = 0;
+
+async function poserLesComptes() {
+  await pool.query(`DELETE FROM users WHERE email LIKE 'acces079-%@essai.test'`);
+  const creer = async (email, nom, role, companyId, superAdmin = false) => (await pool.query(
+    `INSERT INTO users (company_id, fullname, email, password, role, is_super_admin, is_active)
+     VALUES ($1,$2,$3,'$non-utilisable$',$4,$5,true) RETURNING id`,
+    [companyId, nom, email, role, superAdmin])).rows[0].id;
+
+  SUPER     = await creer("acces079-super@essai.test",     "Essai 079 Super",     "super_admin", TRIANGLE, true);
+  COMPTABLE = await creer("acces079-comptable@essai.test", "Essai 079 Comptable", "comptable",   TRIANGLE);
+  EMPLOYE   = await creer("acces079-employe@essai.test",   "Essai 079 Employé",   "employe",     TRIANGLE);
+}
 
 async function nettoyer() {
   await pool.query(`DELETE FROM user_company_access_log WHERE reason LIKE 'ESSAI079%'`);
   await pool.query(`DELETE FROM user_company_access WHERE reason LIKE 'ESSAI079%'`);
   await pool.query(`DELETE FROM user_permission_overrides WHERE module_key = 'utilisateur.acces_societes'`);
+  await pool.query(`DELETE FROM users WHERE email LIKE 'acces079-%@essai.test'`);
 }
 
 /* Le cache d'habilitations vit 30 s. Les tests écrivent en base directement
@@ -69,6 +87,7 @@ async function nettoyer() {
 async function main() {
   console.log(`\n${G}ACCÈS MULTI-SOCIÉTÉS (079)${Z}`);
   await nettoyer();
+  await poserLesComptes();
 
   const tSuper = jeton(SUPER, "super_admin", TRIANGLE, true);
   const tComptable = jeton(COMPTABLE, "comptable", TRIANGLE);

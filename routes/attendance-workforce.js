@@ -163,6 +163,12 @@ module.exports = function createAttendanceWorkforceRouter(deps) {
     } catch (error) { fail(res, error, "Erreur lecture pointages du jour."); }
   });
 
+  /* POINTAGE MANUEL — on choisit l'employé dans une liste.
+     Distinct du pointage QR (routes/attendance-qr.js) : deux écrans, deux
+     droits, deux sources dans les rapports. Ce qu'ils écrivent une fois
+     l'employé identifié passe en revanche par le MÊME moteur
+     (`A.enregistrerPointage`), pour qu'une règle métier n'ait jamais deux
+     versions. */
   router.post("/attendance-v2/check", authenticateToken, async (req, res) => {
     const companyId = requireCompany(req, res); if (!companyId) return;
     const client = await pool.connect();
@@ -170,76 +176,27 @@ module.exports = function createAttendanceWorkforceRouter(deps) {
       const action = A.assertAction(req.body?.action_type);
       const employeeId = Number(req.body?.employee_id);
       if (!employeeId) return res.status(400).json({ error: "Employé obligatoire.", code: "EMPLOYEE_REQUIRED" });
+
       await client.query("BEGIN");
-      const { rows: employees } = await client.query(
-        `SELECT e.*, c.official_start_at, c.timezone,
-                (timezone(c.timezone, now()))::date AS local_date,
-                (timezone(c.timezone, now()))::time AS local_time
-           FROM attendance_employees e
-           JOIN attendance_company_configuration c ON c.company_id=e.company_id
-          WHERE e.id=$1 AND e.company_id=$2 AND e.active=true FOR UPDATE OF e`,
-        [employeeId, companyId]
-      );
-      const employee = employees[0];
+      const employee = await A.chargerEmployePourPointage(client, companyId, employeeId);
       if (!employee) { await client.query("ROLLBACK"); return res.status(404).json({ error: "Employé introuvable." }); }
-      if (new Date() < new Date(employee.official_start_at)) {
-        await client.query("ROLLBACK");
-        return res.status(409).json({ error: "Le nouveau pointage n’est pas encore ouvert.", code: "ATTENDANCE_NOT_STARTED" });
-      }
+
       if (!await A.canPunchEmployee(client, companyId, req.user, employee)) {
         await client.query("ROLLBACK");
         return res.status(403).json({ error: "Vous ne pouvez pas pointer cet employé.", code: "ATTENDANCE_SCOPE_DENIED" });
       }
-      const { rows: days } = await client.query(
-        `SELECT d.* FROM attendance_schedule_days d
-          WHERE d.schedule_id=$1 AND d.iso_weekday=extract(isodow FROM $2::date)`,
-        [employee.schedule_id, employee.local_date]
-      );
-      const day = days[0];
-      if (!day?.is_working_day) {
-        await client.query("ROLLBACK");
-        return res.status(409).json({ error: "Jour non travaillé pour cet employé.", code: "NON_WORKING_DAY" });
-      }
-      const { rows: records } = await client.query(
-        `INSERT INTO attendance_day_records_v2(company_id,employee_id,work_date,status,punched_by)
-         VALUES($1,$2,$3,'ABSENT',$4)
-         ON CONFLICT(company_id,employee_id,work_date) DO UPDATE SET updated_at=attendance_day_records_v2.updated_at
-         RETURNING *`,
-        [companyId, employee.id, employee.local_date, req.user.id]
-      );
-      const record = records[0];
-      const column = A.ACTION_COLUMNS[action];
-      if (record[column]) {
-        await client.query("ROLLBACK");
-        return res.status(409).json({ error: "Ce pointage est déjà enregistré.", code: "ATTENDANCE_ALREADY_RECORDED" });
-      }
-      const prerequisites = {
-        BREAK_OUT: record.check_in,
-        BREAK_IN: record.break_out,
-        CHECK_OUT: record.check_in,
-      };
-      if (action !== "CHECK_IN" && !prerequisites[action]) {
-        await client.query("ROLLBACK");
-        return res.status(409).json({ error: "L’étape précédente n’est pas pointée.", code: "ATTENDANCE_SEQUENCE_INVALID" });
-      }
-      const late = action === "CHECK_IN"
-        ? Math.max(0, Math.floor((Number(String(employee.local_time).slice(0,2))*60 + Number(String(employee.local_time).slice(3,5))) -
-          (Number(String(day.start_time).slice(0,2))*60 + Number(String(day.start_time).slice(3,5))))) : Number(record.late_minutes || 0);
-      const status = action === "CHECK_IN" ? (late > 0 ? "LATE" : "PRESENT")
-        : action === "BREAK_OUT" ? "ON_BREAK" : action === "BREAK_IN" ? "PRESENT" : "COMPLETED";
-      const { rows: updated } = await client.query(
-        `UPDATE attendance_day_records_v2 SET ${column}=now(), status=$1, late_minutes=$2,
-          worked_minutes=CASE WHEN $3='CHECK_OUT' THEN GREATEST(0,extract(epoch FROM (now()-check_in))/60)::int ELSE worked_minutes END,
-          punched_by=$4, updated_at=CURRENT_TIMESTAMP WHERE id=$5 RETURNING *`,
-        [status, late, action, req.user.id, record.id]
-      );
-      await client.query(
-        `INSERT INTO attendance_event_log_v2(company_id,employee_id,record_id,action_type,event_at,performed_by,performed_by_name)
-         VALUES($1,$2,$3,$4,now(),$5,$6)`,
-        [companyId, employee.id, record.id, action, req.user.id, req.user.fullname || req.user.email || ""]
-      );
+
+      const day = await A.chargerJourTravaille(client, employee.schedule_id, employee.local_date);
+      const resultat = await A.enregistrerPointage(client, {
+        companyId, employee, day, action, user: req.user, source: "MANUEL",
+      });
+
       await client.query("COMMIT");
-      res.json({ success: true, attendance: updated[0], employee: { id: employee.id, full_name: employee.full_name } });
+      res.json({
+        success: true,
+        attendance: resultat.record,
+        employee: { id: employee.id, full_name: employee.full_name },
+      });
     } catch (error) {
       await client.query("ROLLBACK").catch(() => {});
       fail(res, error, "Erreur d’enregistrement du pointage.");

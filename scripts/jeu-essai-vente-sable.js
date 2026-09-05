@@ -98,6 +98,33 @@ async function main() {
         [S2, role]);
     }
 
+    /* Les actions fines du chantier — brouillons, annulation, correction,
+       contrepassation — sont posées par la migration 075 pour les rôles qui
+       existaient alors. D'autres suites réécrivent ensuite la matrice des
+       rôles en fonction des comptes présents en base, et ces lignes
+       disparaissent : celle-ci échouait alors sur un refus de permission,
+       pour une raison sans aucun rapport avec ce qu'elle vérifie.
+       On les réaffirme donc ici, à l'identique de 075 — jamais plus large :
+       le comptable garde la seule contrepassation, l'employé et le
+       magasinier les seuls brouillons. C'est ce qui permet aux tests de
+       refus, plus bas, de prouver encore quelque chose. */
+    const droitsSable = [
+      ["admin", ["vente_modifier_brouillon", "vente_supprimer_brouillon",
+                 "vente_corriger_validee", "vente_annuler", "paiement_contrepasser"]],
+      ["comptable", ["paiement_contrepasser"]],
+      ["employe", ["vente_modifier_brouillon", "vente_supprimer_brouillon"]],
+      ["responsable_entrepot", ["vente_modifier_brouillon", "vente_supprimer_brouillon"]],
+    ];
+    for (const [role, actions] of droitsSable) {
+      for (const action of actions) {
+        await c.query(
+          `INSERT INTO role_permissions (company_id, role, module_key, action, allowed)
+           VALUES ($1,$2,'sable',$3,true)
+           ON CONFLICT (company_id, role, module_key, action) DO UPDATE SET allowed = true`,
+          [S2, role, action]);
+      }
+    }
+
     const banque = (await c.query(
       `INSERT INTO accounting_banks (company_id, bank_name, account_number, currency,
          initial_balance, current_balance, is_active, created_by)
