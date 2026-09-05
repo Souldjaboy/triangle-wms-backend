@@ -341,3 +341,26 @@ consultatif par société : deux exécutions simultanées produisent **un** lot 
 11 lignes, pas 22 (éprouvé).
 
 Preview d'exemple destiné à la production : voir le rapport final.
+| 087 | Rapports de pointage, tableau de bord, notifications idempotentes | **fait** — 45/45 |
+
+### Décision 087
+**Les rapports lisent la valeur EFFECTIVE, pas la valeur brute.** L'ordre de
+résolution de chaque journée : absence marquée par-dessus une régularisation →
+valeur régularisée → pointage brut → absence si la journée était due. Chaque
+ligne dit **d'où vient sa valeur** (`source`), pour qu'un chiffre contesté
+puisse être remonté jusqu'à son origine.
+
+Durées en **heures et minutes**, jamais en décimal : 7 h 30, pas 7,5. Un jour
+férié n'est ni un jour dû ni une absence. QR et MANUEL apparaissent dans le
+même rapport, distingués par leur source.
+
+**Notifications** : `notifications` n'avait aucune contrainte d'unicité, donc
+chaque passage d'un déclencheur recréait la même ligne. Au bout d'une semaine,
+la cloche affichait quarante fois la même alerte et plus personne ne la
+regardait — une notification répétée ne prévient pas davantage, elle prévient
+moins. Une clé d'**événement** (pas de message) rend l'insertion idempotente :
+six rafraîchissements de suite ne créent rien de plus (éprouvé).
+
+Les destinataires sont choisis d'après les **droits**, pas les rôles :
+prévenir « les comptables » laisserait de côté celui à qui on vient d'accorder
+la préparation de la paie par exception personnelle.

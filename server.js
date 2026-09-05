@@ -18080,6 +18080,23 @@ app.use(
   })
 );
 
+/* Rapports de pointage. Ils lisent la valeur EFFECTIVE — une journée
+   régularisée, une absence marquée par-dessus — et disent d'où vient chaque
+   chiffre, pour qu'un total contesté puisse être remonté jusqu'à son origine. */
+const createPointageRapportsRouter = require("./routes/pointage-rapports");
+app.use(
+  "/",
+  createPointageRapportsRouter({ pool, authenticateToken, getEffectiveCompanyId, requirePermission })
+);
+
+/* Tableau de bord et notifications métier. Les alertes portent une clé
+   d'événement : rafraîchir dix fois ne crée pas dix alertes. */
+const createTableauDeBordRouter = require("./routes/tableau-de-bord");
+app.use(
+  "/",
+  createTableauDeBordRouter({ pool, authenticateToken, getEffectiveCompanyId, requirePermission })
+);
+
 const createInventoryImportRouter = require("./routes/inventory-import");
 app.use(
   "/",
