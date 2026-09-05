@@ -143,3 +143,21 @@ une raison étrangère à ce qu'elles vérifient. Chaque jeu d'essai accorde
 maintenant **nommément** les droits dont il a besoin — jamais plus larges, afin
 que les tests de refus prouvent encore quelque chose. Les suites 079 et QR
 créent aussi leurs propres comptes au lieu d'identifiants écrits en dur.
+
+### Convergence sur la migration 078
+Le dépôt distant avait avancé pendant ce chantier : deux commits (`9880e37`,
+`7611b47`) corrigent **le même** défaut, avec les **mêmes** noms de contraintes
+(`laboratory_cases_company_case_number_key`,
+`documents_company_document_number_key`) et la **même** décision délibérée de
+laisser `laboratory_cases.result_code` en unicité globale — conclusion atteinte
+indépendamment, ce qui la confirme plutôt qu'elle ne l'infirme.
+
+Résolution : rebase (jamais de force-push), puis suppression de **ma**
+migration en double `sql/078_numerotation_unique_par_societe.sql`, qui n'avait
+jamais été poussée. La version distante est conservée : elle est déjà publiée,
+peut avoir été appliquée ailleurs, et garde correctement son `ADD CONSTRAINT`
+derrière un contrôle `pg_constraint` (le piège `duplicate_table`).
+
+Les deux suites de test sont conservées : la mienne (17 vérifications) couvre
+en plus la non-régression volontaire de `result_code` face à une seconde
+société, le vrai chemin des reçus `REC-LAB`, et les numéros NULL multiples.
