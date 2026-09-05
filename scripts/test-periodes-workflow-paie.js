@@ -147,6 +147,25 @@ async function poserLeJeu() {
   for (const d of [DIRECTEUR, AUTRE_DIRECTEUR]) {
     for (const a of ["visible", "view", "validate", "adjust", "print"]) await droit(d, "paie", a);
   }
+
+  /* Les REFUS sont posés explicitement, en DENY, plutôt que laissés à la
+     matrice des rôles. Deux raisons :
+
+       • `direction` figure dans ROLES_ADMIN : sans ligne de rôle, le moteur
+         retombe sur « repli_role » et lui accorde tout. Or d'autres suites
+         régénèrent `role_permissions` en fonction des seuls comptes présents
+         en base, effaçant les lignes posées par la migration 081 — la
+         séparation dépendrait alors de l'ordre d'exécution des suites ;
+
+       • c'est le chemin « exception personnelle DENY » du RBAC, qui doit être
+         éprouvé pour de vrai et pas seulement supposé.
+
+     Ce que ces DENY expriment est exactement ce que dit la migration 081 : le
+     comptable prépare, soumet et paie ; la Direction valide et ajuste. */
+  for (const d of [DIRECTEUR, AUTRE_DIRECTEUR]) {
+    for (const a of ["prepare", "submit", "pay"]) await droit(d, "paie", a, "DENY");
+  }
+  for (const a of ["validate", "adjust"]) await droit(COMPTABLE, "paie", a, "DENY");
   for (const a of ["visible", "view", "create", "validate", "close", "reopen"]) {
     await droit(RESPONSABLE, "pointage.periode", a);
     await droit(COMPTABLE, "pointage.periode", a === "validate" ? "view" : a);
@@ -310,7 +329,9 @@ async function main() {
        soumis. */
     await pool.query(
       `INSERT INTO user_permission_overrides (company_id, user_id, module_key, action, effect)
-       VALUES ($1,$2,'paie','validate','ALLOW')`, [TRIANGLE, COMPTABLE]);
+       VALUES ($1,$2,'paie','validate','ALLOW')
+       ON CONFLICT (company_id, user_id, module_key, action) DO UPDATE SET effect='ALLOW'`,
+      [TRIANGLE, COMPTABLE]);
 
     const r = await appel("POST", `/paie/runs/${runId}/decision`, tComptable,
       { decision: "VALIDEE" });
@@ -318,7 +339,7 @@ async function main() {
       r.statut === 403 && r.corps.code === "SELF_APPROVAL_FORBIDDEN", JSON.stringify(r.corps));
 
     await pool.query(
-      `DELETE FROM user_permission_overrides
+      `UPDATE user_permission_overrides SET effect='DENY'
         WHERE company_id=$1 AND user_id=$2 AND module_key='paie' AND action='validate'`,
       [TRIANGLE, COMPTABLE]);
   }
