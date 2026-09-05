@@ -316,3 +316,28 @@ comptable. »
 Déclarer crée une **dette** (écritures au passif) **sans toucher la
 trésorerie** ; seul le paiement débite, une fois, et produit une quittance.
 Vérifié explicitement par la suite.
+| 086 | Régularisation exceptionnelle des pointages (`--preview`/`--apply`) | **fait** — 39/39 |
+
+### Décision 086
+Le piège aurait été d'écrire directement dans `attendance_day_records_v2` des
+arrivées à 08h00 : plus rien ne distinguerait alors un pointage **réel** d'un
+pointage **supposé**, ni à l'écran, ni dans un rapport, ni des mois plus tard
+quand quelqu'un contestera une absence.
+
+Le script n'écrit donc **jamais** dans les pointages bruts — la suite le
+vérifie en comparant leur empreinte avant/après. La valeur retenue vit à côté,
+dans `attendance_regularizations`, avec valeur d'origine, valeur effective,
+motif, auteur et lot. Une absence réelle se marque **par-dessus**
+(`overridden_*`), sans rien effacer.
+
+`--date-to` est **obligatoire** : le script n'utilise jamais « aujourd'hui »,
+sans quoi une exécution dans six mois régulariserait six mois de journées que
+personne n'a demandées.
+
+Idempotence par clé déduite de **tous** les paramètres qui changent le
+résultat (période, mode du samedi, fériés, heures, employés) — sinon corriger
+le mode du samedi et relancer ne changerait rien, en silence. Verrou
+consultatif par société : deux exécutions simultanées produisent **un** lot et
+11 lignes, pas 22 (éprouvé).
+
+Preview d'exemple destiné à la production : voir le rapport final.
