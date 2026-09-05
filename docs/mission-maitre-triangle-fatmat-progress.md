@@ -251,3 +251,32 @@ rangs reprennent désormais après le dernier rang existant.
 Régénérer une paie contrepasse d'abord les retenues d'avance qu'elle portait —
 sans cela, préparer deux fois la paie retenait deux fois la même échéance et le
 salarié remboursait le double. Vérifié explicitement par la suite.
+| 084 | Acomptes / dépôts clients (sable et ciment) | **fait** — 47/47 |
+
+### Décision 084
+Un dépôt n'est **pas** une vente. Il augmente la trésorerie mais du côté du
+passif : c'est une **dette envers le client** (« Avances reçues des clients »)
+tant qu'aucune facture ne l'absorbe. Le comptabiliser en chiffre d'affaires
+gonflerait le résultat d'un mois avec de l'argent qui ne l'a pas encore mérité.
+
+La règle qu'il ne faut pas perdre de vue : **l'argent n'entre en banque qu'une
+fois, au versement**. Imputer un dépôt sur une facture ne fait entrer aucun
+argent — cela solde une dette contre une créance. C'est l'erreur la plus
+naturelle du domaine (encaisser la facture « payée par acompte » comme un vrai
+encaissement) et elle double le chiffre d'affaires sans que le solde bancaire
+ne la contredise, puisqu'il a bel et bien augmenté… un mois plus tôt. La suite
+vérifie explicitement que le solde bancaire **ne bouge pas** à l'imputation.
+
+Affectation **FIFO** par défaut (le plus ancien versement sert en premier),
+avec possibilité de flécher un dépôt nommément.
+
+Sable et ciment ayant chacun leurs tables de clients et de factures avec des
+identifiants qui se recoupent, un dépôt porte le couple (activité, id) plutôt
+qu'une clé étrangère. Le prix : PostgreSQL ne peut pas garantir l'intégrité
+référentielle, donc les routes vérifient l'existence dans la table de **leur**
+activité à chaque écriture — ce qui assure aussi l'isolation inter-sociétés
+(vérifiée : FAT & MAT ne peut pas déposer sur un client Triangle).
+
+L'état du dépôt recalcule son solde **ligne à ligne** et signale
+(`coherent: false`) toute divergence avec la fiche : un état doit pouvoir se
+vérifier à la main.

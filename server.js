@@ -18056,6 +18056,18 @@ app.use(
   })
 );
 
+/* Acomptes clients (sable et ciment). L'argent n'entre qu'une fois, au
+   versement : imputer un dépôt sur une facture ne fait entrer aucun argent,
+   cela solde une dette envers le client contre une créance. */
+const createAcomptesRouter = require("./routes/acomptes-clients");
+app.use(
+  "/",
+  createAcomptesRouter({
+    pool, authenticateToken, getEffectiveCompanyId, requirePermission,
+    nextAccountingNumber, createAccountingEntry,
+  })
+);
+
 const createInventoryImportRouter = require("./routes/inventory-import");
 app.use(
   "/",
