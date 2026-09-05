@@ -198,3 +198,26 @@ unicité par société.
 `accounting_entries` était le plus coûteux : `createAccountingEntry()` est
 appelée par **toute** opération financière — salaire, vente, encaissement,
 contrepassation.
+
+### Piège trouvé : les droits d'une migration peuvent ne rien poser
+`role_permissions` n'est écrit par **aucune** route de l'application (vérifié :
+l'écran des droits n'écrit que `user_permission_overrides`). Cette table n'est
+donc alimentée que par les migrations — et la 063 y génère la matrice
+**complète** : chaque société × chaque rôle présent × chaque action de chaque
+module, en accordant tout aux rôles d'administration et rien aux autres.
+
+Conséquence : lors d'un déploiement **linéaire**, 063 passe avant les modules
+créés plus tard et ne les voit pas — les grants de 080/081 s'appliquent. Mais
+lors d'un **rejeu complet** (`rebuild-test-db.sh`, ou la reconstruction d'un
+environnement), 063 repasse une fois les modules existants, remplit la matrice
+la première, et un `ON CONFLICT DO NOTHING` ne pose plus rien. La séparation
+comptable/direction dépendait donc de l'ordre d'application des migrations.
+
+Corrigé dans 080 et 081 : `DO UPDATE ... WHERE role_permissions.updated_by IS
+NULL` — une migration corrige un défaut généré, jamais une décision humaine.
+
+### Suite dépendante d'une base neuve
+`test-import-em2s-db` vérifie des totaux de stock **absolus** : elle passe
+127/127 sur base reconstruite et échoue de 3 vérifications si d'autres suites
+ont déjà bougé du stock. Propriété préexistante de cette suite, sans rapport
+avec ce chantier — à lancer en premier ou sur base neuve.

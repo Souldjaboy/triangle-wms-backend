@@ -232,6 +232,23 @@ DO $$
 DECLARE soc RECORD;
 BEGIN
   FOR soc IN SELECT id FROM companies LOOP
+    /* DO UPDATE, et non DO NOTHING — pour une raison qui ne saute pas aux yeux.
+       La migration 063 remplit la matrice complète (chaque société × chaque
+       rôle présent × chaque action de chaque module) en accordant TOUT aux
+       rôles d'administration et RIEN aux autres. Lors d'un déploiement
+       linéaire, 063 passe avant ce module et ne le voit pas : les lignes
+       ci-dessous s'appliquent. Mais dès qu'on rejoue toutes les migrations
+       depuis zéro — ce que fait scripts/rebuild-test-db.sh, et ce qu'on fera
+       un jour pour reconstruire un environnement — 063 repasse APRÈS que le
+       module existe, remplit la matrice la première, et un DO NOTHING ne pose
+       plus rien du tout. La séparation des rôles dépendrait alors de l'ordre
+       dans lequel les migrations ont été appliquées.
+
+       `role_permissions` n'est écrit par AUCUNE route de l'application —
+       vérifié : l'écran des droits n'écrit que `user_permission_overrides`.
+       Cette table ne contient donc que du généré ; l'écraser ne détruit aucune
+       décision humaine. La garde `updated_by IS NULL` le dit explicitement, et
+       protégera le jour où l'écran écrira ici. */
     INSERT INTO role_permissions (company_id, role, module_key, action, allowed) VALUES
       (soc.id, 'admin',                'pointage.qr',     'visible', true),
       (soc.id, 'admin',                'pointage.qr',     'view',    true),
@@ -257,7 +274,9 @@ BEGIN
       (soc.id, 'responsable_entrepot', 'pointage.badge',  'visible', true),
       (soc.id, 'responsable_entrepot', 'pointage.badge',  'view',    true),
       (soc.id, 'responsable_entrepot', 'pointage.badge',  'print',   true)
-    ON CONFLICT (company_id, role, module_key, action) DO NOTHING;
+    ON CONFLICT (company_id, role, module_key, action)
+    DO UPDATE SET allowed = EXCLUDED.allowed, updated_at = now()
+     WHERE role_permissions.updated_by IS NULL;
   END LOOP;
 END $$;
 
