@@ -64,7 +64,12 @@ async function main() {
     await c.query(`DELETE FROM attendance_payroll_items_v2`);
     await c.query(`DELETE FROM attendance_payroll_runs_v2`);
     await c.query(`DELETE FROM attendance_salary_settings_v2`);
-    await c.query(`DELETE FROM attendance_employees`);
+    /* Les avances référencent les employés : les effacer d'abord, sinon la
+       suite échoue sur une clé étrangère alors que rien ne va mal. */
+  await c.query(`DELETE FROM salary_advance_repayments`);
+  await c.query(`DELETE FROM salary_advance_installments`);
+  await c.query(`DELETE FROM salary_advances`);
+  await c.query(`DELETE FROM attendance_employees`);
     await c.query(`DELETE FROM attendance_schedule_days`);
     await c.query(`DELETE FROM attendance_work_schedules`);
     await c.query(`DELETE FROM attendance_work_sites`);

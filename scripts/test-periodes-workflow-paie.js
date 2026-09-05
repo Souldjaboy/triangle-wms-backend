@@ -73,6 +73,11 @@ async function poserLeJeu() {
   await pool.query(`DELETE FROM attendance_badge_events`);
   await pool.query(`DELETE FROM attendance_badges`);
   await pool.query(`DELETE FROM attendance_operator_scopes`);
+  /* Les avances référencent les employés : les effacer d'abord, sinon la
+       suite échoue sur une clé étrangère alors que rien ne va mal. */
+  await pool.query(`DELETE FROM salary_advance_repayments`);
+  await pool.query(`DELETE FROM salary_advance_installments`);
+  await pool.query(`DELETE FROM salary_advances`);
   await pool.query(`DELETE FROM attendance_employees WHERE company_id = $1`, [TRIANGLE]);
   await pool.query(`DELETE FROM attendance_schedule_days WHERE schedule_id IN
       (SELECT id FROM attendance_work_schedules WHERE company_id = $1 AND code = 'ESSAI-081')`, [TRIANGLE]);

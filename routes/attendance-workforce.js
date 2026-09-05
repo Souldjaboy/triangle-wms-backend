@@ -2,6 +2,7 @@
 
 const express = require("express");
 const A = require("../services/attendance-workforce");
+const AV = require("../services/avances-salaire");
 const P = require("../services/attendance-payroll");
 
 module.exports = function createAttendanceWorkforceRouter(deps) {
@@ -295,21 +296,89 @@ module.exports = function createAttendanceWorkforceRouter(deps) {
         [companyId,`${month}-01`,req.user.id]
       )).rows[0];
       if(!run) throw Object.assign(new Error("Une paie déjà payée ne peut pas être recalculée."),{httpStatus:409,code:"PAYROLL_LOCKED"});
+      /* Régénérer une paie efface ses lignes — donc aussi les retenues
+         d'avance qui y étaient rattachées. Les contrepasser AVANT la
+         suppression rend le solde des avances à ce qu'il était : sans cela,
+         préparer deux fois la paie retiendrait deux fois la même échéance,
+         et le salarié rembourserait le double. */
+      {
+        const { rows: retenues } = await client.query(
+          `SELECT r.id, r.advance_id, r.installment_id, r.amount
+             FROM salary_advance_repayments r
+             JOIN attendance_payroll_items_v2 i ON i.id = r.payroll_item_id
+            WHERE i.payroll_run_id = $1 AND r.origin = 'RETENUE_PAIE'`,
+          [run.id]
+        );
+        for (const retenue of retenues) {
+          await client.query(
+            `UPDATE salary_advances
+                SET balance = balance + $1,
+                    status = CASE WHEN balance + $1 >= amount_paid THEN 'VERSEE' ELSE 'EN_REMBOURSEMENT' END,
+                    updated_at = now()
+              WHERE id = $2`, [retenue.amount, retenue.advance_id]);
+          if (retenue.installment_id) {
+            await client.query(
+              `UPDATE salary_advance_installments
+                  SET amount_taken = GREATEST(0, amount_taken - $1), status = 'A_VENIR', updated_at = now()
+                WHERE id = $2`, [retenue.amount, retenue.installment_id]);
+          }
+        }
+        /* Les lignes de remboursement partent avec les lignes de paie
+           (ON DELETE SET NULL les laisserait orphelines et fausserait
+           l'historique d'une avance). */
+        await client.query(
+          `DELETE FROM salary_advance_repayments
+            WHERE origin = 'RETENUE_PAIE' AND payroll_item_id IN
+              (SELECT id FROM attendance_payroll_items_v2 WHERE payroll_run_id = $1)`,
+          [run.id]);
+      }
+
       await client.query(`DELETE FROM attendance_payroll_items_v2 WHERE payroll_run_id=$1`,[run.id]);
-      for(const line of lines) await client.query(
-        `INSERT INTO attendance_payroll_items_v2(company_id,payroll_run_id,employee_id,employee_name,
-          monthly_salary,daily_rate,expected_days,attended_days,absence_days,late_minutes,
-          absence_deduction,adjustments,net_salary,status)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
-        [companyId,run.id,line.id,line.full_name,line.monthly_salary,line.daily_rate,line.expected_days,
-         line.attended_days,line.absence_days,line.late_minutes,line.absence_deduction,line.adjustments,line.net_salary,line.status]
-      );
+      for(const line of lines){
+        const { rows: creees } = await client.query(
+          `INSERT INTO attendance_payroll_items_v2(company_id,payroll_run_id,employee_id,employee_name,
+            monthly_salary,daily_rate,expected_days,attended_days,absence_days,late_minutes,
+            absence_deduction,adjustments,net_salary,status)
+           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id, net_salary`,
+          [companyId,run.id,line.id,line.full_name,line.monthly_salary,line.daily_rate,line.expected_days,
+           line.attended_days,line.absence_days,line.late_minutes,line.absence_deduction,line.adjustments,line.net_salary,line.status]
+        );
+        const ligne = creees[0];
+
+        /* La retenue d'avance vient APRÈS le calcul du net : elle est plafonnée
+           par ce qui reste dû ET par le net disponible. Une retenue ne doit
+           jamais rendre un salaire négatif ; ce qui n'a pas pu être pris reste
+           dû et repassera à la période suivante. */
+        if (ligne.net_salary != null) {
+          const retenues = await AV.retenueDue(client, {
+            companyId, employeeId: line.id, periodCode: month,
+            netDisponible: Number(ligne.net_salary),
+          });
+          let total = 0;
+          for (const r of retenues) {
+            await AV.rembourser(client, {
+              companyId, advanceId: r.advance_id, montant: r.montant,
+              origine: "RETENUE_PAIE", installmentId: r.installment_id,
+              payrollItemId: ligne.id, reference: r.reference,
+              userId: req.user?.id || null, userName: req.user?.fullname || "",
+            });
+            total += r.montant;
+          }
+          if (total > 0) {
+            await client.query(
+              `UPDATE attendance_payroll_items_v2
+                  SET advance_deduction = $1, net_salary = GREATEST(0, net_salary - $1), updated_at = now()
+                WHERE id = $2`, [total, ligne.id]);
+          }
+        }
+      }
       const totals=(await client.query(
         `UPDATE attendance_payroll_runs_v2 r SET
           gross_amount=x.gross,deductions_amount=x.deductions,adjustments_amount=x.adjustments,
           net_amount=x.net,updated_at=now()
          FROM (SELECT payroll_run_id,COALESCE(sum(monthly_salary),0) gross,
-           COALESCE(sum(absence_deduction),0) deductions,COALESCE(sum(adjustments),0) adjustments,
+           COALESCE(sum(absence_deduction),0)+COALESCE(sum(advance_deduction),0) deductions,
+           COALESCE(sum(adjustments),0) adjustments,
            COALESCE(sum(net_salary),0) net FROM attendance_payroll_items_v2 WHERE payroll_run_id=$1 GROUP BY payroll_run_id) x
          WHERE r.id=x.payroll_run_id RETURNING r.*`,[run.id]
       )).rows[0];

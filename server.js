@@ -18044,6 +18044,18 @@ app.use(
   })
 );
 
+/* Avances sur salaire. Tout mouvement d'argent passe par services/tresorerie.js
+   — verrou sur le compte, contrôle du solde, transaction et écritures
+   équilibrées écrites ensemble. Aucune route ne touche un solde directement. */
+const createAvancesRouter = require("./routes/avances-salaire");
+app.use(
+  "/",
+  createAvancesRouter({
+    pool, authenticateToken, getEffectiveCompanyId, requirePermission,
+    nextAccountingNumber, createAccountingEntry,
+  })
+);
+
 const createInventoryImportRouter = require("./routes/inventory-import");
 app.use(
   "/",

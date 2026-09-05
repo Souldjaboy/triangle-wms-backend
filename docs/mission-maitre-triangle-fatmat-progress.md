@@ -221,3 +221,33 @@ NULL` — une migration corrige un défaut généré, jamais une décision humai
 127/127 sur base reconstruite et échoue de 3 vérifications si d'autres suites
 ont déjà bougé du stock. Propriété préexistante de cette suite, sans rapport
 avec ce chantier — à lancer en premier ou sur base neuve.
+| 083 | Trésorerie partagée + avances sur salaire | **fait** — 53/53 |
+
+### Décision 083
+**`services/tresorerie.js`** : un seul chemin pour tout mouvement d'argent.
+Avant, chaque module refaisait la même séquence — verrouiller, vérifier le
+solde, le mettre à jour, écrire la transaction, écrire les deux écritures — et
+c'est toujours la seconde écriture, celle qui équilibre, qu'on finit par
+oublier. Le service garantit à chaque appel : `FOR UPDATE` avant lecture du
+solde, refus chiffré si insuffisant (avec le **manquant**), solde jamais modifié
+sans transaction ni écritures, les deux écritures posées ensemble.
+
+**Avances** : une avance n'est pas une charge mais une **créance sur le
+salarié** (compte « Créances sur le personnel ») — la comptabiliser en charges
+de personnel la ferait disparaître le jour du remboursement. Le **solde** est
+la seule vérité : tout part de lui, jamais du montant initial.
+
+Les trois cas chiffrés exigés passent : 100 000 − 25 000 = **75 000** ;
+25 000 par mensualités de 5 000 → **5 échéances**, net **95 000** ; solde
+25 000 − remboursement direct 20 000 = **5 000**, argent rentré en caisse et
+reçu numéroté.
+
+### Défaut trouvé par le test
+`poserEcheancier` renumérotait les échéances à partir de 1 lors d'un
+rééchelonnement, écrasant une échéance **déjà retenue** sur une paie : elle
+redevenait « à venir » et aurait été prélevée une seconde fois. Les nouveaux
+rangs reprennent désormais après le dernier rang existant.
+
+Régénérer une paie contrepasse d'abord les retenues d'avance qu'elle portait —
+sans cela, préparer deux fois la paie retenait deux fois la même échéance et le
+salarié remboursait le double. Vérifié explicitement par la suite.
