@@ -527,7 +527,7 @@ module.exports = function createDocumentsContentRouter(deps) {
         if (dejaImprime) {
           /* Un bon déjà sorti a pu partir chez quelqu'un : le corriger demande
              un droit distinct de celui de corriger un brouillon. */
-          const ctx = await permissionsService.chargerContexte(pool, req.user);
+          const ctx = await permissionsService.chargerContexte(pool, req.user, companyId);
           const verdict = permissionsService.decider(ctx, "document", "reprint");
           if (!verdict.autorise) {
             throw erreur(

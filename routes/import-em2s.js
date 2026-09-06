@@ -781,7 +781,7 @@ module.exports = function createImportEm2sRouter(deps) {
               const e = new Error("Ce bon a déjà été imprimé : un motif est obligatoire pour corriger sa date.");
               e.httpStatus = 400; e.code = "REASON_REQUIRED"; throw e;
             }
-            const ctx = await permissionsService.chargerContexte(pool, req.user);
+            const ctx = await permissionsService.chargerContexte(pool, req.user, companyId);
             const verdict = permissionsService.decider(ctx, "reception", "edit_date_after_print");
             if (!verdict.autorise) {
               const e = new Error("Corriger la date d'un bon déjà imprimé demande un droit distinct.");
@@ -907,7 +907,7 @@ module.exports = function createImportEm2sRouter(deps) {
          vérifié ici plutôt qu'en refusant après coup. */
       const premiere = Number(rec.print_count || 0) === 0;
       if (!premiere) {
-        const ctx = await permissionsService.chargerContexte(pool, req.user);
+        const ctx = await permissionsService.chargerContexte(pool, req.user, companyId);
         const verdict = permissionsService.decider(ctx, "reception", "reprint");
         if (!verdict.autorise) {
           return res.status(403).json({

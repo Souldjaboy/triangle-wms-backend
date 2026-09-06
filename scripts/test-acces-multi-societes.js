@@ -102,13 +102,15 @@ async function main() {
         && Number(mes.corps.societes[0].id) === TRIANGLE,
       JSON.stringify(mes.corps));
 
-    /* La bascule demandée sans habilitation doit être ignorée, pas honorée. */
+    /* La bascule demandée sans habilitation est REFUSÉE, pas ignorée.
+       L'ignorer ferait travailler la personne dans sa société d'origine tout
+       en croyant être dans l'autre : elle saisirait des écritures du bon
+       montant, au mauvais endroit. */
     const bascule = await appel("GET", "/acces-societes/mes-societes", tComptable, undefined,
       { "x-active-company-id": String(FATMAT) });
-    verifier("demander FAT & MAT sans habilitation ne donne pas FAT & MAT",
-      bascule.statut === 200 && bascule.corps.societes?.length === 1
-        && Number(bascule.corps.societes[0].id) === TRIANGLE,
-      JSON.stringify(bascule.corps.societes));
+    verifier("demander FAT & MAT sans habilitation est refusé",
+      bascule.statut === 403 && bascule.corps.code === "COMPANY_NOT_ALLOWED",
+      JSON.stringify(bascule.corps));
   }
 
   // ────────────────────────────────────────────────────────────────────

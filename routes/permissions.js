@@ -24,7 +24,13 @@ const service = require("../services/permissions");
 module.exports = function createPermissionsRouter(deps) {
   const { pool, authenticateToken, getEffectiveCompanyId } = deps;
   const router = express.Router();
-  const requirePermission = service.creerRequirePermission(pool);
+  /* Les droits sont jugés dans la société EFFECTIVE de la requête, celle que
+     le sélecteur d'entreprise a choisie — pas dans la société d'origine du
+     compte. Sans cela, un comptable habilité sur FAT & MAT y serait jugé
+     selon ses droits Triangle. */
+  const requirePermission = service.creerRequirePermission(
+    pool, (req) => getEffectiveCompanyId(req, req.user?.company_id)
+  );
   const peutGerer = requirePermission("utilisateur.permissions", "manage");
 
   const estSuperAdmin = (u) =>
@@ -102,7 +108,11 @@ module.exports = function createPermissionsRouter(deps) {
   /** Mes propres droits : c'est ce que le frontend interroge au démarrage. */
   router.get("/permissions/me", authenticateToken, async (req, res) => {
     try {
-      res.json(await service.droitsEffectifs(pool, req.user));
+      /* Les droits de l'entreprise ACTIVE : c'est ce que le frontend affiche,
+         et il doit correspondre à ce que le backend refusera ou non. */
+      res.json(await service.droitsEffectifs(
+        pool, req.user, await societeDe(req)
+      ));
     } catch (e) { echec(res, e, "Erreur de lecture des droits."); }
   });
 
@@ -150,7 +160,9 @@ module.exports = function createPermissionsRouter(deps) {
       if (!cible) return res.status(404).json({ error: "Utilisateur introuvable." });
 
       const [effectifs, overrides, parRole] = await Promise.all([
-        service.droitsEffectifs(pool, cible),
+        /* Les droits du compte cible DANS la société consultée : un même
+           compte peut légitimement n'avoir pas les mêmes des deux côtés. */
+        service.droitsEffectifs(pool, cible, companyId),
         pool.query(
           `SELECT module_key, action, effect FROM user_permission_overrides
             WHERE company_id = $1 AND user_id = $2`,
@@ -194,7 +206,7 @@ module.exports = function createPermissionsRouter(deps) {
       const cible = await cibleOuNull(companyId, req.params.id);
       if (!cible) return res.status(404).json({ error: "Utilisateur introuvable." });
 
-      const ctx = await service.chargerContexte(pool, cible);
+      const ctx = await service.chargerContexte(pool, cible, companyId);
       const filtre = String(req.query.module || "").trim();
 
       const lignes = [];

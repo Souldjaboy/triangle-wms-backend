@@ -387,3 +387,56 @@ colonne qui n'existe pas dans celle posée depuis (079, où elle se nomme
 en silence : la requête échouait, le catch renvoyait `[]`, et un sélecteur vide
 se confond avec « une seule entreprise ». Elle délègue maintenant au service
 d'accès — ce qui ouvre du même coup le sélecteur aux comptes habilités.
+
+---
+
+## 4. Audit correctif — quatre défauts bloquants
+
+### 1. La validation de la Direction était contournable
+`POST /attendance-v2/payroll-items/:id/pay` n'exigeait une demande validée que
+si une demande **existait déjà**. Une paie neuve dont personne n'avait rien
+soumis restait payable : il suffisait de ne pas soumettre pour n'avoir
+personne à convaincre. Les contrôles étaient de surcroît faits **avant** le
+`BEGIN`, sur des lignes non verrouillées.
+
+Corrigé : tout se passe dans une seule transaction, la ligne de paie est
+verrouillée d'abord, et l'exception historique est **nommée** (migration 088,
+colonne `legacy_sans_validation`) au lieu d'être déduite de l'absence d'un
+objet. Seules les paies existant au moment de la migration, et sans période, la
+portent ; toute paie créée ensuite naît à `false`. L'exception ne peut donc pas
+s'élargir. Le décideur doit en outre être différent du demandeur, y compris
+pour une demande auto-validée écrite directement en base.
+
+### 2. Le RBAC lisait les droits de la mauvaise société
+`chargerContexte()` lisait `user.company_id` — la société d'**origine**. Un
+comptable habilité qui basculait sur FAT & MAT y était jugé selon ses droits
+Triangle.
+
+Corrigé : `chargerContexte`, `droitsEffectifs` et `creerRequirePermission`
+prennent la société **effective**, résolue par l'en-tête validé (jamais par
+`req.body`). Un `x-active-company-id` non autorisé est **refusé** (403,
+`COMPANY_NOT_ALLOWED`) au lieu d'être ignoré — l'ignorer ferait travailler la
+personne dans sa société d'origine en croyant être dans l'autre. Le frontend
+recharge ses droits à chaque bascule et refuse d'utiliser un cache portant sur
+une autre société.
+
+### 3. La paie était calculée sur un mois civil
+`calculatePayroll()` calculait du 1er au 31 alors que l'écran annonçait du 25
+au 24 : une présence du 25 août tombait hors de la paie de septembre.
+
+Corrigé : `POST /paie/periodes/:code/preparer` part des bornes enregistrées,
+exige un pointage validé, utilise les valeurs **effectives** après
+régularisation, et rattache `period_id` — ce que l'ancienne route ne faisait
+pas, laissant une paie orpheline que le verrou prenait pour une paie
+historique. L'ancien point d'entrée refuse désormais si une période existe.
+Unicité `(company_id, period_id)` garantie par la base.
+
+### 4. Navigation
+Les sept écrans sont au menu, chacun piloté par `can(module, action)` — un
+employé sans droits n'en voit aucun. Les anciens écrans restent joignables sous
+un libellé qui dit ce qu'ils sont (« Badges des comptes », « Ancien scan »).
+
+**Défaut de mise en page trouvé en vérifiant à 375 px** : `w-64` dans un flex
+en ligne, sans `shrink-0`, s'écrasait à 48 px — les libellés s'y empilaient
+lettre par lettre. Le menu passe désormais au-dessus du contenu sur téléphone
+(`flex-col md:flex-row`), avec des cibles de 48 px sur 327.

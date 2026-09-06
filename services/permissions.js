@@ -71,8 +71,21 @@ function chaineDeCles(cle) {
  * Charge tout ce qui décide, en une fois. Trois requêtes plutôt qu'une par
  * case : l'écran des droits en évalue plusieurs centaines.
  */
-async function chargerContexte(pool, user) {
-  const companyId = Number(user?.company_id || 0);
+/**
+ * Charge tout ce qui décide, pour UNE société donnée.
+ *
+ * `companyId` est la société EFFECTIVE de la requête, pas forcément celle du
+ * compte. Un comptable habilité qui bascule sur FAT & MAT doit être jugé par
+ * les droits de FAT & MAT : lire ceux de Triangle lui donnerait, dans l'autre
+ * société, un pouvoir que personne ne lui y a accordé — ou le priverait de
+ * celui qu'on lui y a donné.
+ *
+ * `user.company_id` reste la société d'ORIGINE et n'est jamais réécrit : il
+ * sert d'ancrage (et de repli quand aucune société effective n'est fournie),
+ * pas de contexte de travail.
+ */
+async function chargerContexte(pool, user, societeEffective = null) {
+  const companyId = Number(societeEffective || user?.company_id || 0);
   const userId = Number(user?.id || 0);
   const role = String(user?.role || "").trim().toLowerCase();
 
@@ -104,6 +117,7 @@ async function chargerContexte(pool, user) {
 
   return {
     user,
+    companyId,
     modules: modules.rows,
     parModule: new Map(modules.rows.map((m) => [m.module_key, m])),
     parRole,
@@ -214,8 +228,13 @@ function peutEcrire(ctx, cleModule) {
 }
 
 /** Tous les droits d'un utilisateur, prêts pour le frontend. */
-async function droitsEffectifs(pool, user) {
-  const ctx = await chargerContexte(pool, user);
+/**
+ * Les droits tels qu'ils s'appliquent DANS une société donnée. Le frontend
+ * les recharge à chaque bascule d'entreprise : les afficher pour la société
+ * d'origine ferait apparaître des boutons que le backend refuserait ensuite.
+ */
+async function droitsEffectifs(pool, user, societeEffective = null) {
+  const ctx = await chargerContexte(pool, user, societeEffective);
   const out = {};
   for (const m of ctx.modules) {
     out[m.module_key] = {};
@@ -226,7 +245,12 @@ async function droitsEffectifs(pool, user) {
   return {
     is_super_admin: estSuperAdmin(user),
     role: user?.role || "",
+    /* La société d'origine du compte, inchangée… */
     company_id: user?.company_id || null,
+    /* …et celle pour laquelle ces droits ont été calculés. Le frontend s'en
+       sert pour détecter qu'il regarde des droits d'une autre société que
+       celle affichée, et recharger. */
+    company_id_effectif: ctx.companyId || null,
     modules: ctx.modules.map((m) => ({
       module_key: m.module_key, parent_key: m.parent_key, label: m.label,
       description: m.description, sort_order: m.sort_order,
@@ -246,7 +270,15 @@ async function droitsEffectifs(pool, user) {
  * Middleware. `requirePermission("stock.entree", "create")`.
  * Sans action, elle se déduit de la méthode HTTP.
  */
-function creerRequirePermission(pool) {
+/**
+ * @param {Function} [resoudreSociete] rend la société EFFECTIVE d'une requête.
+ *   Sans elle, on retombe sur la société d'origine du compte — le comportement
+ *   d'avant la bascule multi-sociétés. Elle doit refuser le corps de la
+ *   requête : `company_id` y est un nom de champ de donnée avant d'être une
+ *   commande, et l'accepter ferait juger un comptable habilité selon les
+ *   droits d'une société qu'il n'a pas demandée.
+ */
+function creerRequirePermission(pool, resoudreSociete = null) {
   return function requirePermission(cleModule, action) {
     return async (req, res, next) => {
       try {
@@ -254,7 +286,8 @@ function creerRequirePermission(pool) {
         if (estSuperAdmin(req.user)) return next();
 
         const act = action || legacy.METHOD_ACTION[req.method] || "view";
-        const ctx = await chargerContexte(pool, req.user);
+        const societe = resoudreSociete ? resoudreSociete(req) : null;
+        const ctx = await chargerContexte(pool, req.user, societe);
         const verdict = decider(ctx, cleModule, act);
 
         if (!verdict.autorise) {

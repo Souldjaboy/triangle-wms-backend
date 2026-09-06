@@ -29,6 +29,7 @@
 const express = require("express");
 const P = require("../services/attendance-periodes");
 const PAIE = require("../services/attendance-payroll");
+const AV = require("../services/avances-salaire");
 
 module.exports = function createPaieWorkflowRouter(deps) {
   const { pool, authenticateToken, getEffectiveCompanyId, requirePermission, nextAccountingNumber } = deps;
@@ -216,6 +217,198 @@ module.exports = function createPaieWorkflowRouter(deps) {
       } catch (e) {
         await client.query("ROLLBACK").catch(() => {});
         fail(res, e, "Clôture impossible.");
+      } finally { client.release(); }
+    }
+  );
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // PRÉPARER LA PAIE D'UNE PÉRIODE RÉELLE
+  //
+  // L'ancien point d'entrée (`/attendance-v2/payroll/:month/generate`) calcule
+  // sur un mois CIVIL. L'écran, lui, annonce une période du 25 au 24 : les
+  // deux ne couvrent pas les mêmes journées, et personne ne pouvait le voir
+  // sans recompter à la main. Une présence du 25 août tombait hors de la paie
+  // de septembre, alors qu'elle en fait partie.
+  //
+  // Cette route part des bornes ENREGISTRÉES de la période, exige que le
+  // pointage ait été validé, et rattache la paie à sa période — ce que
+  // l'ancienne route ne faisait pas, laissant une paie orpheline que le verrou
+  // de paiement traitait ensuite comme une paie historique.
+  // ═══════════════════════════════════════════════════════════════════════
+  router.post(
+    "/paie/periodes/:code/preparer",
+    authenticateToken,
+    requirePermission("paie", "prepare"),
+    async (req, res) => {
+      const companyId = requireCompany(req, res); if (!companyId) return;
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+
+        /* Verrou par société et par période : deux préparations simultanées
+           ne doivent pas produire deux paies pour la même période. */
+        await client.query(`SELECT pg_advisory_xact_lock($1, $2)`, [813_000, companyId]);
+
+        const { rows: periodes } = await client.query(
+          `SELECT *, date_debut::text AS debut, date_fin::text AS fin
+             FROM attendance_periods
+            WHERE company_id = $1 AND code = $2
+            FOR UPDATE`,
+          [companyId, String(req.params.code)]
+        );
+        const periode = periodes[0];
+        if (!periode) {
+          throw P.erreur(
+            `La période ${req.params.code} n'est pas ouverte. Ouvrez-la avant de préparer la paie.`,
+            "PERIOD_NOT_FOUND", 404);
+        }
+
+        /* Préparer une paie sur un pointage non validé, c'est payer des
+           journées que personne n'a contrôlées. */
+        const ETATS_PRETS = [
+          "POINTAGE_VALIDE", "PAIE_PREPAREE", "EN_ATTENTE_DIRECTION",
+          "VALIDEE_DIRECTION", "AUTORISEE_AU_PAIEMENT",
+        ];
+        if (!ETATS_PRETS.includes(periode.status)) {
+          throw P.erreur(
+            `Le pointage de cette période n'est pas validé (état « ${periode.status} »). Validez-le avant de préparer la paie.`,
+            "ATTENDANCE_NOT_VALIDATED", 409);
+        }
+
+        const { rows: existantes } = await client.query(
+          `SELECT * FROM attendance_payroll_runs_v2
+            WHERE company_id = $1 AND period_id = $2 FOR UPDATE`,
+          [companyId, periode.id]
+        );
+        const existante = existantes[0] || null;
+        if (existante && !["DRAFT", "CORRECTION_DEMANDEE", "REFUSEE"].includes(existante.status)) {
+          throw P.erreur(
+            `Une paie « ${existante.status} » ne se recalcule pas : elle a déjà suivi son chemin.`,
+            "PAYROLL_LOCKED", 409);
+        }
+
+        const lignes = await PAIE.calculerPaiePeriode(client, companyId, {
+          date_debut: periode.debut, date_fin: periode.fin,
+        });
+        if (!lignes.length) {
+          throw P.erreur("Aucun employé actif sur cette période.", "NO_EMPLOYEE", 409);
+        }
+
+        /* `period_month` reste renseigné — la colonne est NOT NULL et les
+           écrans historiques la lisent — mais c'est `period_id` qui fait foi. */
+        const ancrage = `${String(periode.code).slice(0, 7)}-01`;
+        const { rows: paies } = await client.query(
+          `INSERT INTO attendance_payroll_runs_v2
+             (company_id, period_id, period_month, status, prepared_by, prepared_at)
+           VALUES ($1,$2,$3::date,'DRAFT',$4, now())
+           ON CONFLICT (company_id, period_month) DO UPDATE
+             SET period_id = EXCLUDED.period_id, prepared_by = EXCLUDED.prepared_by,
+                 prepared_at = now(), status = 'DRAFT', updated_at = now()
+           RETURNING *`,
+          [companyId, periode.id, ancrage, req.user?.id || null]
+        );
+        const paie = paies[0];
+
+        /* Régénérer efface les lignes — donc les retenues d'avance qu'elles
+           portaient. On les rend au solde avant de supprimer, sinon préparer
+           deux fois retiendrait deux fois la même échéance. */
+        const { rows: retenues } = await client.query(
+          `SELECT r.id, r.advance_id, r.installment_id, r.amount
+             FROM salary_advance_repayments r
+             JOIN attendance_payroll_items_v2 i ON i.id = r.payroll_item_id
+            WHERE i.payroll_run_id = $1 AND r.origin = 'RETENUE_PAIE'`,
+          [paie.id]
+        );
+        for (const retenue of retenues) {
+          await client.query(
+            `UPDATE salary_advances
+                SET balance = balance + $1,
+                    status = CASE WHEN balance + $1 >= amount_paid THEN 'VERSEE' ELSE 'EN_REMBOURSEMENT' END,
+                    updated_at = now()
+              WHERE id = $2`, [retenue.amount, retenue.advance_id]);
+          if (retenue.installment_id) {
+            await client.query(
+              `UPDATE salary_advance_installments
+                  SET amount_taken = GREATEST(0, amount_taken - $1), status = 'A_VENIR', updated_at = now()
+                WHERE id = $2`, [retenue.amount, retenue.installment_id]);
+          }
+        }
+        await client.query(
+          `DELETE FROM salary_advance_repayments
+            WHERE origin = 'RETENUE_PAIE' AND payroll_item_id IN
+              (SELECT id FROM attendance_payroll_items_v2 WHERE payroll_run_id = $1)`,
+          [paie.id]);
+        await client.query(
+          `DELETE FROM attendance_payroll_items_v2 WHERE payroll_run_id = $1`, [paie.id]);
+
+        for (const l of lignes) {
+          const { rows: creees } = await client.query(
+            `INSERT INTO attendance_payroll_items_v2
+               (company_id, payroll_run_id, employee_id, employee_name, monthly_salary,
+                daily_rate, expected_days, attended_days, absence_days, late_minutes,
+                absence_deduction, adjustments, net_salary, status)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+             RETURNING id, net_salary`,
+            [companyId, paie.id, l.id, l.full_name, l.monthly_salary, l.daily_rate,
+             l.expected_days, l.attended_days, l.absence_days, l.late_minutes,
+             l.absence_deduction, l.adjustments, l.net_salary, l.status]
+          );
+          const ligne = creees[0];
+
+          if (ligne.net_salary != null) {
+            const dues = await AV.retenueDue(client, {
+              companyId, employeeId: l.id, periodCode: periode.code,
+              netDisponible: Number(ligne.net_salary),
+            });
+            let total = 0;
+            for (const d of dues) {
+              await AV.rembourser(client, {
+                companyId, advanceId: d.advance_id, montant: d.montant,
+                origine: "RETENUE_PAIE", installmentId: d.installment_id,
+                payrollItemId: ligne.id, reference: d.reference,
+                userId: req.user?.id || null, userName: nomDe(req),
+              });
+              total += d.montant;
+            }
+            if (total > 0) {
+              await client.query(
+                `UPDATE attendance_payroll_items_v2
+                    SET advance_deduction = $1, net_salary = GREATEST(0, net_salary - $1), updated_at = now()
+                  WHERE id = $2`, [total, ligne.id]);
+            }
+          }
+        }
+
+        const { rows: totaux } = await client.query(
+          `UPDATE attendance_payroll_runs_v2 r
+              SET gross_amount = x.brut, deductions_amount = x.retenues,
+                  adjustments_amount = x.ajustements, net_amount = x.net, updated_at = now()
+             FROM (SELECT payroll_run_id,
+                          COALESCE(sum(monthly_salary), 0) AS brut,
+                          COALESCE(sum(absence_deduction), 0) + COALESCE(sum(advance_deduction), 0) AS retenues,
+                          COALESCE(sum(adjustments), 0) AS ajustements,
+                          COALESCE(sum(net_salary), 0) AS net
+                     FROM attendance_payroll_items_v2 WHERE payroll_run_id = $1
+                    GROUP BY payroll_run_id) x
+            WHERE r.id = x.payroll_run_id
+            RETURNING r.*`,
+          [paie.id]
+        );
+
+        await client.query(
+          `UPDATE attendance_periods SET status = 'PAIE_PREPAREE', updated_at = now()
+            WHERE id = $1 AND status = 'POINTAGE_VALIDE'`, [periode.id]);
+
+        await client.query("COMMIT");
+        res.status(201).json({
+          paie: totaux[0] || paie,
+          periode: { code: periode.code, debut: periode.debut, fin: periode.fin },
+          employes: lignes,
+          message: `Paie préparée sur la période du ${periode.debut} au ${periode.fin}.`,
+        });
+      } catch (e) {
+        await client.query("ROLLBACK").catch(() => {});
+        fail(res, e, "Préparation de la paie impossible.");
       } finally { client.release(); }
     }
   );

@@ -509,7 +509,14 @@ const permissionsService = require("./services/permissions");
    invisible pour lui, et l'employé se voyait refuser ce qu'on venait de lui
    donner. Le nouveau moteur consulte les deux, l'ancien modèle servant de
    repli, si bien qu'aucun compte configuré autrefois ne perd son accès. */
-const requirePermission = permissionsService.creerRequirePermission(pool);
+/* La société EFFECTIVE, jamais celle du corps de la requête : `company_id` y
+   est un nom de champ de donnée avant d'être une commande. `…Strict` ne lit
+   que l'en-tête et le paramètre d'URL — les deux endroits où la bascule est
+   intentionnelle. */
+const requirePermission = permissionsService.creerRequirePermission(
+  pool,
+  (req) => getEffectiveCompanyIdStrict(req, req.user?.company_id)
+);
 
 /* Repli historique (utilisé UNIQUEMENT si aucune permission explicite n'est
    configurée pour l'utilisateur). `responsable_entrepot` est ajouté : ce rôle
@@ -1090,6 +1097,25 @@ async function authenticateToken(req, res, next) {
       societes_autorisees: societesAutorisees
     };
     req.tenant_id = requestTenant;
+
+    /* UN EN-TÊTE DE SOCIÉTÉ NON AUTORISÉ EST REFUSÉ, PAS IGNORÉ.
+       L'ignorer silencieusement ferait travailler la personne dans sa société
+       d'origine tout en croyant être dans l'autre : elle saisirait des
+       écritures du bon montant, au mauvais endroit. Et une habilitation
+       révoquée doit se voir dès la requête suivante, pas au prochain
+       rechargement de page. */
+    const societeDemandee = Number(
+      req.headers["x-active-company-id"] || req.headers["x-company-id"] || 0
+    );
+    if (societeDemandee > 0
+        && Number(user.company_id) !== societeDemandee
+        && !societesAutorisees.includes(societeDemandee)) {
+      return res.status(403).json({
+        error: "Entreprise active non autorisée pour ce compte.",
+        code: "COMPANY_NOT_ALLOWED",
+        company_id: societeDemandee
+      });
+    }
 
     next();
   } catch (err) {

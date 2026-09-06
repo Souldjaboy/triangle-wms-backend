@@ -24,6 +24,102 @@ function calculatePayrollLine(input) {
   };
 }
 
+
+/**
+ * LA PAIE D'UNE PÉRIODE RÉELLE, DU 25 AU 24.
+ *
+ * `calculatePayroll()` (routes/attendance-workforce.js) calcule sur un mois
+ * CIVIL. L'écran, lui, annonce une période du 25 au 24 : les deux ne
+ * couvraient pas les mêmes journées, et personne ne pouvait le voir sans
+ * recompter à la main. Une présence du 25 août tombait hors de la paie de
+ * septembre alors qu'elle en fait partie, et une présence du 25 septembre y
+ * tombait alors qu'elle appartient à octobre.
+ *
+ * Cette fonction part des BORNES de la période, telles qu'elles sont
+ * enregistrées, et de la valeur EFFECTIVE de chaque journée :
+ *
+ *   1. une absence marquée par-dessus une régularisation l'emporte ;
+ *   2. sinon la régularisation ;
+ *   3. sinon le pointage brut ;
+ *   4. sinon rien — et c'est une absence si la journée était due.
+ *
+ * Un jour non dû — dimanche, samedi chômé selon le réglage, jour férié — ne
+ * compte ni comme attendu ni comme absence.
+ */
+async function calculerPaiePeriode(client, companyId, periode) {
+  const { rows } = await client.query(
+    `WITH cfg AS (
+       SELECT COALESCE(saturday_mode, 'NORMAL') AS samedi,
+              COALESCE(timezone, 'Africa/Bamako') AS tz
+         FROM attendance_company_configuration WHERE company_id = $1
+     ),
+     jours AS (
+       SELECT d::date AS jour, extract(isodow FROM d)::int AS isodow
+         FROM generate_series($2::date, $3::date, interval '1 day') d
+     ),
+     employes AS (
+       SELECT e.id, e.employee_number, e.full_name, e.schedule_id
+         FROM attendance_employees e
+        WHERE e.company_id = $1 AND e.active
+          AND e.effective_from <= $3::date
+          AND (e.effective_to IS NULL OR e.effective_to >= $2::date)
+     ),
+     detail AS (
+       SELECT e.id AS employee_id, e.employee_number, e.full_name, j.jour,
+              /* La journée est-elle DUE ? */
+              (d.id IS NOT NULL
+               AND j.isodow <> 7
+               AND ((SELECT samedi FROM cfg) = 'NORMAL' OR j.isodow <> 6)
+               AND h.id IS NULL) AS due,
+              /* La personne était-elle là, au sens de la valeur retenue ? */
+              CASE
+                WHEN NULLIF(g.overridden_status, '') IS NOT NULL
+                  THEN g.overridden_status IN ('PRESENT','LATE','COMPLETED')
+                WHEN r.check_in IS NOT NULL THEN true
+                WHEN g.effective_check_in IS NOT NULL THEN true
+                ELSE false
+              END AS presente,
+              COALESCE(r.late_minutes, 0) AS retard
+         FROM employes e
+         CROSS JOIN jours j
+         LEFT JOIN attendance_schedule_days d
+           ON d.schedule_id = e.schedule_id AND d.iso_weekday = j.isodow AND d.is_working_day
+         LEFT JOIN attendance_holidays h
+           ON h.company_id = $1 AND h.holiday_date = j.jour
+         LEFT JOIN attendance_day_records_v2 r
+           ON r.company_id = $1 AND r.employee_id = e.id AND r.work_date = j.jour
+         LEFT JOIN attendance_regularizations g
+           ON g.company_id = $1 AND g.employee_id = e.id AND g.work_date = j.jour
+     ),
+     totaux AS (
+       SELECT employee_id, employee_number, full_name,
+              count(*) FILTER (WHERE due)::int AS expected_days,
+              count(*) FILTER (WHERE due AND presente)::int AS attended_days,
+              count(*) FILTER (WHERE due AND NOT presente)::int AS absence_days,
+              COALESCE(sum(retard) FILTER (WHERE presente), 0)::int AS late_minutes
+         FROM detail
+        GROUP BY employee_id, employee_number, full_name
+     )
+     SELECT t.employee_id AS id, t.employee_number, t.full_name,
+            t.expected_days, t.attended_days, t.absence_days, t.late_minutes,
+            s.monthly_salary, s.daily_rate,
+            COALESCE((SELECT sum(a.amount) FROM attendance_salary_adjustments_v2 a
+                       WHERE a.company_id = $1 AND a.employee_id = t.employee_id
+                         AND a.work_date BETWEEN $2::date AND $3::date), 0) AS adjustments
+       FROM totaux t
+       LEFT JOIN LATERAL (
+         SELECT monthly_salary, daily_rate
+           FROM attendance_salary_settings_v2 v
+          WHERE v.company_id = $1 AND v.employee_id = t.employee_id
+            AND v.effective_from <= $3::date
+          ORDER BY v.effective_from DESC LIMIT 1
+       ) s ON true
+      ORDER BY t.employee_number`,
+    [companyId, periode.date_debut, periode.date_fin]
+  );
+  return rows.map(calculatePayrollLine);
+}
+
 function assertPaymentMethod(value) {
   const method = String(value || "").trim().toUpperCase();
   const allowed = new Set(["CASH","BANK","CASHBOX","TRANSFER","CHECK","MOBILE_MONEY"]);
@@ -49,4 +145,4 @@ async function canManagePayroll(client, companyId, user, action = "prepare") {
   return Boolean(rows[0]);
 }
 
-module.exports = { calculatePayrollLine, assertPaymentMethod, canManagePayroll };
+module.exports = { calculatePayrollLine, calculerPaiePeriode, assertPaymentMethod, canManagePayroll };

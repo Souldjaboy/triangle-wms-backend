@@ -286,6 +286,27 @@ module.exports = function createAttendanceWorkforceRouter(deps) {
     const client=await pool.connect();
     try {
       if(!await P.canManagePayroll(client,companyId,req.user,"prepare")) return res.status(403).json({error:"Préparation de la paie refusée."});
+
+      /* CETTE ROUTE CALCULE UN MOIS CIVIL, PAS UNE PÉRIODE DU 25 AU 24.
+         Dès qu'une période existe pour ce mois, l'utiliser produirait une paie
+         qui ne couvre pas les mêmes journées que celles annoncées à l'écran —
+         et, faute de `period_id`, le verrou de paiement la prendrait ensuite
+         pour une paie historique, donc payable sans passer par la Direction.
+         On refuse, en indiquant la route qui convient. */
+      {
+        const { rows: periodes } = await client.query(
+          `SELECT code FROM attendance_periods WHERE company_id = $1 AND code = $2`,
+          [companyId, month]
+        );
+        if (periodes[0]) {
+          return res.status(409).json({
+            error: `La période ${month} est ouverte : préparez sa paie sur ses vraies bornes, du 25 au 24.`,
+            code: "USE_PERIOD_ENDPOINT",
+            route: `/paie/periodes/${month}/preparer`,
+          });
+        }
+      }
+
       const lines=await calculatePayroll(client,companyId,month);
       await client.query("BEGIN");
       const run=(await client.query(
@@ -387,63 +408,124 @@ module.exports = function createAttendanceWorkforceRouter(deps) {
     finally{client.release();}
   });
 
+  /**
+   * PAYER UN SALAIRE.
+   *
+   * ─────────────────────────────────────────────────────────────────────
+   * POURQUOI TOUT SE PASSE DANS UNE SEULE TRANSACTION
+   *
+   * Les contrôles étaient auparavant faits AVANT le `BEGIN`, sur des lignes
+   * non verrouillées. Entre la lecture et l'écriture, la Direction pouvait
+   * refuser la paie, ou un second clic pouvait passer : on vérifiait un
+   * état qui n'était plus celui qu'on modifiait ensuite. Ici, la ligne de
+   * paie est verrouillée d'abord, tout est lu sous ce verrou, et le débit
+   * comme les écritures partent dans la même transaction.
+   *
+   * ─────────────────────────────────────────────────────────────────────
+   * POURQUOI « AUCUNE DEMANDE » N'EST PLUS UN LAISSEZ-PASSER
+   *
+   * L'ancien verrou n'exigeait une demande validée que si une demande
+   * EXISTAIT. Une paie neuve dont personne n'avait rien soumis restait donc
+   * payable — c'est-à-dire précisément le contournement qu'il fallait
+   * fermer : il suffisait de ne pas soumettre pour n'avoir personne à
+   * convaincre.
+   *
+   * L'exception historique est désormais NOMMÉE (migration 088) plutôt que
+   * déduite : seules les paies qui existaient au moment de cette migration,
+   * et qui n'ont pas de période, portent `legacy_sans_validation`. Toute
+   * paie créée ensuite naît à FALSE. L'exception ne peut donc pas s'élargir.
+   */
   router.post("/attendance-v2/payroll-items/:id/pay", authenticateToken, async(req,res)=>{
     const companyId=requireCompany(req,res); if(!companyId) return;
     const client=await pool.connect();
     try {
       if(!await P.canManagePayroll(client,companyId,req.user,"pay")) return res.status(403).json({error:"Paiement de salaire refusé."});
 
-      /* LE VERROU (migration 081) : payer exige une autorisation de la
-         Direction. Le contrôle ne porte pas sur le rôle de celui qui clique —
-         un rôle se change à l'écran des droits — mais sur l'état d'un objet
-         que quelqu'un d'AUTRE a dû toucher : une `payroll_requests` VALIDEE,
-         décidée par un compte différent de celui qui a soumis.
+      const method=P.assertPaymentMethod(req.body?.payment_method);
+      if(["BANK","TRANSFER","CHECK"].includes(method) && !req.body?.bank_id)
+        return res.status(400).json({error:"Sélectionnez la banque utilisée.",code:"PAYROLL_BANK_REQUIRED"});
+      if(method==="CASHBOX" && !req.body?.caisse_id)
+        return res.status(400).json({error:"Sélectionnez la caisse utilisée.",code:"PAYROLL_CASHBOX_REQUIRED"});
 
-         Une paie sans période et sans demande reste payable : ce sont les
-         paies mensuelles enregistrées avant ce chantier, et les bloquer
-         rétroactivement empêcherait de solder ce qui est en cours. Dès qu'une
-         demande existe pour cette paie, en revanche, elle fait autorité. */
-      {
-        const { rows: etat } = await client.query(
-          `SELECT r.id AS run_id, r.status AS run_status,
-                  (SELECT status FROM payroll_requests q
-                    WHERE q.payroll_run_id = r.id
-                    ORDER BY q.submitted_at DESC, q.id DESC LIMIT 1) AS demande_status
-             FROM attendance_payroll_items_v2 i
-             JOIN attendance_payroll_runs_v2 r ON r.id = i.payroll_run_id
-            WHERE i.id = $1 AND i.company_id = $2`,
-          [Number(req.params.id), companyId]
+      await client.query("BEGIN");
+
+      /* Le verrou d'abord : deux paiements simultanés se sérialisent ici, et
+         le second trouvera la ligne déjà payée. */
+      const { rows: lignes } = await client.query(
+        `SELECT i.id, i.status, i.net_salary, i.payroll_run_id,
+                r.status AS run_status, r.period_id, r.legacy_sans_validation
+           FROM attendance_payroll_items_v2 i
+           JOIN attendance_payroll_runs_v2 r ON r.id = i.payroll_run_id
+          WHERE i.id = $1 AND i.company_id = $2
+          FOR UPDATE OF i`,
+        [Number(req.params.id), companyId]
+      );
+      const ligne = lignes[0];
+      if (!ligne) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "Salaire introuvable.", code: "PAYROLL_ITEM_NOT_FOUND" });
+      }
+
+      /* L'exception historique, et rien d'autre. Une paie rattachée à une
+         période n'y a jamais droit, même marquée par erreur. */
+      const historique = ligne.legacy_sans_validation === true && ligne.period_id === null;
+
+      if (!historique) {
+        const { rows: demandes } = await client.query(
+          `SELECT status, submitted_by, decided_by
+             FROM payroll_requests
+            WHERE payroll_run_id = $1
+            ORDER BY submitted_at DESC, id DESC
+            LIMIT 1`,
+          [ligne.payroll_run_id]
         );
-        const ligne = etat[0];
-        if (!ligne) return res.status(404).json({ error: "Salaire introuvable.", code: "PAYROLL_ITEM_NOT_FOUND" });
+        const demande = demandes[0] || null;
 
-        if (ligne.demande_status && ligne.demande_status !== "VALIDEE") {
+        if (!demande) {
+          await client.query("ROLLBACK");
+          return res.status(409).json({
+            error: "Cette paie n'a jamais été soumise à la Direction : elle ne peut pas être payée.",
+            code: "PAYROLL_NOT_SUBMITTED",
+          });
+        }
+        if (demande.status !== "VALIDEE") {
           const explications = {
             EN_ATTENTE_DIRECTION: "Cette paie attend encore la décision de la Direction.",
             REFUSEE:              "Cette paie a été refusée par la Direction.",
             CORRECTION_DEMANDEE:  "La Direction a demandé une correction : corrigez puis soumettez à nouveau.",
             ANNULEE:              "La demande de paiement a été annulée.",
           };
+          await client.query("ROLLBACK");
           return res.status(409).json({
-            error: explications[ligne.demande_status] || "Cette paie n'est pas autorisée au paiement.",
+            error: explications[demande.status] || "Cette paie n'est pas autorisée au paiement.",
             code: "PAYROLL_NOT_AUTHORIZED",
-            statut_demande: ligne.demande_status,
+            statut_demande: demande.status,
           });
         }
-        if (["EN_ATTENTE_DIRECTION", "REFUSEE", "CORRECTION_DEMANDEE"].includes(ligne.run_status)) {
+
+        /* Le décideur doit être quelqu'un d'AUTRE. La route de décision le
+           refuse déjà, mais une demande validée est ce qui autorise à sortir
+           de l'argent : on ne s'en remet pas à un contrôle fait ailleurs. */
+        if (demande.decided_by === null
+            || Number(demande.decided_by) === Number(demande.submitted_by)) {
+          await client.query("ROLLBACK");
           return res.status(409).json({
-            error: "Cette paie n'est pas autorisée au paiement.",
-            code: "PAYROLL_NOT_AUTHORIZED", statut_paie: ligne.run_status,
+            error: "Cette paie a été validée par la personne qui l'a soumise : elle n'est pas valablement autorisée.",
+            code: "SELF_APPROVED_REQUEST",
+          });
+        }
+
+        const STATUTS_PAYABLES = ["AUTORISEE_AU_PAIEMENT", "PARTIALLY_PAID", "PAID"];
+        if (!STATUTS_PAYABLES.includes(ligne.run_status)) {
+          await client.query("ROLLBACK");
+          return res.status(409).json({
+            error: "Cette paie n'est pas dans un état qui permet le paiement.",
+            code: "PAYROLL_NOT_AUTHORIZED",
+            statut_paie: ligne.run_status,
           });
         }
       }
 
-      const method=P.assertPaymentMethod(req.body?.payment_method);
-      if(["BANK","TRANSFER","CHECK"].includes(method) && !req.body?.bank_id)
-        return res.status(400).json({error:"Sélectionnez la banque utilisée.",code:"PAYROLL_BANK_REQUIRED"});
-      if(method==="CASHBOX" && !req.body?.caisse_id)
-        return res.status(400).json({error:"Sélectionnez la caisse utilisée.",code:"PAYROLL_CASHBOX_REQUIRED"});
-      await client.query("BEGIN");
       const item=(await client.query(
         `UPDATE attendance_payroll_items_v2 SET status='PAID',payment_method=$1,payment_reference=$2,
           bank_id=$3,caisse_id=$4,paid_by=$5,paid_at=now(),updated_at=now()

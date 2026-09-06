@@ -283,14 +283,19 @@ async function main() {
   console.log(`\n${G}PRÉPARATION ET SOUMISSION${Z}`);
   let runId = 0, ligneA = 0, ligneB = 0;
   {
-    const gen = await appel("POST", "/attendance-v2/payroll/2026-09/generate", tComptable);
-    verifier("le comptable prépare la paie", gen.statut === 201, JSON.stringify(gen.corps).slice(0, 200));
-    runId = gen.corps.run?.id;
+    /* La préparation passe par la PÉRIODE, comme le fait l'écran. L'ancienne
+       route calculait un mois civil et laissait la paie sans période ; ce test
+       rattachait alors `period_id` à la main, ce qui ne prouvait rien de ce
+       qui se passe en production. C'est la route qui pose le lien. */
+    const gen = await appel("POST", "/paie/periodes/2026-09/preparer", tComptable);
+    verifier("le comptable prépare la paie sur la période", gen.statut === 201,
+      JSON.stringify(gen.corps).slice(0, 200));
+    runId = gen.corps.paie?.id;
 
-    /* On rattache la paie à la période : le lien est ce qui fera suivre les
-       statuts jusqu'à la clôture. */
-    const [periode] = await q(`SELECT id FROM attendance_periods WHERE company_id=$1 AND code='2026-09'`, [TRIANGLE]);
-    await pool.query(`UPDATE attendance_payroll_runs_v2 SET period_id=$1 WHERE id=$2`, [periode.id, runId]);
+    const [rattachee] = await q(
+      `SELECT period_id FROM attendance_payroll_runs_v2 WHERE id=$1`, [runId]);
+    verifier("la période est rattachée par la route elle-même",
+      rattachee && rattachee.period_id !== null, JSON.stringify(rattachee));
 
     const lignes = await q(
       `SELECT id, employee_id, net_salary, status FROM attendance_payroll_items_v2
