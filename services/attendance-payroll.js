@@ -132,10 +132,32 @@ function assertPaymentMethod(value) {
   return method;
 }
 
+/**
+ * OBSOLÈTE — NE DÉCIDE PLUS D'UN PAIEMENT.
+ *
+ * Cette fonction accordait la paie à quiconque portait le rôle « comptable »,
+ * avant même de regarder les permissions. Un administrateur pouvait donc poser
+ * DENY sur `paie|pay`, voir le bouton disparaître de l'écran — et le comptable
+ * payait quand même en appelant la route directement. Le refus n'existait
+ * qu'à l'écran.
+ *
+ * Deux moteurs décidaient d'un même paiement, et le mauvais gagnait parce
+ * qu'il répondait le premier. Les routes de paie passent désormais toutes par
+ * `requirePermission("paie", …)` : un seul moteur, celui que l'écran des
+ * droits pilote.
+ *
+ * Les autorisations de `attendance_payroll_authorizations` ont été reportées
+ * en exceptions personnelles par la migration 089 — personne n'a rien perdu,
+ * et ce qui était accordé se voit maintenant à l'écran des droits.
+ *
+ * La fonction reste, sans le repli par rôle, pour les appelants historiques
+ * qui n'ont pas encore de garde de permission. Elle n'accorde plus rien
+ * qu'une ligne d'autorisation explicite ne dise.
+ */
 async function canManagePayroll(client, companyId, user, action = "prepare") {
   if (user?.is_super_admin === true) return true;
   const role = String(user?.role || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-  if (role === "super_admin" || role === "comptable") return true;
+  if (role === "super_admin") return true;
   const column = action === "pay" ? "can_pay" : "can_prepare";
   const { rows } = await client.query(
     `SELECT 1 FROM attendance_payroll_authorizations

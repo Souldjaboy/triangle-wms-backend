@@ -440,3 +440,47 @@ un libellé qui dit ce qu'ils sont (« Badges des comptes », « Ancien scan »)
 en ligne, sans `shrink-0`, s'écrasait à 48 px — les libellés s'y empilaient
 lettre par lettre. Le menu passe désormais au-dessus du contenu sur téléphone
 (`flex-col md:flex-row`), avec des cibles de 48 px sur 327.
+
+---
+
+## 5. Audit RBAC — trois contournements
+
+### 1. Le rôle contournait les droits
+`canManagePayroll()` accordait la paie à quiconque portait le rôle
+« comptable », **avant** de regarder les permissions. Un administrateur posait
+DENY sur `paie|pay`, le bouton disparaissait de l'écran — et le comptable
+payait quand même en appelant la route directement. Le refus n'existait qu'à
+l'écran.
+
+Deux moteurs décidaient d'un même paiement, et le mauvais gagnait parce qu'il
+répondait le premier. Les trois routes historiques passent désormais par
+`requirePermission("paie", view|prepare|pay)`, et `canManagePayroll()` a été
+retirée du chemin de paie. Les règles **métier** (demande validée, décideur
+distinct, statut payable, verrou, solde, anti-doublon) restent entières et
+doivent toutes être satisfaites **en plus** du droit.
+
+La migration 089 reporte d'abord les autorisations de
+`attendance_payroll_authorizations` en exceptions personnelles : personne ne
+perd un droit qu'on lui avait explicitement donné, et ce qui était accordé se
+voit maintenant à l'écran des droits.
+
+### 2. Un compte habilité était invisible dans sa société d'accueil
+`cibleOuNull()` et `GET /permissions/users` ne retenaient que
+`users.company_id = société active`. Le comptable et le directeur des deux
+sociétés — d'origine Triangle — étaient donc absents de l'écran des droits
+FAT & MAT. On ne configure pas les droits de quelqu'un qu'on ne voit pas.
+
+La liste retient maintenant l'origine **ou** une habilitation active, dans le
+même `tenant_id`. `users.company_id` n'est jamais réécrit, le compte reste
+unique, et les exceptions sont comptées et écrites pour la société **active**.
+
+### 3. Une permission historique traversait les sociétés
+`user_permissions` est antérieure au multi-sociétés : elle porte un `user_id`
+mais **aucun** `company_id`. Une ligne y disait « ce compte pouvait faire
+ceci », sans dire où — et l'emportait donc partout. Un droit coché chez
+Triangle avant ce chantier suivait le compte chez FAT & MAT, où rien à l'écran
+ne l'expliquait.
+
+Ce repli est borné à la société d'**origine**. Dans une société secondaire,
+seuls comptent `role_permissions` et `user_permission_overrides` de cette
+société ; à défaut, on refuse.

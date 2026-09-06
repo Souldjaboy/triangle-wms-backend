@@ -161,7 +161,12 @@ async function main() {
   {
     const mois = new Date().toISOString().slice(0, 7);
     const r = await appel("GET", `/attendance-v2/payroll?month=${mois}`, ISSA);
-    verifier("Issa est refusé sur la paie (403, aucune permission de paie accordée)", r.statut === 403,
+    /* 403 ou 404 : la route est désormais gardée par le moteur de droits, qui
+       répond « introuvable » quand le module entier est masqué pour ce compte
+       — dire « interdit » apprendrait déjà que l'écran existe. Ce qui compte
+       ici est qu'aucun salaire ne sorte. */
+    verifier("Issa est refusé sur la paie (aucune permission de paie accordée)",
+      r.statut === 403 || r.statut === 404,
       JSON.stringify(r.corps));
   }
 

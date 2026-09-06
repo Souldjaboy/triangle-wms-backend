@@ -122,8 +122,28 @@ async function chargerContexte(pool, user, societeEffective = null) {
     parModule: new Map(modules.rows.map((m) => [m.module_key, m])),
     parRole,
     exceptions,
-    /* Ancien modèle, chargé à la demande seulement. */
-    ancien: await legacy.loadUserPermissions(pool, userId),
+    /* ─────────────────────────────────────────────────────────────────
+       L'ANCIEN MODÈLE NE FRANCHIT PAS LA FRONTIÈRE D'UNE SOCIÉTÉ.
+
+       `user_permissions` est antérieure au multi-sociétés : elle porte un
+       `user_id` et un `module_key`, mais AUCUN `company_id`. Une ligne y
+       signifie donc « ce compte pouvait faire ceci », sans dire où.
+
+       Tant qu'un compte n'existait que dans une société, l'ambiguïté était
+       sans conséquence. Depuis les habilitations (migration 079), elle en a
+       une, et grave : un comptable dont l'ancien écran avait coché « valider
+       la comptabilité » chez Triangle emporterait ce droit chez FAT & MAT,
+       où personne ne le lui a jamais accordé — et où le nouvel écran des
+       droits ne montre rien qui l'expliquerait.
+
+       On borne donc ce repli à la société d'ORIGINE du compte. Dans une
+       société secondaire, seuls comptent `role_permissions` et
+       `user_permission_overrides` de cette société-là ; à défaut, on refuse.
+       C'est une compatibilité, pas un passe-partout.
+       ───────────────────────────────────────────────────────────────── */
+    ancien: companyId === Number(user?.company_id || 0)
+      ? await legacy.loadUserPermissions(pool, userId)
+      : new Map(),
   };
 }
 
@@ -177,7 +197,9 @@ function decider(ctx, cleModule, action) {
     if (enfants.length) return { autorise: false, source: "sous_module" };
   }
 
-  /* Comptes configurés dans l'ancien écran, avant ce module. */
+  /* Comptes configurés dans l'ancien écran, avant ce module. La carte est
+     VIDE hors de la société d'origine (voir chargerContexte) : une permission
+     historique ne traverse pas une frontière de société. */
   for (const candidat of candidats) {
     const ligne = ctx.ancien.get(legacy.normalizeModuleKey(candidat));
     if (ligne) {

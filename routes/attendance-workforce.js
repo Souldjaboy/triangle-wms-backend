@@ -6,7 +6,22 @@ const AV = require("../services/avances-salaire");
 const P = require("../services/attendance-payroll");
 
 module.exports = function createAttendanceWorkforceRouter(deps) {
-  const { pool, authenticateToken, getEffectiveCompanyId, nextAccountingNumber, createAccountingEntry } = deps;
+  const { pool, authenticateToken, getEffectiveCompanyId, requirePermission,
+          nextAccountingNumber, createAccountingEntry } = deps;
+
+  /* Les routes de paie sont gardées par le moteur de droits, comme partout
+     ailleurs. Sans cela, elles reposaient sur `canManagePayroll()`, qui
+     accordait la paie au seul vu du rôle : un DENY posé par l'administrateur
+     ne tenait pas devant un appel direct à l'API. Si le garde n'était pas
+     fourni — un appelant qui n'aurait pas été mis à jour — on refuse plutôt
+     que d'ouvrir. */
+  const garde = (action) => (
+    typeof requirePermission === "function"
+      ? requirePermission("paie", action)
+      : (_req, res) => res.status(503).json({
+          error: "Contrôle des droits indisponible.", code: "PERMISSION_CHECK_MISSING",
+        })
+  );
   const router = express.Router();
 
   const companyOf = (req) => Number(getEffectiveCompanyId(req, req.user?.company_id) || 0);
@@ -259,7 +274,7 @@ module.exports = function createAttendanceWorkforceRouter(deps) {
     } catch (error) { fail(res, error, "Erreur ajustement salarial."); }
   });
 
-  router.get("/attendance-v2/payroll", authenticateToken, async (req, res) => {
+  router.get("/attendance-v2/payroll", authenticateToken, garde("view"), async (req, res) => {
     const companyId = requireCompany(req, res); if (!companyId) return;
     const month = String(req.query.month || "");
     if (!/^\d{4}-\d{2}$/.test(month)) return res.status(400).json({ error: "Mois attendu au format AAAA-MM." });
@@ -279,13 +294,18 @@ module.exports = function createAttendanceWorkforceRouter(deps) {
     finally { client.release(); }
   });
 
-  router.post("/attendance-v2/payroll/:month/generate", authenticateToken, async (req,res) => {
+  router.post("/attendance-v2/payroll/:month/generate", authenticateToken, garde("prepare"), async (req,res) => {
     const companyId=requireCompany(req,res); if(!companyId) return;
     const month=String(req.params.month||"");
     if(!/^\d{4}-\d{2}$/.test(month)) return res.status(400).json({error:"Mois attendu au format AAAA-MM."});
     const client=await pool.connect();
     try {
-      if(!await P.canManagePayroll(client,companyId,req.user,"prepare")) return res.status(403).json({error:"Préparation de la paie refusée."});
+      /* Le droit a déjà été tranché par `garde("prepare")`, à l'entrée de la
+         route. On n'interroge plus `canManagePayroll()` : c'était le second
+         moteur, celui qui accordait la paie au vu du rôle et qui, une fois ce
+         repli retiré, se mettait à refuser des comptes pourtant autorisés par
+         l'écran des droits. Deux moteurs concurrents se trompent toujours dans
+         un sens ou dans l'autre ; il n'en reste qu'un. */
 
       /* CETTE ROUTE CALCULE UN MOIS CIVIL, PAS UNE PÉRIODE DU 25 AU 24.
          Dès qu'une période existe pour ce mois, l'utiliser produirait une paie
@@ -435,11 +455,15 @@ module.exports = function createAttendanceWorkforceRouter(deps) {
    * et qui n'ont pas de période, portent `legacy_sans_validation`. Toute
    * paie créée ensuite naît à FALSE. L'exception ne peut donc pas s'élargir.
    */
-  router.post("/attendance-v2/payroll-items/:id/pay", authenticateToken, async(req,res)=>{
+  router.post("/attendance-v2/payroll-items/:id/pay", authenticateToken, garde("pay"), async(req,res)=>{
     const companyId=requireCompany(req,res); if(!companyId) return;
     const client=await pool.connect();
     try {
-      if(!await P.canManagePayroll(client,companyId,req.user,"pay")) return res.status(403).json({error:"Paiement de salaire refusé."});
+      /* Le droit a déjà été tranché par `garde("pay")`. Voir la note de la
+         route de préparation : un seul moteur décide, celui que l'écran des
+         droits pilote. Les règles MÉTIER — demande validée, décideur distinct
+         du demandeur, statut payable, solde, anti-doublon — restent entières,
+         plus bas, et doivent toutes être satisfaites en plus du droit. */
 
       const method=P.assertPaymentMethod(req.body?.payment_method);
       if(["BANK","TRANSFER","CHECK"].includes(method) && !req.body?.bank_id)

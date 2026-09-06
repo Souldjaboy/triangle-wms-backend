@@ -18035,7 +18035,7 @@ const createAttendanceWorkforceRouter = require("./routes/attendance-workforce")
 app.use(
   "/",
   createAttendanceWorkforceRouter({
-    pool, authenticateToken, getEffectiveCompanyId,
+    pool, authenticateToken, getEffectiveCompanyId, requirePermission,
     nextAccountingNumber, createAccountingEntry,
   })
 );

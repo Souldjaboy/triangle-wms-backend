@@ -79,14 +79,39 @@ module.exports = function createPermissionsRouter(deps) {
    * l'appelant. C'est le seul point d'entrée : aucune route ne lit un
    * identifiant utilisateur sans passer par ici.
    */
+  /**
+   * LE COMPTE EST-IL ADMINISTRABLE DEPUIS CETTE SOCIÉTÉ ?
+   *
+   * Deux façons d'en être : y avoir sa société d'origine, ou y être HABILITÉ
+   * (`user_company_access`, migration 079). Ne retenir que la première
+   * excluait de l'écran des droits FAT & MAT le comptable et le directeur des
+   * deux sociétés — dont l'origine est Triangle — alors qu'ils y travaillent.
+   * On ne peut pas configurer les droits de quelqu'un qu'on ne voit pas.
+   *
+   * Ce qu'on ne fait PAS pour autant : réécrire `users.company_id`. La société
+   * d'origine reste ce qu'elle est, et le compte reste unique.
+   */
   async function cibleOuNull(companyId, userId) {
     const { rows } = await pool.query(
       /* La colonne s'appelle `badge_code` en base ; l'API expose `badge_number`
          depuis l'ouverture de cet écran. On aliase plutôt que de renommer :
          la base ne bouge pas, le contrat JSON du frontend non plus. */
-      `SELECT id, company_id, fullname, email, role, badge_code AS badge_number,
-              is_super_admin, is_active
-         FROM users WHERE id = $1 AND company_id = $2 LIMIT 1`,
+      `SELECT u.id, u.company_id, u.fullname, u.email, u.role,
+              u.badge_code AS badge_number, u.is_super_admin, u.is_active,
+              (u.company_id = $2) AS societe_origine
+         FROM users u
+         JOIN companies c ON c.id = $2
+        WHERE u.id = $1
+          AND (
+            u.company_id = $2
+            OR EXISTS (SELECT 1 FROM user_company_access a
+                        WHERE a.user_id = u.id AND a.company_id = $2 AND a.active)
+          )
+          /* Le cloisonnement de version prime : une habilitation ne fait
+             jamais franchir la frontière d'un tenant. */
+          AND (COALESCE(u.tenant_id, '') = COALESCE(c.tenant_id, '')
+               OR u.tenant_id IS NULL OR c.tenant_id IS NULL)
+        LIMIT 1`,
       [Number(userId) || 0, companyId]
     );
     return rows[0] || null;
@@ -140,14 +165,25 @@ module.exports = function createPermissionsRouter(deps) {
       const { rows } = await pool.query(
         `SELECT u.id, u.fullname, u.email, u.role, u.badge_code AS badge_number,
                 u.is_active, u.is_super_admin,
+                (u.company_id = $1) AS societe_origine,
+                /* Les exceptions de la société ACTIVE, pas celles de la société
+                   d'origine du compte : administrer FAT & MAT ne doit montrer
+                   ni toucher les exceptions posées chez Triangle. */
                 (SELECT count(*)::int FROM user_permission_overrides o
-                  WHERE o.company_id = u.company_id AND o.user_id = u.id) AS exceptions
+                  WHERE o.company_id = $1 AND o.user_id = u.id) AS exceptions
            FROM users u
-          WHERE u.company_id = $1
-          ORDER BY u.is_active DESC, lower(u.fullname)`,
+           JOIN companies c ON c.id = $1
+          WHERE (
+                  u.company_id = $1
+                  OR EXISTS (SELECT 1 FROM user_company_access a
+                              WHERE a.user_id = u.id AND a.company_id = $1 AND a.active)
+                )
+            AND (COALESCE(u.tenant_id, '') = COALESCE(c.tenant_id, '')
+                 OR u.tenant_id IS NULL OR c.tenant_id IS NULL)
+          ORDER BY u.is_active DESC, (u.company_id = $1) DESC, lower(u.fullname)`,
         [companyId]
       );
-      res.json({ users: rows });
+      res.json({ users: rows, company_id: companyId });
     } catch (e) { echec(res, e, "Erreur de lecture des comptes."); }
   });
 
