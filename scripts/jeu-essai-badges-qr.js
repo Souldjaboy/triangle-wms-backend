@@ -34,15 +34,22 @@ async function poserHoraire(c, companyId, code) {
   const { rows } = await c.query(
     `INSERT INTO attendance_work_schedules (company_id, code, name, active)
      VALUES ($1,$2,$3,true) RETURNING id`,
-    [companyId, code, "Journée 08:00–17:00"]
+    [companyId, code, "Journée 08:00–17:00, tous les jours"]
   );
   const scheduleId = rows[0].id;
+  /* TOUS les jours sont travaillés, dimanche compris — et c'est délibéré.
+     Cette suite éprouve les badges et le scan, pas le calendrier. Laisser le
+     dimanche chômé la faisait échouer un jour sur sept, pour une raison sans
+     aucun rapport avec ce qu'elle vérifie : le pointage était refusé par la
+     règle « jour non travaillé ». Le dimanche non travaillé et le samedi
+     configurable sont éprouvés là où c'est leur sujet — suites des périodes
+     et des rapports. */
   for (let jour = 1; jour <= 7; jour += 1) {
     await c.query(
       `INSERT INTO attendance_schedule_days
          (schedule_id, iso_weekday, is_working_day, start_time, end_time, break_start, break_end)
-       VALUES ($1,$2,$3,'08:00','17:00','12:00','13:00')`,
-      [scheduleId, jour, jour !== 7]
+       VALUES ($1,$2,true,'08:00','17:00','12:00','13:00')`,
+      [scheduleId, jour]
     );
   }
   return scheduleId;

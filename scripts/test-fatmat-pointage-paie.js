@@ -123,6 +123,22 @@ async function main() {
   // ────────────────────────────────────────────────────────────────────
   console.log(`\n${G}7-9. ISSA VOIT LES 9, PEUT LES POINTER, RIEN D'UNE AUTRE SOCIÉTÉ${Z}`);
   {
+    /* FAT & MAT travaille du lundi au samedi — c'est une décision métier, posée
+       par le script de configuration réel, et on n'y touche pas. Mais la suite
+       éprouve ici le POINTAGE, pas le calendrier : lancée un dimanche, elle
+       échouait sur « jour non travaillé », un jour sur sept, pour une raison
+       sans rapport avec ce qu'elle vérifie. On ouvre donc le jour courant, le
+       temps de ce test — la règle du jour chômé est éprouvée là où c'est son
+       sujet, dans les suites des périodes et des rapports. */
+    await pool.query(
+      `UPDATE attendance_schedule_days
+          SET is_working_day = true,
+              start_time = COALESCE(start_time, '08:00'),
+              end_time = COALESCE(end_time, '17:00')
+        WHERE iso_weekday = extract(isodow FROM (timezone('Africa/Bamako', now()))::date)
+          AND schedule_id IN (SELECT id FROM attendance_work_schedules WHERE company_id = $1)`,
+      [jeu.fatmat]);
+
     const r = await appel("GET", "/attendance-v2/employees", ISSA);
     const liste = Array.isArray(r.corps) ? r.corps : r.corps.employees || [];
     verifier("Issa voit les 9 employés de FAT & MAT", liste.length === 9, String(liste.length));

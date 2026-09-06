@@ -364,3 +364,26 @@ six rafraîchissements de suite ne créent rien de plus (éprouvé).
 Les destinataires sont choisis d'après les **droits**, pas les rôles :
 prévenir « les comptables » laisserait de côté celui à qui on vient d'accorder
 la préparation de la paie par exception personnelle.
+
+---
+
+## 3. Deux fragilités de tests corrigées à la validation finale
+
+**Dépendance au jour de la semaine.** Les suites QR, avances et FAT & MAT
+posaient un horaire « lundi au samedi » puis pointaient *aujourd'hui*. Lancées
+un dimanche, elles échouaient sur « jour non travaillé » — un jour sur sept,
+pour une raison sans aucun rapport avec ce qu'elles vérifient. Les jeux d'essai
+ouvrent désormais tous les jours (ces suites portent sur les badges, les
+avances et les droits, pas sur le calendrier) ; la suite FAT & MAT ouvre le
+jour courant sans toucher au calendrier métier posé par le script de
+configuration **réel**, qui reste lundi-samedi. Le dimanche chômé et le samedi
+configurable sont éprouvés là où c'est leur sujet : suites des périodes et des
+rapports.
+
+**`/companies/available` était cassée.** Elle interrogeait
+`user_company_access.is_active` — une table absente de toute migration, et une
+colonne qui n'existe pas dans celle posée depuis (079, où elle se nomme
+`active`). Le sélecteur d'entreprise restait donc **vide pour un super admin**,
+en silence : la requête échouait, le catch renvoyait `[]`, et un sélecteur vide
+se confond avec « une seule entreprise ». Elle délègue maintenant au service
+d'accès — ce qui ouvre du même coup le sélecteur aux comptes habilités.

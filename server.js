@@ -18194,38 +18194,44 @@ app.use(
 // Triangle Logistics <-> FAT & MAT
 // ============================================================
 
-app.get("/companies/available", authenticateToken, async (req,res) => {
+/**
+ * LES ENTREPRISES QUE CE COMPTE PEUT ATTEINDRE.
+ *
+ * Cette route alimente le sélecteur d'entreprise. Elle interrogeait
+ * `user_company_access.is_active` — une table qui n'existait dans aucune
+ * migration, et une colonne qui n'existe pas dans celle posée depuis (079,
+ * où elle se nomme `active`). Le sélecteur était donc VIDE pour un super
+ * admin : la requête échouait, tombait dans le catch, et renvoyait une liste
+ * vide sans que rien ne le signale à l'écran.
+ *
+ * Elle délègue désormais à `services/acces-societes.js`, seule réponse de
+ * l'application à la question « quelles sociétés ? ». Conséquence voulue : un
+ * comptable ou un directeur HABILITÉ (migration 079) voit lui aussi son
+ * sélecteur, sans qu'on ait eu à l'élever en super admin.
+ */
+app.get("/companies/available", authenticateToken, async (req, res) => {
   try {
-    const isSuper =
-      req.user?.is_super_admin === true ||
-      String(req.user?.role || "").toLowerCase() === "super_admin";
-
-    if (!isSuper) {
-      const { rows } = await pool.query(
-        `SELECT id,name,business_type,status
-         FROM companies
-         WHERE id=$1`,
-        [req.user.company_id]
-      );
-      return res.json(rows);
-    }
+    const ids = await accesSocietes.societesAccessibles(
+      pool, req.user, req.tenant_id || null
+    );
+    if (!ids.length) return res.json([]);
 
     const { rows } = await pool.query(
-      `SELECT c.id,c.name,c.business_type,c.status,cs.logo_url
-       FROM user_company_access uca
-       JOIN companies c ON c.id=uca.company_id
-       LEFT JOIN company_settings cs ON cs.company_id=c.id
-       WHERE uca.user_id=$1
-         AND uca.is_active=TRUE
-         AND c.tenant_id=$2
-       ORDER BY c.id`,
-      [req.user.id, req.tenant_id || "triangle"]
+      `SELECT c.id, c.name, c.business_type, c.status, cs.logo_url
+         FROM companies c
+         LEFT JOIN company_settings cs ON cs.company_id = c.id
+        WHERE c.id = ANY($1::int[])
+          AND COALESCE(c.status, 'active') <> 'deleted'
+        ORDER BY c.name`,
+      [ids]
     );
-
     res.json(rows);
-  } catch(e) {
-    console.error(e);
-    res.status(500).json({error:"Erreur chargement entreprises."});
+  } catch (e) {
+    console.error("Entreprises accessibles :", e);
+    /* On ne renvoie pas une liste vide en silence : un sélecteur vide se
+       confond avec « une seule entreprise », et c'est ce qui a masqué le
+       défaut pendant si longtemps. */
+    res.status(500).json({ error: "Impossible de lire les entreprises accessibles." });
   }
 });
 

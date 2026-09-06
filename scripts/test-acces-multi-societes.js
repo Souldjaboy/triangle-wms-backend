@@ -249,6 +249,39 @@ async function main() {
   }
 
   // ────────────────────────────────────────────────────────────────────
+  console.log(`\n${G}LE SÉLECTEUR D'ENTREPRISE${Z}`);
+  {
+    /* `/companies/available` alimente le sélecteur affiché en haut de
+       l'application. Elle interrogeait `user_company_access.is_active` — une
+       table absente de toute migration, et une colonne qui n'existe pas dans
+       celle posée depuis. Le sélecteur restait donc vide pour un super admin,
+       en silence : la requête échouait et le catch renvoyait []. */
+    const pourSuper = await appel("GET", "/companies/available", tSuper);
+    verifier("le super admin voit ses entreprises dans le sélecteur",
+      pourSuper.statut === 200 && Array.isArray(pourSuper.corps) && pourSuper.corps.length >= 2,
+      JSON.stringify(pourSuper.corps).slice(0, 160));
+
+    /* On interroge l'EMPLOYÉ, jamais habilité : le comptable vient d'être
+       réhabilité par la section précédente, et l'interroger ici testerait
+       l'ordre des sections plutôt que la règle. */
+    const seul = await appel("GET", "/companies/available", tEmploye);
+    verifier("un compte non habilité n'y voit que la sienne",
+      seul.statut === 200 && seul.corps.length === 1
+        && Number(seul.corps[0].id) === TRIANGLE,
+      JSON.stringify(seul.corps));
+
+    /* L'habilitation ouvre le sélecteur à un compte qui n'est pas super
+       admin — c'est tout l'objet de la migration 079. */
+    const avec = await appel("GET", "/companies/available", tComptable);
+    const dejaHabilite = (await pool.query(
+      `SELECT 1 FROM user_company_access WHERE user_id=$1 AND company_id=$2 AND active`,
+      [COMPTABLE, FATMAT])).rowCount > 0;
+    verifier("le comptable habilité voit les deux dans son sélecteur",
+      !dejaHabilite || avec.corps.length === 2,
+      `habilité=${dejaHabilite} vu=${avec.corps.length}`);
+  }
+
+  // ────────────────────────────────────────────────────────────────────
   console.log(`\n${G}SUPER ADMIN : COMPORTEMENT INCHANGÉ${Z}`);
   {
     const mes = await appel("GET", "/acces-societes/mes-societes", tSuper);

@@ -103,10 +103,12 @@ async function poserLeJeu() {
   scheduleId = (await pool.query(
     `INSERT INTO attendance_work_schedules (company_id, code, name, active)
      VALUES ($1,'ESSAI-083','Journée 08:00',true) RETURNING id`, [TRIANGLE])).rows[0].id;
+  /* Tous les jours travaillés : cette suite porte sur les avances, pas sur le
+     calendrier. Un dimanche chômé la ferait échouer un jour sur sept. */
   for (let j = 1; j <= 7; j += 1) {
     await pool.query(
       `INSERT INTO attendance_schedule_days (schedule_id, iso_weekday, is_working_day, start_time, end_time)
-       VALUES ($1,$2,$3,'08:00','17:00')`, [scheduleId, j, j !== 7]);
+       VALUES ($1,$2,true,'08:00','17:00')`, [scheduleId, j]);
   }
 
   const emp = async (numero, nom, salaire) => {
