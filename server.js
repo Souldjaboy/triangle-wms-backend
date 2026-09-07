@@ -8027,6 +8027,672 @@ app.get("/accounting/intercompany-transfers", authenticateToken, async (req, res
   }
 });
 
+
+/* ==========================================================
+ * TRANSFERT INTER-SOCIÉTÉS
+ * Triangle <-> FAT & MAT
+ * ========================================================== */
+
+app.get("/accounting/intercompany-options", authenticateToken, async (req, res) => {
+  try {
+    if (!canViewAccounting(req.user)) {
+      return res.status(403).json({
+        error: "Accès comptabilité refusé."
+      });
+    }
+
+    const activeCompanyId = Number(
+      getEffectiveCompanyId(req) ||
+      req.user?.company_id ||
+      0
+    );
+
+    const companies = await pool.query(
+      `SELECT id, name
+       FROM companies
+       WHERE id IN (1,5)
+       ORDER BY id`
+    );
+
+    const banks = await pool.query(
+      `SELECT
+         id,
+         company_id,
+         bank_name,
+         current_balance,
+         currency
+       FROM accounting_banks
+       WHERE company_id IN (1,5)
+       ORDER BY company_id, bank_name, id`
+    );
+
+    const treasury = await pool.query(
+      `SELECT
+         company_id,
+         current_balance,
+         currency
+       FROM treasury_accounts
+       WHERE company_id IN (1,5)
+       ORDER BY company_id`
+    );
+
+    res.json({
+      active_company_id: activeCompanyId,
+      companies: companies.rows,
+      banks: banks.rows,
+      treasury: treasury.rows
+    });
+  } catch (error) {
+    logAccountingError(
+      "GET /accounting/intercompany-options",
+      error,
+      req
+    );
+
+    res.status(500).json({
+      error: "Erreur lecture options transfert."
+    });
+  }
+});
+
+
+app.post("/accounting/intercompany-transfers", authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    if (!canManageAccounting(req.user)) {
+      return res.status(403).json({
+        error: "Accès gestion comptable refusé."
+      });
+    }
+
+    const fromCompanyId = Number(
+      getAccountingScope(req, true).companyId
+    );
+
+    const toCompanyId = Number(
+      req.body?.to_company_id || 0
+    );
+
+    const amount = Number(
+      req.body?.amount || 0
+    );
+
+    const reason = String(
+      req.body?.reason || ""
+    ).trim();
+
+    const fromAccountType = String(
+      req.body?.from_account_type || "TREASURY"
+    ).toUpperCase();
+
+    const toAccountType = String(
+      req.body?.to_account_type || "TREASURY"
+    ).toUpperCase();
+
+    const fromBankId =
+      normalizeOptionalId(req.body?.from_bank_id);
+
+    const toBankId =
+      normalizeOptionalId(req.body?.to_bank_id);
+
+    if (![1,5].includes(fromCompanyId)) {
+      return res.status(400).json({
+        error: "Société source invalide."
+      });
+    }
+
+    if (
+      ![1,5].includes(toCompanyId) ||
+      toCompanyId === fromCompanyId
+    ) {
+      return res.status(400).json({
+        error:
+          "La destination doit être l'autre société."
+      });
+    }
+
+    if (
+      !["TREASURY","BANK"].includes(fromAccountType) ||
+      !["TREASURY","BANK"].includes(toAccountType)
+    ) {
+      return res.status(400).json({
+        error: "Type de compte invalide."
+      });
+    }
+
+    if (
+      fromAccountType === "BANK" &&
+      !fromBankId
+    ) {
+      return res.status(400).json({
+        error: "Banque source obligatoire."
+      });
+    }
+
+    if (
+      toAccountType === "BANK" &&
+      !toBankId
+    ) {
+      return res.status(400).json({
+        error: "Banque destination obligatoire."
+      });
+    }
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({
+        error: "Montant invalide."
+      });
+    }
+
+    if (!reason) {
+      return res.status(400).json({
+        error: "Objet du transfert obligatoire."
+      });
+    }
+
+    await client.query("BEGIN");
+
+    /*
+     * Vérifie l'accès à la société destination.
+     */
+    if (!isSuperAdminUser(req.user)) {
+      const access = await client.query(
+        `SELECT 1
+         FROM user_company_access
+         WHERE user_id=$1
+           AND company_id=$2
+           AND is_active=true
+         LIMIT 1`,
+        [req.user.id, toCompanyId]
+      );
+
+      if (
+        Number(req.user.company_id) !== toCompanyId &&
+        !access.rows[0]
+      ) {
+        await client.query("ROLLBACK");
+
+        return res.status(403).json({
+          error:
+            "Accès à la société destination refusé."
+        });
+      }
+    }
+
+    await ensureTreasuryAccount(
+      client,
+      fromCompanyId
+    );
+
+    await ensureTreasuryAccount(
+      client,
+      toCompanyId
+    );
+
+    /*
+     * Verrouille les deux trésoreries.
+     */
+    const treasuries = await client.query(
+      `SELECT *
+       FROM treasury_accounts
+       WHERE company_id IN ($1,$2)
+       ORDER BY company_id
+       FOR UPDATE`,
+      [fromCompanyId, toCompanyId]
+    );
+
+    const treasuryMap = new Map(
+      treasuries.rows.map(row => [
+        Number(row.company_id),
+        row
+      ])
+    );
+
+    let sourceBank = null;
+    let destinationBank = null;
+
+    const bankIds = [
+      fromBankId,
+      toBankId
+    ]
+      .filter(Boolean)
+      .map(Number)
+      .sort((a,b) => a-b);
+
+    if (bankIds.length) {
+      const bankResult = await client.query(
+        `SELECT *
+         FROM accounting_banks
+         WHERE id = ANY($1::int[])
+         ORDER BY id
+         FOR UPDATE`,
+        [bankIds]
+      );
+
+      sourceBank =
+        bankResult.rows.find(
+          row =>
+            Number(row.id) ===
+            Number(fromBankId)
+        ) || null;
+
+      destinationBank =
+        bankResult.rows.find(
+          row =>
+            Number(row.id) ===
+            Number(toBankId)
+        ) || null;
+    }
+
+    if (
+      fromAccountType === "BANK" &&
+      (
+        !sourceBank ||
+        Number(sourceBank.company_id) !==
+          fromCompanyId
+      )
+    ) {
+      await client.query("ROLLBACK");
+
+      return res.status(400).json({
+        error: "Banque source incorrecte."
+      });
+    }
+
+    if (
+      toAccountType === "BANK" &&
+      (
+        !destinationBank ||
+        Number(destinationBank.company_id) !==
+          toCompanyId
+      )
+    ) {
+      await client.query("ROLLBACK");
+
+      return res.status(400).json({
+        error: "Banque destination incorrecte."
+      });
+    }
+
+    const sourceBalance =
+      fromAccountType === "BANK"
+        ? Number(
+            sourceBank.current_balance || 0
+          )
+        : Number(
+            treasuryMap.get(fromCompanyId)
+              ?.current_balance || 0
+          );
+
+    ensureSufficientBalance(
+      sourceBalance,
+      amount,
+      "Solde insuffisant sur le compte source."
+    );
+
+    /*
+     * Noms des entreprises.
+     */
+    const companyRows = await client.query(
+      `SELECT id, name
+       FROM companies
+       WHERE id IN ($1,$2)`,
+      [fromCompanyId, toCompanyId]
+    );
+
+    const names = new Map(
+      companyRows.rows.map(row => [
+        Number(row.id),
+        row.name
+      ])
+    );
+
+    /*
+     * Identifiant transfert.
+     */
+    const idResult = await client.query(
+      `SELECT nextval(
+         pg_get_serial_sequence(
+           'intercompany_transfers',
+           'id'
+         )
+       ) AS id`
+    );
+
+    const transferId =
+      Number(idResult.rows[0].id);
+
+    const d = new Date();
+
+    const transferNumber =
+      `INT-${String(d.getFullYear()).slice(-2)}` +
+      `${String(d.getMonth()+1).padStart(2,"0")}` +
+      `${String(d.getDate()).padStart(2,"0")}-` +
+      `${String(transferId).padStart(6,"0")}`;
+
+    await client.query(
+      `INSERT INTO intercompany_transfers
+       (
+         id,
+         transfer_number,
+         from_company_id,
+         to_company_id,
+         amount,
+         currency,
+         operation_date,
+         reason,
+         status,
+         from_bank_id,
+         to_bank_id,
+         from_account_type,
+         to_account_type,
+         created_by
+       )
+       VALUES
+       (
+         $1,$2,$3,$4,$5,'FCFA',
+         CURRENT_DATE,$6,'VALIDATED',
+         $7,$8,$9,$10,$11
+       )`,
+      [
+        transferId,
+        transferNumber,
+        fromCompanyId,
+        toCompanyId,
+        amount,
+        reason,
+        fromAccountType === "BANK"
+          ? fromBankId
+          : null,
+        toAccountType === "BANK"
+          ? toBankId
+          : null,
+        fromAccountType,
+        toAccountType,
+        req.user.id
+      ]
+    );
+
+    /*
+     * Débit source.
+     */
+    if (fromAccountType === "BANK") {
+      await client.query(
+        `UPDATE accounting_banks
+         SET current_balance=
+               current_balance-$1,
+             updated_at=CURRENT_TIMESTAMP
+         WHERE id=$2
+           AND company_id=$3`,
+        [
+          amount,
+          fromBankId,
+          fromCompanyId
+        ]
+      );
+    } else {
+      await client.query(
+        `UPDATE treasury_accounts
+         SET current_balance=
+               current_balance-$1,
+             updated_by=$2,
+             updated_at=CURRENT_TIMESTAMP
+         WHERE company_id=$3`,
+        [
+          amount,
+          req.user.id,
+          fromCompanyId
+        ]
+      );
+    }
+
+    /*
+     * Crédit destination.
+     */
+    if (toAccountType === "BANK") {
+      await client.query(
+        `UPDATE accounting_banks
+         SET current_balance=
+               current_balance+$1,
+             updated_at=CURRENT_TIMESTAMP
+         WHERE id=$2
+           AND company_id=$3`,
+        [
+          amount,
+          toBankId,
+          toCompanyId
+        ]
+      );
+    } else {
+      await client.query(
+        `UPDATE treasury_accounts
+         SET current_balance=
+               current_balance+$1,
+             updated_by=$2,
+             updated_at=CURRENT_TIMESTAMP
+         WHERE company_id=$3`,
+        [
+          amount,
+          req.user.id,
+          toCompanyId
+        ]
+      );
+    }
+
+    const sourceNumber =
+      await nextAccountingNumber(
+        client,
+        "accounting_transactions",
+        "transaction_number",
+        "TRF",
+        fromCompanyId
+      );
+
+    const destinationNumber =
+      await nextAccountingNumber(
+        client,
+        "accounting_transactions",
+        "transaction_number",
+        "TRF",
+        toCompanyId
+      );
+
+    const fromName =
+      names.get(fromCompanyId) ||
+      `Société ${fromCompanyId}`;
+
+    const toName =
+      names.get(toCompanyId) ||
+      `Société ${toCompanyId}`;
+
+    const sourceTx = await client.query(
+      `INSERT INTO accounting_transactions
+       (
+         company_id,
+         transaction_number,
+         transaction_type,
+         source_type,
+         source_id,
+         bank_id,
+         amount,
+         direction,
+         category,
+         description,
+         source_label,
+         destination_label,
+         status,
+         created_by,
+         validated_by,
+         validated_at,
+         operation_date
+       )
+       VALUES
+       (
+         $1,$2,'transfert_inter_societes',
+         'intercompany_transfer',$3,$4,$5,
+         'sortie',
+         'Transfert inter-sociétés',
+         $6,$7,$8,
+         'validé',$9,$9,
+         CURRENT_TIMESTAMP,CURRENT_DATE
+       )
+       RETURNING *`,
+      [
+        fromCompanyId,
+        sourceNumber,
+        transferId,
+        fromAccountType === "BANK"
+          ? fromBankId
+          : null,
+        amount,
+        reason,
+        fromName,
+        toName,
+        req.user.id
+      ]
+    );
+
+    const destinationTx =
+      await client.query(
+        `INSERT INTO accounting_transactions
+         (
+           company_id,
+           transaction_number,
+           transaction_type,
+           source_type,
+           source_id,
+           bank_id,
+           amount,
+           direction,
+           category,
+           description,
+           source_label,
+           destination_label,
+           status,
+           created_by,
+           validated_by,
+           validated_at,
+           operation_date
+         )
+         VALUES
+         (
+           $1,$2,'transfert_inter_societes',
+           'intercompany_transfer',$3,$4,$5,
+           'entrée',
+           'Transfert inter-sociétés',
+           $6,$7,$8,
+           'validé',$9,$9,
+           CURRENT_TIMESTAMP,CURRENT_DATE
+         )
+         RETURNING *`,
+        [
+          toCompanyId,
+          destinationNumber,
+          transferId,
+          toAccountType === "BANK"
+            ? toBankId
+            : null,
+          amount,
+          reason,
+          fromName,
+          toName,
+          req.user.id
+        ]
+      );
+
+    await client.query(
+      `UPDATE intercompany_transfers
+       SET from_transaction_id=$1,
+           to_transaction_id=$2
+       WHERE id=$3`,
+      [
+        sourceTx.rows[0].id,
+        destinationTx.rows[0].id,
+        transferId
+      ]
+    );
+
+    /*
+     * Une écriture de suivi par société.
+     */
+    await createAccountingEntry(
+      client,
+      {
+        companyId: fromCompanyId,
+        sourceType: "intercompany_transfer",
+        sourceId: transferId,
+        accountLabel:
+          `Transfert vers ${toName}`,
+        debit: 0,
+        credit: amount,
+        description: reason,
+        createdBy: req.user.id
+      }
+    );
+
+    await createAccountingEntry(
+      client,
+      {
+        companyId: toCompanyId,
+        sourceType: "intercompany_transfer",
+        sourceId: transferId,
+        accountLabel:
+          `Transfert reçu de ${fromName}`,
+        debit: amount,
+        credit: 0,
+        description: reason,
+        createdBy: req.user.id
+      }
+    );
+
+    await client.query("COMMIT");
+
+    await logAudit(
+      req,
+      "create_intercompany_transfer",
+      "intercompany_transfer",
+      transferId,
+      {
+        from_company_id: fromCompanyId,
+        to_company_id: toCompanyId,
+        amount,
+        reason
+      }
+    );
+
+    res.status(201).json({
+      id: transferId,
+      transfer_number: transferNumber,
+      from_company_id: fromCompanyId,
+      to_company_id: toCompanyId,
+      amount,
+      reason
+    });
+
+  } catch (error) {
+    await client.query("ROLLBACK");
+
+    logAccountingError(
+      "POST /accounting/intercompany-transfers",
+      error,
+      req
+    );
+
+    res.status(
+      error.statusCode || 500
+    ).json({
+      error: accountingErrorMessage(
+        error,
+        "Erreur transfert inter-sociétés"
+      )
+    });
+  } finally {
+    client.release();
+  }
+});
+
+
 app.post("/accounting/transactions", authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -8056,6 +8722,27 @@ app.post("/accounting/transactions", authenticateToken, async (req, res) => {
     if (operation_date && !/^\d{4}-\d{2}-\d{2}$/.test(String(operation_date))) {
       return res.status(400).json({ error: "Date métier invalide (format AAAA-MM-JJ attendu)." });
     }
+    /*
+     * Une dépense comptable ne peut plus être créée directement.
+     * Workflow obligatoire :
+     * Demande -> Direction -> Comptabilité.
+     */
+    const directExpenseTypes = new Set([
+      "depense",
+      "paiement_fournisseur",
+      "salaire"
+    ]);
+
+    if (
+      direction === "sortie" &&
+      directExpenseTypes.has(String(transaction_type))
+    ) {
+      return res.status(409).json({
+        error:
+          "Dépense directe interdite. Créez une demande, faites-la valider par la Direction, puis effectuez le paiement depuis la demande validée."
+      });
+    }
+
     const bankId = normalizeOptionalId(bank_id);
     const caisseId = normalizeOptionalId(caisse_id);
 
@@ -8696,6 +9383,18 @@ app.put("/accounting/expense-requests/:id/status", authenticateToken, async (req
     if (status === "clôturé" && !proof_url && !request.proof_url) {
       await client.query("ROLLBACK");
       return res.status(400).json({ error: "Justificatif obligatoire pour clôturer." });
+    }
+
+    if (
+      status === "paiement_effectué" &&
+      request.status !== "validé"
+    ) {
+      await client.query("ROLLBACK");
+
+      return res.status(409).json({
+        error:
+          "Paiement impossible : validation Direction obligatoire."
+      });
     }
 
     if (status === "paiement_effectué" && request.status !== "paiement_effectué") {
