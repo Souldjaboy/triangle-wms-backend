@@ -149,45 +149,249 @@ module.exports = function createDisbursementsRouter(deps) {
     ).catch(() => {});
   }
 
-  // ---------- CRÉATION (aucun impact trésorerie) ----------
+  // ---------- CRÉATION MULTI-LIGNES (aucun impact trésorerie) ----------
   router.post("/disbursements", authenticateToken, permRequest("create"), async (req, res) => {
     const client = await pool.connect();
+
     try {
       const b = req.body || {};
-      const amount = Number(b.amount);
-      if (!(amount > 0)) return res.status(400).json({ error: "Montant demandé invalide." });
-      if (!String(b.reason || "").trim()) return res.status(400).json({ error: "Objet / motif obligatoire." });
-      const companyId = companyOf(req);
-      await client.query("BEGIN");
-      const number = await shortNumber(client, "DD", companyId);
-      const me = (await client.query(`SELECT fullname, role FROM users WHERE id=$1`, [req.user.id])).rows[0] || {};
-      const status = b.submit === true ? S.WAITING_DIR : S.DRAFT;
-      const { rows } = await client.query(
-        `INSERT INTO disbursement_requests
-           (company_id, request_number, requester_id, requester_name, requester_role, beneficiary_name, amount, category,
-            urgency, reason, status, payment_method, initial_attachment_url)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
-        [companyId, number, req.user.id, me.fullname || null, me.role || null,
-         String(b.beneficiary_name || "").trim() || null,
-         amount, b.category || null, b.urgency || "normale", String(b.reason).trim(), status,
-         b.payment_method || null, b.initial_attachment_url || null]
-      );
-      await audit(client, companyId, req.user.id, "create", rows[0].id, number, null, { status, amount }, req.ip);
-      await client.query("COMMIT");
-      if (status === S.WAITING_DIR) {
-        await notify(await usersWithCapability(companyId, "demande", DIRECTION_ROLES), {
-          company_id: companyId, type: "finance", title: "Demande de décaissement à valider",
-          message: `${number} — ${amount} FCFA — ${String(b.reason).slice(0, 60)}`,
-          related_entity_type: "disbursement_request", related_entity_id: rows[0].id,
-          action_url: `/direction?id=${rows[0].id}`, created_by: req.user.id, priority: "high",
+
+      /*
+       * Compatibilité :
+       * - nouveau frontend : b.lines[]
+       * - ancien frontend/API : amount/category/reason
+       */
+      const explicitLines = Array.isArray(b.lines) && b.lines.length > 0;
+
+      const rawLines = explicitLines
+        ? b.lines
+        : [{
+            category: b.category || null,
+            label: b.reason || "",
+            amount: b.amount,
+          }];
+
+      if (rawLines.length > 50) {
+        return res.status(400).json({
+          error: "Une demande ne peut pas contenir plus de 50 lignes."
         });
       }
-      res.status(201).json({ ...rows[0], treasury_impacted: false });
+
+      const lines = [];
+
+      for (let i = 0; i < rawLines.length; i += 1) {
+        const raw = rawLines[i] || {};
+
+        const category =
+          String(raw.category || "").trim() || "Non catégorisé";
+
+        const label =
+          String(
+            raw.label ||
+            raw.reason ||
+            raw.description ||
+            ""
+          ).trim();
+
+        const lineAmount = Number(raw.amount);
+
+        if (!label) {
+          return res.status(400).json({
+            error: `Libellé obligatoire à la ligne ${i + 1}.`
+          });
+        }
+
+        if (!(lineAmount > 0)) {
+          return res.status(400).json({
+            error: `Montant invalide à la ligne ${i + 1}.`
+          });
+        }
+
+        lines.push({
+          line_no: i + 1,
+          category,
+          label,
+          amount: lineAmount,
+        });
+      }
+
+      if (lines.length === 0) {
+        return res.status(400).json({
+          error: "Ajoutez au moins une ligne à la demande."
+        });
+      }
+
+      const amount = lines.reduce(
+        (sum, line) => sum + Number(line.amount),
+        0
+      );
+
+      if (!(amount > 0)) {
+        return res.status(400).json({
+          error: "Montant total invalide."
+        });
+      }
+
+      const reason =
+        String(b.reason || "").trim() ||
+        lines[0].label;
+
+      if (!reason) {
+        return res.status(400).json({
+          error: "Objet / motif obligatoire."
+        });
+      }
+
+      const companyId = companyOf(req);
+
+      await client.query("BEGIN");
+
+      const number = await shortNumber(
+        client,
+        "DD",
+        companyId
+      );
+
+      const me = (
+        await client.query(
+          `SELECT fullname, role
+             FROM users
+            WHERE id=$1`,
+          [req.user.id]
+        )
+      ).rows[0] || {};
+
+      const status =
+        b.submit === true
+          ? S.WAITING_DIR
+          : S.DRAFT;
+
+      const parentCategory =
+        lines.length === 1
+          ? lines[0].category
+          : "Multi-catégories";
+
+      const { rows } = await client.query(
+        `INSERT INTO disbursement_requests
+           (
+             company_id,
+             request_number,
+             requester_id,
+             requester_name,
+             requester_role,
+             beneficiary_name,
+             amount,
+             category,
+             urgency,
+             reason,
+             status,
+             payment_method,
+             initial_attachment_url
+           )
+         VALUES
+           ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+         RETURNING *`,
+        [
+          companyId,
+          number,
+          req.user.id,
+          me.fullname || null,
+          me.role || null,
+          String(b.beneficiary_name || "").trim() || null,
+          amount,
+          parentCategory,
+          b.urgency || "normale",
+          reason,
+          status,
+          b.payment_method || null,
+          b.initial_attachment_url || null,
+        ]
+      );
+
+      const request = rows[0];
+
+      for (const line of lines) {
+        await client.query(
+          `INSERT INTO disbursement_request_lines
+             (
+               company_id,
+               request_id,
+               line_no,
+               category,
+               label,
+               amount
+             )
+           VALUES ($1,$2,$3,$4,$5,$6)`,
+          [
+            companyId,
+            request.id,
+            line.line_no,
+            line.category,
+            line.label,
+            line.amount,
+          ]
+        );
+      }
+
+      await audit(
+        client,
+        companyId,
+        req.user.id,
+        "create",
+        request.id,
+        number,
+        null,
+        {
+          status,
+          amount,
+          lines,
+        },
+        req.ip
+      );
+
+      await client.query("COMMIT");
+
+      if (status === S.WAITING_DIR) {
+        await notify(
+          await usersWithCapability(
+            companyId,
+            "finance.direction",
+            DIRECTION_ROLES
+          ),
+          {
+            company_id: companyId,
+            type: "finance",
+            title: "Demande de décaissement à valider",
+            message:
+              `${number} — ${amount} FCFA — ` +
+              `${lines.length} ligne(s) — ` +
+              `${reason.slice(0, 60)}`,
+            related_entity_type: "disbursement_request",
+            related_entity_id: request.id,
+            action_url: `/direction?id=${request.id}`,
+            created_by: req.user.id,
+            priority: "high",
+          }
+        );
+      }
+
+      res.status(201).json({
+        ...request,
+        lines,
+        treasury_impacted: false,
+      });
+
     } catch (e) {
       await client.query("ROLLBACK").catch(() => {});
       console.error("disbursements create:", e);
-      res.status(500).json({ error: "Erreur création de la demande." });
-    } finally { client.release(); }
+
+      res.status(500).json({
+        error: "Erreur création de la demande."
+      });
+
+    } finally {
+      client.release();
+    }
   });
 
   // ---------- LISTE / DÉTAIL ----------
@@ -435,7 +639,28 @@ module.exports = function createDisbursementsRouter(deps) {
            LEFT JOIN users u ON u.id=a.user_id
           WHERE a.company_id=$1 AND a.entity='disbursement_request' AND a.entity_id=$2 ORDER BY a.created_at`, [companyId, req.params.id]
       )).rows;
-      res.json({ request, receipts, refunds, amounts: await amountsOf(companyId, req.params.id), history });
+      const lines = (await pool.query(
+        `SELECT
+           id,
+           line_no,
+           category,
+           label,
+           amount
+         FROM disbursement_request_lines
+         WHERE request_id=$1
+           AND company_id=$2
+         ORDER BY line_no`,
+        [req.params.id, companyId]
+      )).rows;
+
+      res.json({
+        request: { ...request, lines },
+        lines,
+        receipts,
+        refunds,
+        amounts: await amountsOf(companyId, req.params.id),
+        history
+      });
     } catch (e) { console.error(e); res.status(500).json({ error: "Erreur détail." }); }
   });
 
