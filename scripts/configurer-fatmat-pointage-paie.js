@@ -1,7 +1,8 @@
 "use strict";
 
 /**
- * CONFIGURER LE POINTAGE ET LA PAIE DE FAT & MAT — HORAIRE, 9 EMPLOYÉS, ISSA.
+ * CONFIGURER LE POINTAGE ET LA PAIE DE FAT & MAT — HORAIRE, 9 EMPLOYÉS,
+ * ISSA ET DJOULÉDÉ OPÉRATEURS.
  *
  *   node scripts/configurer-fatmat-pointage-paie.js --preview
  *
@@ -40,9 +41,10 @@
  *   4. Les 9 employés (attendance_employees + attendance_salary_settings_v2) :
  *      créés s'ils n'existent pas, mis à jour (salaire, poste) s'ils existent
  *      déjà sous une identité certaine. Jamais de doublon.
- *   5. Issa Diallo comme OPÉRATEUR de pointage (attendance_operator_scopes,
- *      can_punch=true) sur le site FAT & MAT — jamais comme lecteur de
- *      salaires (attendance_salary_viewers n'est jamais touché pour lui).
+ *   5. Issa Diallo et Djoulédé Traoré comme OPÉRATEURS de pointage
+ *      (attendance_operator_scopes, can_punch=true) sur le site FAT & MAT —
+ *      jamais comme lecteurs de salaires (attendance_salary_viewers n'est
+ *      jamais modifié par ce script).
  *
  * Total net certifié : 775 000 FCFA (595 000 de base + 180 000
  * d'indemnités/rations). Le script refuse d'écrire si son propre calcul, à
@@ -66,7 +68,7 @@ const TOTAL_NET_CERTIFIE = 775000;
    775 000 au total. */
 const EMPLOYES_CERTIFIES = [
   { nom: "Issa Diallo", telephone: "77 11 30 98", poste: "Responsable de FAT & MAT",
-    base: 125000, indemnite: 0, estIssa: true },
+    base: 125000, indemnite: 0, operateur: true },
   { nom: "Drissa Togo", telephone: "93 99 43 02", poste: "Chauffeur", base: 100000, indemnite: 30000 },
   { nom: "Moussa Boujare", telephone: "79 15 43 63", poste: "Chauffeur", base: 100000, indemnite: 30000 },
   { nom: "Sidiki Dembele", telephone: null, poste: "Apprenti", base: 15000, indemnite: 0 },
@@ -74,7 +76,8 @@ const EMPLOYES_CERTIFIES = [
   { nom: "Abou Coulibali", telephone: null, poste: "Apprenti", base: 15000, indemnite: 0 },
   { nom: "Dougakoro Coulibali", telephone: "71 11 80 84", poste: "Chauffeur", base: 100000, indemnite: 90000 },
   { nom: "Siaka Dembele", telephone: "79 79 78 49", poste: "Chauffeur", base: 100000, indemnite: 30000 },
-  { nom: "Djoulédé Traoré", telephone: "91 91 64 79", poste: "Stagiaire", base: 25000, indemnite: 0 },
+  { nom: "Djoulédé Traoré", telephone: "91 91 64 79", poste: "Stagiaire",
+    base: 25000, indemnite: 0, operateur: true },
 ];
 
 const HORAIRE = { code: "FATMAT-STD", nom: "Horaire standard FAT & MAT",
@@ -169,24 +172,21 @@ async function main() {
     console.log(`\n${G}SOCIÉTÉ CIBLÉE${Z}`);
     console.log(`  #${societe.id} — ${societe.name}`);
 
-    const issaCertifie = EMPLOYES_CERTIFIES.find((e) => e.estIssa);
-    const { correspondances: issaComptes } = await resoudreUtilisateurParTelephone(
-      client, societe.id, issaCertifie.telephone);
-
-    console.log(`\n${G}COMPTE D'ISSA DIALLO${Z}`);
-    if (issaComptes.length === 0) {
-      console.log(`  ${J}Aucun compte de la société #${societe.id} n'a le téléphone ${issaCertifie.telephone}.${Z}`);
-      console.log(`  Il sera créé sans compte de connexion lié ; l'accès opérateur ne pourra pas`);
-      console.log(`  être accordé tant qu'aucun compte ne portera ce téléphone.`);
-    } else if (issaComptes.length > 1) {
-      stop(`  Plusieurs comptes de la société #${societe.id} portent le téléphone `
-        + `${issaCertifie.telephone} : ${issaComptes.map((u) => `#${u.id} ${u.fullname} <${u.email}>`).join(", ")}. `
-        + "Ambiguïté : arrêt, aucune écriture.");
-    } else {
-      console.log(`  ${V}#${issaComptes[0].id} — ${issaComptes[0].fullname} <${issaComptes[0].email}> `
-        + `— rôle ${issaComptes[0].role}${Z}`);
+    const operateurs = [];
+    console.log(`\n${G}COMPTES DES OPÉRATEURS DE POINTAGE${Z}`);
+    for (const personne of EMPLOYES_CERTIFIES.filter((e) => e.operateur)) {
+      const { correspondances } = await resoudreUtilisateurParTelephone(
+        client, societe.id, personne.telephone);
+      if (correspondances.length !== 1) {
+        stop(`${personne.nom} : téléphone certifié ${personne.telephone}, `
+          + `${correspondances.length} compte(s) exact(s) trouvé(s) dans FAT & MAT. `
+          + "Il faut exactement un compte : arrêt, aucune écriture.");
+      }
+      const compte = correspondances[0];
+      operateurs.push({ personne, compte });
+      console.log(`  ${V}#${compte.id} — ${compte.fullname} <${compte.email}> `
+        + `— téléphone exact ${personne.telephone}${Z}`);
     }
-    const issaUserId = issaComptes[0]?.id || null;
 
     // ── Horaire ─────────────────────────────────────────────────────────
     console.log(`\n${G}GROUPE HORAIRE${Z}`);
@@ -244,30 +244,29 @@ async function main() {
       if (existant && netExistant !== netAttendu) {
         console.log(`      ${J}salaire à corriger : ${netExistant ?? "non défini"} → ${netAttendu}${Z}`);
       }
-      if (personne.estIssa && existant && issaUserId && existant.user_id && Number(existant.user_id) !== Number(issaUserId)) {
-        stop(`\nL'employé Issa Diallo (#${existant.id}) est déjà lié à un AUTRE compte `
-          + `(#${existant.user_id}) que celui trouvé par téléphone (#${issaUserId}). Ambiguïté : arrêt.`);
+      const compteOperateur = operateurs.find((o) => o.personne === personne)?.compte;
+      if (compteOperateur && existant?.user_id && Number(existant.user_id) !== Number(compteOperateur.id)) {
+        stop(`\nL'employé ${personne.nom} (#${existant.id}) est déjà lié à un AUTRE compte `
+          + `(#${existant.user_id}) que celui trouvé par téléphone (#${compteOperateur.id}). Ambiguïté : arrêt.`);
       }
     }
 
-    // ── Opérateur : Issa peut pointer, jamais automatiquement les salaires ──
-    console.log(`\n${G}DROIT D'OPÉRATEUR D'ISSA (pointer, jamais voir les salaires)${Z}`);
-    if (!issaUserId) {
-      console.log(`  ${J}ignoré : aucun compte utilisateur résolu pour Issa (voir plus haut).${Z}`);
-    } else {
+    // ── Opérateurs : pointage global, jamais automatiquement les salaires ──
+    console.log(`\n${G}DROITS DES OPÉRATEURS (pointer, jamais voir les salaires)${Z}`);
+    for (const { personne, compte } of operateurs) {
       const { rows: scopeExistant } = await client.query(
         `SELECT * FROM attendance_operator_scopes
-          WHERE company_id = $1 AND operator_user_id = $2`, [societe.id, issaUserId]);
+          WHERE company_id = $1 AND operator_user_id = $2`, [societe.id, compte.id]);
       const { rows: dejaSalaire } = await client.query(
         `SELECT 1 FROM attendance_salary_viewers WHERE company_id = $1 AND user_id = $2`,
-        [societe.id, issaUserId]);
+        [societe.id, compte.id]);
       console.log(scopeExistant.length
-        ? `  ${V}déjà opérateur${Z} sur ${scopeExistant.length} site(s)`
-        : `  ${J}à accorder${Z} : opérateur (can_punch) sur le site FAT & MAT`);
+        ? `  ${personne.nom}: ${V}déjà opérateur${Z} sur ${scopeExistant.length} site(s)`
+        : `  ${personne.nom}: ${J}à accorder${Z} — opérateur (can_punch) sur le site FAT & MAT`);
       console.log(dejaSalaire.length
-        ? `  ${R}attention : Issa a par ailleurs déjà un accès aux salaires (attendance_salary_viewers) — `
+        ? `  ${R}attention : ${personne.nom} a déjà un accès aux salaires (attendance_salary_viewers) — `
           + `non touché par ce script, à vérifier séparément si ce n'est pas voulu.${Z}`
-        : `  ${V}confirmé${Z} : aucun accès aux salaires ne sera accordé à Issa par ce script.`);
+        : `  ${V}confirmé${Z} : aucun accès aux salaires ne sera accordé par ce script.`);
     }
 
     if (PREVIEW) {
@@ -335,7 +334,7 @@ async function main() {
                   user_id = COALESCE(user_id, $5), updated_at = CURRENT_TIMESTAMP
             WHERE id = $6 AND company_id = $7`,
           [personne.poste, personne.telephone || "", siteId, horaireId,
-           personne.estIssa ? issaUserId : null, employeId, societe.id]);
+           operateurs.find((o) => o.personne === personne)?.compte.id || null, employeId, societe.id]);
       } else {
         const { rows: num } = await client.query(
           `SELECT COALESCE(MAX(employee_number), 0) + 1 AS n FROM attendance_employees WHERE company_id = $1`,
@@ -344,7 +343,8 @@ async function main() {
           `INSERT INTO attendance_employees
              (company_id, employee_number, full_name, user_id, site_id, schedule_id, job_title, phone, active)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,true) RETURNING id`,
-          [societe.id, num[0].n, personne.nom, personne.estIssa ? issaUserId : null,
+          [societe.id, num[0].n, personne.nom,
+           operateurs.find((o) => o.personne === personne)?.compte.id || null,
            siteId, horaireId, personne.poste, personne.telephone || ""])).rows[0].id;
       }
 
@@ -369,12 +369,12 @@ async function main() {
       resultatEmployes.push({ nom: personne.nom, employeId, net: netAttendu, cree: !existant });
     }
 
-    if (issaUserId) {
+    for (const { compte } of operateurs) {
       await client.query(
         `INSERT INTO attendance_operator_scopes (company_id, operator_user_id, site_id, can_punch)
          VALUES ($1,$2,$3,true)
          ON CONFLICT (company_id, operator_user_id, site_id) DO UPDATE SET can_punch = true`,
-        [societe.id, issaUserId, siteId]);
+        [societe.id, compte.id, siteId]);
     }
 
     /* Contrôle final : rien n'a été écrit hors du périmètre de cette

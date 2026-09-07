@@ -73,7 +73,7 @@ module.exports = function createAccesSocietesRouter(deps) {
         if (!compte[0]) return res.status(404).json({ error: "Compte introuvable." });
 
         const { rows: habilitations } = await pool.query(
-          `SELECT a.company_id, c.name AS company_name, a.reason, a.active,
+          `SELECT a.company_id, c.name AS company_name, a.reason, a.is_active AS active,
                   a.created_at, a.updated_at, u.fullname AS granted_by_name
              FROM user_company_access a
              JOIN companies c ON c.id = a.company_id

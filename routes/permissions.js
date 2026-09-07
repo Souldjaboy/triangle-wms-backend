@@ -105,7 +105,7 @@ module.exports = function createPermissionsRouter(deps) {
           AND (
             u.company_id = $2
             OR EXISTS (SELECT 1 FROM user_company_access a
-                        WHERE a.user_id = u.id AND a.company_id = $2 AND a.active)
+                        WHERE a.user_id = u.id AND a.company_id = $2 AND a.is_active)
           )
           /* Le cloisonnement de version prime : une habilitation ne fait
              jamais franchir la frontière d'un tenant. */
@@ -176,7 +176,7 @@ module.exports = function createPermissionsRouter(deps) {
           WHERE (
                   u.company_id = $1
                   OR EXISTS (SELECT 1 FROM user_company_access a
-                              WHERE a.user_id = u.id AND a.company_id = $1 AND a.active)
+                              WHERE a.user_id = u.id AND a.company_id = $1 AND a.is_active)
                 )
             AND (COALESCE(u.tenant_id, '') = COALESCE(c.tenant_id, '')
                  OR u.tenant_id IS NULL OR c.tenant_id IS NULL)

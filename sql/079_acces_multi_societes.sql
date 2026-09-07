@@ -33,23 +33,47 @@ CREATE TABLE IF NOT EXISTS user_company_access (
      tard, quand personne ne se souvient de la décision. */
   reason      TEXT NOT NULL DEFAULT '',
   granted_by  INTEGER REFERENCES users(id) ON DELETE SET NULL,
-  active      BOOLEAN NOT NULL DEFAULT true,
+  is_active   BOOLEAN NOT NULL DEFAULT true,
+  is_default  BOOLEAN NOT NULL DEFAULT false,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Compatibilité avec les installations antérieures où user_company_access
+-- existait déjà avant cette migration.
+ALTER TABLE user_company_access
+  ADD COLUMN IF NOT EXISTS reason TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE user_company_access
+  ADD COLUMN IF NOT EXISTS granted_by INTEGER REFERENCES users(id) ON DELETE SET NULL;
+
+ALTER TABLE user_company_access
+  ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT true;
+
+ALTER TABLE user_company_access
+  ADD COLUMN IF NOT EXISTS is_default BOOLEAN NOT NULL DEFAULT false;
 
 /* Une seule ligne par couple : accorder deux fois le même accès ne doit pas
    créer un doublon que la révocation oublierait ensuite à moitié. */
 DO $$
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'user_company_access_user_company_key') THEN
+  IF NOT EXISTS (
+    SELECT 1
+      FROM pg_constraint
+     WHERE conrelid = 'public.user_company_access'::regclass
+       AND contype = 'u'
+       AND conname IN (
+         'user_company_access_user_company_key',
+         'user_company_access_user_id_company_id_key'
+       )
+  ) THEN
     ALTER TABLE user_company_access
       ADD CONSTRAINT user_company_access_user_company_key UNIQUE (user_id, company_id);
   END IF;
 END $$;
 
 CREATE INDEX IF NOT EXISTS idx_user_company_access_user
-  ON user_company_access (user_id) WHERE active;
+  ON user_company_access (user_id) WHERE is_active;
 
 -- ═════════════════════════════════════════════════════════════════════════
 -- JOURNAL DES HABILITATIONS

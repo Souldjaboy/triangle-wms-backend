@@ -81,7 +81,7 @@ async function societesAccessibles(pool, user, tenantId = null) {
        FROM user_company_access a
        JOIN companies c ON c.id = a.company_id
       WHERE a.user_id = $1
-        AND a.active
+        AND a.is_active
         AND COALESCE(c.status,'active') <> 'deleted'
         AND ($2::text IS NULL OR COALESCE(c.tenant_id,'') = $2 OR c.tenant_id IS NULL)`,
     [userId, tenantId]
@@ -101,10 +101,10 @@ async function societesAccessibles(pool, user, tenantId = null) {
  */
 async function accorder(client, { userId, companyId, reason, performedBy, performedByName }) {
   const { rows } = await client.query(
-    `INSERT INTO user_company_access (user_id, company_id, reason, granted_by, active)
+    `INSERT INTO user_company_access (user_id, company_id, reason, granted_by, is_active)
      VALUES ($1,$2,$3,$4,true)
      ON CONFLICT (user_id, company_id)
-     DO UPDATE SET active = true, reason = EXCLUDED.reason,
+     DO UPDATE SET is_active = true, reason = EXCLUDED.reason,
                    granted_by = EXCLUDED.granted_by, updated_at = now()
      RETURNING id, (xmax = 0) AS creation`,
     [userId, companyId, String(reason || ""), performedBy || null]
@@ -123,8 +123,8 @@ async function accorder(client, { userId, companyId, reason, performedBy, perfor
 /** Révoque sans effacer : la ligne reste, désactivée, et le journal la garde. */
 async function revoquer(client, { userId, companyId, reason, performedBy, performedByName }) {
   const { rowCount } = await client.query(
-    `UPDATE user_company_access SET active = false, updated_at = now()
-      WHERE user_id = $1 AND company_id = $2 AND active`,
+    `UPDATE user_company_access SET is_active = false, updated_at = now()
+      WHERE user_id = $1 AND company_id = $2 AND is_active`,
     [userId, companyId]
   );
   if (rowCount) {

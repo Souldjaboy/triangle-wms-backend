@@ -25,12 +25,34 @@ module.exports = function createDisbursementsRouter(deps) {
   const { pool, authenticateToken, getEffectiveCompanyId, requirePermission,
           createNotification, accounting, upload, rbacHelper } = deps;
   const router = express.Router();
-  const companyOf = (req) => getEffectiveCompanyId(req, req.user.company_id);
-  // Permissions : finance.request (création/suivi), finance.direction (validation),
-  // finance.disbursement (exécution). Toutes via le moteur RBAC (pas de rôle en dur).
-  const permRequest = (a) => requirePermission("finance.request", a);
-  const permDirection = (a) => requirePermission("finance.direction", a);
-  const permDisburse = (a) => requirePermission("finance.disbursement", a);
+  /*
+   * Société EFFECTIVE de la demande.
+   *
+   * Le frontend envoie x-active-company-id lorsqu'un compte bascule
+   * Triangle <-> FAT & MAT. getEffectiveCompanyId contrôle que cette société
+   * fait réellement partie des sociétés autorisées du compte.
+   *
+   * On ne lit jamais req.body.company_id ici : le navigateur ne doit pas
+   * pouvoir forcer arbitrairement la société d'une demande.
+   */
+  const companyOf = (req) => {
+    const companyId = Number(
+      getEffectiveCompanyId(req, req.user?.company_id)
+    );
+
+    if (!Number.isInteger(companyId) || companyId <= 0) {
+      const error = new Error("Société active impossible à déterminer.");
+      error.code = "ACTIVE_COMPANY_REQUIRED";
+      throw error;
+    }
+
+    return companyId;
+  };
+  // Clés présentes dans le catalogue administrable :
+  // demande = création/suivi/validation Direction ; comptabilite = décaissement réel.
+  const permRequest = (a) => requirePermission("demande", a);
+  const permDirection = (a) => requirePermission("demande", a);
+  const permDisburse = (a) => requirePermission("comptabilite", a);
 
   async function notify(userIds, payload) {
     if (!createNotification) return;
@@ -38,13 +60,46 @@ module.exports = function createDisbursementsRouter(deps) {
       try { await createNotification({ ...payload, user_id: uid }); } catch { /* non bloquant */ }
     }
   }
-  /* Destinataires par capacité (permission explicite, sinon rôles de repli). */
+  /* Permission effective : exception personnelle, puis rôle de la société,
+     puis rôles historiques seulement si aucune règle n'est configurée. */
+  async function hasCapability(user, companyId, moduleKey, action, fallbackRoles) {
+    if (rbacHelper && rbacHelper.isSuperAdmin(user)) return true;
+    const { rows } = await pool.query(
+      `SELECT
+         upo.effect AS user_effect,
+         rp.allowed AS role_allowed
+       FROM (SELECT 1) base
+       LEFT JOIN user_permission_overrides upo
+         ON upo.company_id=$1 AND upo.user_id=$2
+        AND upo.module_key=$3 AND upo.action=$4
+       LEFT JOIN role_permissions rp
+         ON rp.company_id=$1 AND lower(rp.role)=lower($5)
+        AND rp.module_key=$3 AND rp.action=$4`,
+      [companyId, user.id, moduleKey, action, String(user.role || "")]
+    );
+    const configured = rows[0] || {};
+    if (configured.user_effect != null) return configured.user_effect === "ALLOW";
+    if (configured.role_allowed != null) return configured.role_allowed === true;
+    return fallbackRoles.includes(String(user.role || "").toLowerCase().trim());
+  }
+
+  /* Destinataires par capacité, avec la même priorité que /permissions/me. */
   async function usersWithCapability(companyId, moduleKey, fallbackRoles) {
     const { rows } = await pool.query(
-      `SELECT DISTINCT u.id FROM users u
-         LEFT JOIN user_permissions p ON p.user_id=u.id AND p.module_key=$2
-        WHERE u.company_id=$1
-          AND (p.can_validate = TRUE OR (p.can_validate IS NULL AND lower(u.role) = ANY($3)))`,
+      `SELECT DISTINCT u.id
+         FROM users u
+         LEFT JOIN user_permission_overrides upo
+           ON upo.company_id=$1 AND upo.user_id=u.id
+          AND upo.module_key=$2 AND upo.action='validate'
+         LEFT JOIN role_permissions rp
+           ON rp.company_id=$1 AND lower(rp.role)=lower(u.role)
+          AND rp.module_key=$2 AND rp.action='validate'
+        WHERE u.company_id=$1 AND u.is_active=true
+          AND CASE
+            WHEN upo.effect IS NOT NULL THEN upo.effect='ALLOW'
+            WHEN rp.allowed IS NOT NULL THEN rp.allowed=true
+            ELSE lower(u.role)=ANY($3)
+          END`,
       [companyId, moduleKey, fallbackRoles]
     );
     return rows.map((r) => r.id);
@@ -53,17 +108,12 @@ module.exports = function createDisbursementsRouter(deps) {
 
   /* Voit-il TOUTES les demandes de l'entreprise ? Oui si une permission de
      Direction ou de Décaissement lui est accordée (explicitement ou par rôle).
-     Sinon : il ne voit que les siennes (finance.request.view_own implicite). */
+     Sinon : il ne voit que les siennes (demande.view personnel). */
   async function canSeeAll(req) {
     if (rbacHelper && rbacHelper.isSuperAdmin(req.user)) return true;
-    const perms = await pool.query(
-      `SELECT module_key, can_view FROM user_permissions WHERE user_id=$1 AND module_key IN ('finance.direction','finance.disbursement')`,
-      [req.user.id]
-    );
-    if (perms.rows.some((r) => r.can_view === true)) return true;
-    if (perms.rows.length > 0) return false; // configuré explicitement -> refus
-    const role = String(req.user.role || "").toLowerCase().trim();
-    return [...DIRECTION_ROLES, ...ACCOUNTING_ROLES].includes(role);
+    const companyId = companyOf(req);
+    if (await hasCapability(req.user, companyId, "demande", "validate", DIRECTION_ROLES)) return true;
+    return hasCapability(req.user, companyId, "comptabilite", "view", ACCOUNTING_ROLES);
   }
 
   /* Garde de périmètre : une demande hors périmètre renvoie 404 (on ne révèle
@@ -125,7 +175,7 @@ module.exports = function createDisbursementsRouter(deps) {
       await audit(client, companyId, req.user.id, "create", rows[0].id, number, null, { status, amount }, req.ip);
       await client.query("COMMIT");
       if (status === S.WAITING_DIR) {
-        await notify(await usersWithCapability(companyId, "finance.direction", DIRECTION_ROLES), {
+        await notify(await usersWithCapability(companyId, "demande", DIRECTION_ROLES), {
           company_id: companyId, type: "finance", title: "Demande de décaissement à valider",
           message: `${number} — ${amount} FCFA — ${String(b.reason).slice(0, 60)}`,
           related_entity_type: "disbursement_request", related_entity_id: rows[0].id,
@@ -175,7 +225,7 @@ module.exports = function createDisbursementsRouter(deps) {
       const { rows } = await client.query(`UPDATE disbursement_requests SET status=$3, updated_at=NOW() WHERE id=$1 AND company_id=$2 RETURNING *`, [cur.id, companyId, S.WAITING_DIR]);
       await audit(client, companyId, req.user.id, "submit", cur.id, cur.request_number, { status: cur.status }, { status: S.WAITING_DIR }, req.ip);
       await client.query("COMMIT");
-      await notify(await usersWithCapability(companyId, "finance.direction", DIRECTION_ROLES), {
+      await notify(await usersWithCapability(companyId, "demande", DIRECTION_ROLES), {
         company_id: companyId, type: "finance", title: "Demande de décaissement à valider",
         message: `${cur.request_number} — ${cur.amount} FCFA`, related_entity_type: "disbursement_request",
         related_entity_id: cur.id, action_url: `/direction?id=${cur.id}`, created_by: req.user.id, priority: "high",
@@ -206,7 +256,7 @@ module.exports = function createDisbursementsRouter(deps) {
       await audit(client, companyId, req.user.id, "approve", cur.id, cur.request_number, { status: cur.status }, { status: S.WAITING_DISB }, req.ip);
       await client.query("COMMIT");
       // La demande apparaît AUTOMATIQUEMENT chez le comptable (statut EN_ATTENTE_DECAISSEMENT).
-      await notify([cur.requester_id, ...(await usersWithCapability(companyId, "finance.disbursement", ACCOUNTING_ROLES))], {
+      await notify([cur.requester_id, ...(await usersWithCapability(companyId, "comptabilite", ACCOUNTING_ROLES))], {
         company_id: companyId, type: "finance", title: "Décaissement à effectuer",
         message: `${cur.request_number} validée par la Direction — ${cur.amount} FCFA à décaisser.`,
         related_entity_type: "disbursement_request", related_entity_id: cur.id,
@@ -341,7 +391,7 @@ module.exports = function createDisbursementsRouter(deps) {
         [req.params.id, companyId, url, S.WAITING_RECEIPTS, S.RECEIPTS_UPLOADED]
       );
       if (!rows[0]) return res.status(404).json({ error: "Demande introuvable." });
-      await notify(await usersWithCapability(companyId, "finance.disbursement", ACCOUNTING_ROLES), {
+      await notify(await usersWithCapability(companyId, "comptabilite", ACCOUNTING_ROLES), {
         company_id: companyId, type: "finance", title: "Justificatif déposé",
         message: `${rows[0].request_number} : justificatif à contrôler.`,
         related_entity_type: "disbursement_request", related_entity_id: rows[0].id,
@@ -411,7 +461,7 @@ module.exports = function createDisbursementsRouter(deps) {
          WHERE id=$1 AND company_id=$2`,
         [cur.id, companyId, url, S.WAITING_RECEIPTS, S.RECEIPTS_UPLOADED]
       );
-      await notify(await usersWithCapability(companyId, "finance.disbursement", ACCOUNTING_ROLES), {
+      await notify(await usersWithCapability(companyId, "comptabilite", ACCOUNTING_ROLES), {
         company_id: companyId, type: "finance", title: "Justificatif à contrôler",
         message: `${cur.request_number} : justificatif de ${amount} FCFA déposé.`,
         related_entity_type: "disbursement_request", related_entity_id: cur.id,

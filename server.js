@@ -7485,7 +7485,8 @@ async function createAccountingEntry(client, {
   debit = 0,
   credit = 0,
   description = "",
-  createdBy = null
+  createdBy = null,
+  entryDate = null
 }) {
   const entryNumber = await nextAccountingNumber(
     client,
@@ -7497,12 +7498,13 @@ async function createAccountingEntry(client, {
 
   await client.query(
     `INSERT INTO accounting_entries
-     (company_id, entry_number, source_type, source_id, account_label,
+     (company_id, entry_number, entry_date, source_type, source_id, account_label,
       debit, credit, description, created_by)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+     VALUES ($1,$2,COALESCE($3::date,CURRENT_DATE),$4,$5,$6,$7,$8,$9,$10)`,
     [
       companyId,
       entryNumber,
+      entryDate,
       sourceType,
       sourceId,
       accountLabel,
@@ -7520,7 +7522,8 @@ async function createJournalEntry(client, {
   moduleSource,
   sourceId,
   lines,
-  createdBy = null
+  createdBy = null,
+  entryDate = null
 }) {
   const normalizedLines = (lines || []).map((line) => ({
     ...line,
@@ -7545,10 +7548,10 @@ async function createJournalEntry(client, {
   );
   const entryResult = await client.query(
     `INSERT INTO journal_entries
-     (company_id, entry_number, label, module_source, source_id, created_by)
-     VALUES ($1,$2,$3,$4,$5,$6)
+     (company_id, entry_number, entry_date, label, module_source, source_id, created_by)
+     VALUES ($1,$2,COALESCE($3::date,CURRENT_DATE),$4,$5,$6,$7)
      RETURNING *`,
-    [companyId, entryNumber, label, moduleSource, sourceId, createdBy]
+    [companyId, entryNumber, entryDate, label, moduleSource, sourceId, createdBy]
   );
 
   for (const line of normalizedLines) {
@@ -7985,6 +7988,45 @@ app.get("/accounting/transactions", authenticateToken, async (req, res) => {
   }
 });
 
+app.get("/accounting/historical-imports", authenticateToken, async (req, res) => {
+  try {
+    if (!canViewAccounting(req.user)) return res.status(403).json({ error: "Accès comptabilité refusé." });
+    const { values, filter } = getAccountingScope(req, false);
+    const result = await pool.query(
+      `SELECT i.*,
+              COUNT(l.id)::int AS line_count,
+              COUNT(l.id) FILTER (WHERE l.status='TO_REVIEW')::int AS review_count,
+              COUNT(l.id) FILTER (WHERE l.status='INCOMPLETE')::int AS incomplete_count
+         FROM accounting_historical_imports i
+         LEFT JOIN accounting_historical_lines l ON l.import_id=i.id AND l.company_id=i.company_id
+         ${filter ? "WHERE i.company_id=$1" : ""}
+        GROUP BY i.id
+        ORDER BY i.applied_at DESC NULLS LAST, i.id DESC`, values);
+    res.json(result.rows);
+  } catch (error) {
+    logAccountingError("GET /accounting/historical-imports", error, req);
+    res.status(500).json({ error: "Erreur lecture imports comptables" });
+  }
+});
+
+app.get("/accounting/intercompany-transfers", authenticateToken, async (req, res) => {
+  try {
+    if (!canViewAccounting(req.user)) return res.status(403).json({ error: "Accès comptabilité refusé." });
+    const { companyId } = getAccountingScope(req, true);
+    const result = await pool.query(
+      `SELECT t.*, cf.name AS from_company_name, ct.name AS to_company_name
+         FROM intercompany_transfers t
+         JOIN companies cf ON cf.id=t.from_company_id
+         JOIN companies ct ON ct.id=t.to_company_id
+        WHERE t.from_company_id=$1 OR t.to_company_id=$1
+        ORDER BY t.operation_date DESC, t.id DESC`, [companyId]);
+    res.json(result.rows);
+  } catch (error) {
+    logAccountingError("GET /accounting/intercompany-transfers", error, req);
+    res.status(500).json({ error: "Erreur lecture avances inter-sociétés" });
+  }
+});
+
 app.post("/accounting/transactions", authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -8003,12 +8045,16 @@ app.post("/accounting/transactions", authenticateToken, async (req, res) => {
       description = "",
       attachment_url = "",
       source_label = "",
-      destination_label = ""
+      destination_label = "",
+      operation_date = null
     } = req.body;
 
     const amountValue = Number(amount || 0);
     if (!transaction_type || amountValue <= 0 || !["entrée", "sortie"].includes(direction)) {
       return res.status(400).json({ error: "Type, sens et montant valides obligatoires." });
+    }
+    if (operation_date && !/^\d{4}-\d{2}-\d{2}$/.test(String(operation_date))) {
+      return res.status(400).json({ error: "Date métier invalide (format AAAA-MM-JJ attendu)." });
     }
     const bankId = normalizeOptionalId(bank_id);
     const caisseId = normalizeOptionalId(caisse_id);
@@ -8100,8 +8146,10 @@ app.post("/accounting/transactions", authenticateToken, async (req, res) => {
       `INSERT INTO accounting_transactions
        (company_id, transaction_number, transaction_type, bank_id, caisse_id, amount,
         direction, category, partner_id, partner_name, description,
-        attachment_url, source_label, destination_label, created_by, validated_by, validated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$15,CURRENT_TIMESTAMP)
+        attachment_url, source_label, destination_label, operation_date,
+        created_by, validated_by, validated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
+               COALESCE($15::date,CURRENT_DATE),$16,$16,CURRENT_TIMESTAMP)
        RETURNING *`,
       [
         companyId,
@@ -8118,6 +8166,7 @@ app.post("/accounting/transactions", authenticateToken, async (req, res) => {
         attachment_url,
         source_label,
         destination_label,
+        operation_date || null,
         req.user.id
       ]
     );
@@ -8130,7 +8179,8 @@ app.post("/accounting/transactions", authenticateToken, async (req, res) => {
       debit: direction === "entrée" ? amountValue : 0,
       credit: direction === "sortie" ? amountValue : 0,
       description,
-      createdBy: req.user.id
+      createdBy: req.user.id,
+      entryDate: operation_date || null
     });
 
     const isBankCashTransfer = transaction_type === "retrait_banque" && bankId && caisseId;
@@ -8218,7 +8268,8 @@ app.post("/accounting/transactions", authenticateToken, async (req, res) => {
       moduleSource: "accounting_transaction",
       sourceId: result.rows[0].id,
       lines: [debitLine, creditLine],
-      createdBy: req.user.id
+      createdBy: req.user.id,
+      entryDate: operation_date || null
     });
 
     await client.query("COMMIT");
