@@ -33,6 +33,34 @@ function verifier(titre, condition, detail = "") {
   else { echoues += 1; console.log(`${R}  ✗ ${titre}${Z}${detail ? `  — ${detail}` : ""}`); }
 }
 
+/* Relire le texte RÉELLEMENT DESSINÉ dans le PDF, et pas seulement la
+   donnée qu'on croit lui avoir passée. pdfkit compresse le flux de contenu
+   (FlateDecode) et y écrit chaque ligne en tableau « TJ » de chaînes
+   hexadécimales — un simple indexOf sur les octets du fichier ne trouve donc
+   jamais rien, ce qui donnerait un test faussement rassurant. */
+function texteDuPdf(buf) {
+  const zlib = require("zlib");
+  let flux = "", pos = 0;
+  while (true) {
+    const d = buf.indexOf("stream", pos);
+    if (d === -1) break;
+    if (buf.slice(d, d + 9).toString("latin1") === "endstream") { pos = d + 9; continue; }
+    let debut = d + 6;
+    while (buf[debut] === 0x0d || buf[debut] === 0x0a) debut += 1;
+    const fin = buf.indexOf("endstream", debut);
+    if (fin === -1) break;
+    let f = fin;
+    while (buf[f - 1] === 0x0a || buf[f - 1] === 0x0d) f -= 1;
+    try { flux += zlib.inflateSync(buf.slice(debut, f)).toString("latin1"); } catch { /* flux non compressé */ }
+    pos = fin + 9;
+  }
+  return flux.split(/\bBT\b/).slice(1)
+    .map((bloc) => [...bloc.matchAll(/<([0-9a-fA-F]*)>/g)]
+      .map((m) => Buffer.from(m[1], "hex").toString("latin1")).join(""))
+    .filter(Boolean)
+    .join(" | ");
+}
+
 const pool = new Pool({ connectionString: URL_BASE });
 const q = async (sql, params = []) => (await pool.query(sql, params)).rows;
 const jeton = (id, role, companyId, superAdmin = false) =>
@@ -260,11 +288,21 @@ async function main() {
   // ════════════════════════════════════════════════════════════════════
   console.log(`\n${G}LE PDF PORTE LE BON NOM DE LIVREUR${Z}`);
   {
-    /* pdfkit compresse les flux : on relit donc la valeur à la source, et on
-       vérifie que la route la prend bien du bon. */
     const [bon] = await q(`SELECT delivered_by FROM sand_deliveries WHERE id=$1`, [blFatmat]);
     verifier("la donnée servie au PDF est « Issa Diallo »",
       bon.delivered_by === "Issa Diallo", bon.delivered_by);
+
+    /* Le point qui compte vraiment : ce qui est IMPRIMÉ sur le document que
+       l'utilisateur télécharge, partage ou reçoit par courriel. */
+    const dessine = texteDuPdf(pdfTelecharge);
+    verifier("le PDF téléchargé porte bien la mention « Livré par »",
+      /Livr. par/.test(dessine));
+    verifier("le PDF téléchargé imprime « Issa Diallo »",
+      dessine.includes("Issa Diallo"), dessine.slice(0, 200));
+    verifier("le PDF téléchargé ne porte plus l'ancien nom",
+      !/Djoul/i.test(dessine));
+    verifier("le PDF téléchargé est bien celui de FAT & MAT",
+      dessine.includes("FAT & MAT"), dessine.slice(0, 120));
 
     /* Et quand le bon n'en porte aucun, c'est le réglage de société qui
        prend le relais — jamais un nom inventé. */
@@ -273,6 +311,8 @@ async function main() {
     verifier("un bon sans livreur est tout de même servi", r.status === 200, `statut ${r.status}`);
     const buf = Buffer.from(await r.arrayBuffer());
     verifier("et le PDF reste valide", buf.slice(0, 5).toString() === "%PDF-");
+    verifier("il imprime alors le livreur réglé pour la société",
+      texteDuPdf(buf).includes("Issa Diallo"), texteDuPdf(buf).slice(0, 200));
     await pool.query(`UPDATE sand_deliveries SET delivered_by = 'Issa Diallo' WHERE id = $1`, [blFatmat]);
   }
 
