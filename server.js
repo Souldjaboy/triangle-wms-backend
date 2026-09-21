@@ -23,6 +23,7 @@ const nodemailer = require("nodemailer");
 /* Entreprise d'appartenance et badge : une seule règle, côté serveur. */
 const companyContext = require("./services/company-context");
 const accesSocietes = require("./services/acces-societes");
+const pdfBonLivraison = require("./services/pdf-bon-livraison");
 const identifiants = require("./services/identifiants");
 const stockLocations = require("./services/stock-locations");
 const locationHierarchy = require("./services/location-hierarchy");
@@ -9039,6 +9040,71 @@ app.post("/documents/:id/email", authenticateToken, requirePermission("document"
     const companySettings = await getCompanySettingsForCompany(pool, document.company_id);
     const html = renderDocumentHtml(document, itemsResult.rows, companySettings || {});
 
+    /* LA PIÈCE JOINTE EST LE PDF, PAS UN FICHIER HTML.
+       Un .html en pièce jointe s'ouvre dans un navigateur, se réimprime
+       différemment d'un poste à l'autre, et n'est pas ce qu'un client appelle
+       « le bon ». C'est le MÊME PDF que celui du bouton « Télécharger », parce
+       qu'il sort du même générateur : deux documents qui se ressemblent sans
+       être identiques finissent par se contredire.
+
+       Si la génération échoue, on n'envoie pas un email amputé en silence :
+       on le dit, et rien ne part. */
+    let piecesJointes;
+    try {
+      const societePdf = (await pool.query(
+        `SELECT COALESCE(NULLIF(TRIM(s.company_name), ''), c.name) AS nom,
+                s.address AS adresse, s.phone AS telephone, s.email,
+                COALESCE(s.default_delivered_by, '') AS livreur_par_defaut
+           FROM companies c
+           LEFT JOIN company_settings s ON s.company_id = c.id
+          WHERE c.id = $1 LIMIT 1`,
+        [document.company_id]
+      )).rows[0] || {};
+
+      const pdf = await pdfBonLivraison.genererPdfBonLivraison({
+        titre: String(document.document_type || "BON").toUpperCase(),
+        numero: document.document_number,
+        societe: societePdf,
+        infos: [
+          ["Date", pdfBonLivraison.jour(document.document_datetime || document.created_at)],
+          ["Client", document.client_name],
+          ["Téléphone", document.client_phone],
+          ["Adresse", document.client_address],
+        ],
+        colonnes: [
+          { cle: "designation", titre: "Désignation", largeur: 245 },
+          { cle: "quantite", titre: "Quantité", largeur: 80, align: "right" },
+          { cle: "prix", titre: "Prix unitaire", largeur: 95, align: "right" },
+          { cle: "montant", titre: "Montant", largeur: 95, align: "right" },
+        ],
+        lignes: itemsResult.rows.map((l) => ({
+          designation: l.product_name || "—",
+          quantite: Number(l.quantity || 0).toLocaleString("fr-FR"),
+          prix: l.unit_price != null ? pdfBonLivraison.fcfa(l.unit_price) : "—",
+          montant: l.total_price != null ? pdfBonLivraison.fcfa(l.total_price) : "—",
+        })),
+        total: document.total_amount != null ? pdfBonLivraison.fcfa(document.total_amount) : null,
+        observation: document.observation,
+        livrePar: societePdf.livreur_par_defaut || "",
+        annule: Boolean(document.cancelled_at),
+        motifAnnulation: document.cancellation_reason,
+      });
+
+      piecesJointes = [{
+        filename: pdfBonLivraison.nomFichier({
+          numero: document.document_number, societe: societePdf.nom,
+        }),
+        content: pdf,
+        contentType: "application/pdf",
+      }];
+    } catch (e) {
+      console.error("PDF du document pour email :", e);
+      return res.status(500).json({
+        error: "Le PDF du bon n'a pas pu être produit : l'email n'a pas été envoyé.",
+        code: "PDF_GENERATION_FAILED",
+      });
+    }
+
     const transporter = nodemailer.createTransport({
       host: process.env.SMTP_HOST,
       port: Number(process.env.SMTP_PORT || 587),
@@ -9055,13 +9121,7 @@ app.post("/documents/:id/email", authenticateToken, requirePermission("document"
       subject: subject || `${document.document_type} ${document.document_number}`,
       text: message || `Veuillez trouver le document ${document.document_number}.`,
       html: `<p>${escapeHtml(message || `Veuillez trouver le document ${document.document_number}.`)}</p>${html}`,
-      attachments: [
-        {
-          filename: `${document.document_number || "document"}.html`,
-          content: html,
-          contentType: "text/html"
-        }
-      ]
+      attachments: piecesJointes
     });
 
     await pool.query(
@@ -18113,6 +18173,17 @@ const createPointageRapportsRouter = require("./routes/pointage-rapports");
 app.use(
   "/",
   createPointageRapportsRouter({ pool, authenticateToken, getEffectiveCompanyId, requirePermission })
+);
+
+/* Le PDF des bons de livraison. Une seule génération, côté serveur, pour
+   toutes les actions : télécharger, partager, joindre à un email. Deux
+   générateurs — un dans le navigateur, un sur le serveur — finiraient par
+   produire deux documents différents, et personne ne s'en apercevrait avant
+   qu'un client compare son exemplaire avec celui du classeur. */
+const createBonsLivraisonPdfRouter = require("./routes/bons-livraison-pdf");
+app.use(
+  "/",
+  createBonsLivraisonPdfRouter({ pool, authenticateToken, getEffectiveCompanyId, requirePermission })
 );
 
 /* Tableau de bord et notifications métier. Les alertes portent une clé

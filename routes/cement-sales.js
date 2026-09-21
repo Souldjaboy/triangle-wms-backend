@@ -684,6 +684,14 @@ module.exports = function createCementSalesRouter({
           );
         }
 
+        const livreurSocieteCiment = (
+          await client.query(
+            `SELECT COALESCE(default_delivered_by, '') AS nom
+               FROM company_settings WHERE company_id = $1 LIMIT 1`,
+            [companyId]
+          )
+        ).rows[0]?.nom || "";
+
         await client.query(
           `INSERT INTO cement_deliveries (
              company_id,
@@ -721,7 +729,11 @@ module.exports = function createCementSalesRouter({
             sale.tonnage_voucher_number,
             sale.tonnage_voucher_url,
             txt(req.body?.received_by_name) || null,
-            txt(req.body?.delivered_by_name) || sale.driver_name || null,
+            /* Saisi, sinon le livreur réglé pour la société (migration 090),
+               sinon le chauffeur. Le chauffeur reste un repli acceptable ici —
+               c'est lui qui conduit —, mais il ne doit pas passer devant un
+               livreur explicitement configuré. */
+            txt(req.body?.delivered_by_name) || livreurSocieteCiment || sale.driver_name || null,
             sale.notes,
             req.user.id
           ]
