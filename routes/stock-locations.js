@@ -105,7 +105,29 @@ module.exports = function createStockLocationsRouter(deps) {
       );
       /* Arborescence prête à alimenter des sélecteurs dépendants : un bin
          n'apparaît jamais sous un rayon auquel il n'appartient pas. */
+      /*
+       * Précharger tous les entrepôts actifs, même lorsqu'ils ne possèdent
+       * encore aucun bac exploitable. Ainsi l'entrepôt C reste visible et
+       * l'utilisateur comprend qu'il doit d'abord régulariser ses anciens
+       * emplacements FULLBIN.
+       */
+      const imposePourArbre = await entrepotDe(req);
+      const { rows: entrepotsActifs } = await pool.query(
+        `SELECT code
+           FROM warehouses
+          WHERE company_id = $1
+            AND LOWER(BTRIM(COALESCE(status, 'active')))
+                IN ('active', 'actif')
+            AND ($2::int IS NULL OR id = $2)
+          ORDER BY code`,
+        [companyOf(req), imposePourArbre]
+      );
+
       const arbre = {};
+      for (const entrepot of entrepotsActifs) {
+        arbre[entrepot.code] ??= {};
+      }
+
       for (const r of rows) {
         const w = r.warehouse_code || "—", ro = r.row_code || "—";
         const lo = r.loc_code || "—", lv = r.lvl_code || "—";

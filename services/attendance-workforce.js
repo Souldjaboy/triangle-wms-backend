@@ -47,6 +47,15 @@ function minutesLate(eventDate, workDate, startTime, timezone = "Africa/Bamako")
 }
 
 async function canViewAllSalaries(client, companyId, user) {
+  /* Un refus nominatif est prioritaire sur le rôle. Cela permet à une
+     comptable de consulter les pointages sans voir les salaires. */
+  const { rows: refus } = await client.query(
+    `SELECT 1 FROM attendance_salary_denials
+      WHERE company_id=$1 AND user_id=$2 LIMIT 1`,
+    [companyId, user?.id]
+  );
+  if (refus[0]) return false;
+
   if (roleCanViewSalary(user)) return true;
   const { rows } = await client.query(
     `SELECT 1 FROM attendance_salary_viewers WHERE company_id=$1 AND user_id=$2 LIMIT 1`,

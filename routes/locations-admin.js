@@ -268,10 +268,27 @@ module.exports = function createLocationsAdminRouter(deps) {
     try {
       const companyId = companyOf(req);
       if (!companyId) return sansSociete(res);
+
+      /*
+       * IMPORTANT :
+       * on charge d'abord TOUS les entrepôts actifs de l'entreprise.
+       * Ainsi un entrepôt neuf et encore vide reste visible dans
+       * l'administration des emplacements.
+       */
+      const { rows: warehouses } = await pool.query(
+        `SELECT id, code, name, racks_count, status
+           FROM warehouses
+          WHERE company_id = $1
+            AND LOWER(BTRIM(COALESCE(status,'active'))) IN ('active','actif')
+          ORDER BY code`,
+        [companyId]
+      );
+
       const { rows } = await pool.query(
         `SELECT ${COMPOSANTES}, ${QUANTITES}
            FROM locations l
-          WHERE l.company_id = $1 AND l.archived_at IS NULL
+          WHERE l.company_id = $1
+            AND l.archived_at IS NULL
           ORDER BY l.warehouse_code, 3, 4,
                    COALESCE(l.level_rank, 8999), 5,
                    COALESCE(l.bin_rank, 999999), 6`,
@@ -279,33 +296,111 @@ module.exports = function createLocationsAdminRouter(deps) {
       );
 
       const arbre = [];
+
       const trouver = (liste, nom, extra = {}) => {
         let n = liste.find((x) => x.nom === nom);
-        if (!n) { n = { nom, quantite: 0, bins: 0, enfants: [], ...extra }; liste.push(n); }
+
+        if (!n) {
+          n = {
+            nom,
+            quantite: 0,
+            bins: 0,
+            enfants: [],
+            ...extra
+          };
+          liste.push(n);
+        }
+
         return n;
       };
 
+      /*
+       * Pré-création des noeuds entrepôt.
+       * Aucun rayon/bac fictif n'est créé.
+       */
+      for (const wh of warehouses) {
+        trouver(arbre, wh.code, {
+          type: "WAREHOUSE",
+          warehouse_id: wh.id,
+          warehouse_name: wh.name,
+          racks_count: Number(wh.racks_count || 0),
+          vide: true
+        });
+      }
+
       for (const brut of rows) {
         const b = decorer(brut);
-        const w = trouver(arbre, b.warehouse_code || "—", { type: "WAREHOUSE" });
-        const r = trouver(w.enfants, b.row_code || "—", { type: "ROW" });
-        const sh = trouver(r.enfants, b.shelf_code || "—", { type: "SHELF" });
-        const lv = trouver(sh.enfants, b.level_code || "—", {
-          type: "LEVEL", rang: b.level_rank ?? H.levelRank(b.level_code), is_top: b.is_top,
+
+        const w = trouver(
+          arbre,
+          b.warehouse_code || "—",
+          { type: "WAREHOUSE" }
+        );
+
+        w.vide = false;
+
+        const r = trouver(
+          w.enfants,
+          b.row_code || "—",
+          { type: "ROW" }
+        );
+
+        const sh = trouver(
+          r.enfants,
+          b.shelf_code || "—",
+          { type: "SHELF" }
+        );
+
+        const lv = trouver(
+          sh.enfants,
+          b.level_code || "—",
+          {
+            type: "LEVEL",
+            rang:
+              b.level_rank ??
+              H.levelRank(b.level_code),
+            is_top: b.is_top
+          }
+        );
+
+        lv.enfants.push({
+          type: "BIN",
+          ...b
         });
-        lv.enfants.push({ type: "BIN", ...b });
-        for (const n of [w, r, sh, lv]) { n.quantite += b.quantity; n.bins += 1; }
+
+        for (const n of [w, r, sh, lv]) {
+          n.quantite += b.quantity;
+          n.bins += 1;
+        }
       }
-      /* Les niveaux se rangent par rang : « Top » après Level 3 comme après
-         Level 4, sans qu'on ait à déclarer la hauteur de l'étagère. */
-      for (const w of arbre) for (const r of w.enfants) for (const sh of r.enfants) {
-        sh.enfants.sort((a, b) => (a.rang ?? 8999) - (b.rang ?? 8999));
+
+      for (const w of arbre) {
+        for (const r of w.enfants) {
+          for (const sh of r.enfants) {
+            sh.enfants.sort(
+              (a, b) =>
+                (a.rang ?? 8999) -
+                (b.rang ?? 8999)
+            );
+          }
+        }
       }
-      res.json({ hierarchy: arbre, bins: rows.length });
-    } catch (e) { fail(res, e, "Erreur de lecture de l'arborescence."); }
+
+      res.json({
+        hierarchy: arbre,
+        bins: rows.length,
+        warehouses: warehouses.length
+      });
+
+    } catch (e) {
+      fail(
+        res,
+        e,
+        "Erreur de lecture de l'arborescence."
+      );
+    }
   });
 
-  /** Les niveaux existants d'une étagère, avec leur rang et leur occupation. */
   router.get("/stock/locations/levels", authenticateToken, canView, async (req, res) => {
     try {
       const companyId = companyOf(req);

@@ -32,13 +32,85 @@ async function computeClosure(pool, companyId, year, month) {
   )).rows[0];
   const opening = prevClose ? Number(prevClose.closing_balance) : 0;
 
+  /*
+   * PHASE FINANCE 2026-09 :
+   * - Le chiffre d'affaires Triangle provient des ventes CIMENT réelles.
+   * - Les rapprochements bancaires, retraits, virements et transferts ne sont
+   *   PAS des dépenses.
+   * - Une variation de solde bancaire n'est jamais du chiffre d'affaires.
+   */
+  let income = 0;
+
+  if (Number(companyId) === 1) {
+    const ca = (await pool.query(
+      `SELECT COALESCE(SUM(total_amount),0) AS total
+         FROM cement_sales
+        WHERE company_id=$1
+          AND EXTRACT(YEAR FROM sale_date)=$2
+          AND EXTRACT(MONTH FROM sale_date)=$3
+          AND COALESCE(status,'') <> 'ANNULEE'`,
+      [companyId, year, month]
+    )).rows[0];
+
+    income = Number(ca?.total || 0);
+  } else if (Number(companyId) === 5) {
+    const ca = (await pool.query(
+      `SELECT COALESCE(SUM(recette),0) AS total
+         FROM camion_operations
+        WHERE company_id=$1
+          AND EXTRACT(YEAR FROM op_date)=$2
+          AND EXTRACT(MONTH FROM op_date)=$3`,
+      [companyId, year, month]
+    )).rows[0];
+
+    income = Number(ca?.total || 0);
+  } else {
+    const ca = (await pool.query(
+      `SELECT COALESCE(SUM(amount),0) AS total
+         FROM accounting_transactions
+        WHERE company_id=$1
+          AND direction='entrée'
+          AND status='validé'
+          AND EXTRACT(YEAR FROM COALESCE(operation_date,created_at::date))=$2
+          AND EXTRACT(MONTH FROM COALESCE(operation_date,created_at::date))=$3
+          AND COALESCE(transaction_type,'') NOT IN (
+            'ajustement_bancaire',
+            'retrait_banque',
+            'retrait_historique',
+            'depot_historique',
+            'transfert',
+            'virement'
+          )
+          AND COALESCE(source_type,'') NOT ILIKE 'reconciliation%'`,
+      [companyId, year, month]
+    )).rows[0];
+
+    income = Number(ca?.total || 0);
+  }
+
   const agg = (await pool.query(
     `SELECT
-        COALESCE(SUM(amount) FILTER (WHERE direction='entrée' AND status='validé'),0) AS income,
-        COALESCE(SUM(amount) FILTER (WHERE direction='sortie' AND status='validé'),0) AS expense,
+        COALESCE(SUM(amount) FILTER (
+          WHERE direction='sortie'
+            AND status='validé'
+            AND COALESCE(transaction_type,'') NOT IN (
+              'ajustement_bancaire',
+              'retrait_banque',
+              'retrait_historique',
+              'depot_historique',
+              'transfert',
+              'virement'
+            )
+            AND COALESCE(source_type,'') NOT ILIKE 'reconciliation%'
+        ),0) AS expense,
+
         COUNT(*) FILTER (WHERE status<>'validé') AS not_validated
+
        FROM accounting_transactions
-      WHERE company_id=$1 AND EXTRACT(YEAR FROM created_at)=$2 AND EXTRACT(MONTH FROM created_at)=$3`,
+
+      WHERE company_id=$1
+        AND EXTRACT(YEAR FROM COALESCE(operation_date,created_at::date))=$2
+        AND EXTRACT(MONTH FROM COALESCE(operation_date,created_at::date))=$3`,
     [companyId, year, month]
   )).rows[0];
 
@@ -58,7 +130,7 @@ async function computeClosure(pool, companyId, year, month) {
     [companyId, year, month]
   )).rows[0].n);
 
-  const income = Number(agg.income), expense = Number(agg.expense);
+  const expense = Number(agg.expense);
   const closing = opening + income - expense;
   const anomalies = [];
   if (Number(agg.not_validated) > 0) anomalies.push(`${agg.not_validated} opération(s) non validée(s).`);

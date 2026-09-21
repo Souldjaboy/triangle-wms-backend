@@ -1,6 +1,8 @@
 "use strict";
 
 const express = require("express");
+const { autoAllocateClientDeposits } =
+  require("../services/client-deposit-auto-allocation");
 const { listActiveBanks, recordSalePaymentAccounting } = require("./sales-payment-accounting");
 
 module.exports = function createCementSalesRouter({
@@ -149,7 +151,7 @@ module.exports = function createCementSalesRouter({
 
   router.patch("/cement/products/:id", authenticateToken, cementModuleGuard, perm("update"), async (req, res) => {
     const companyId = companyOf(req);
-    const b = req.body || {};
+
     const { rows } = await pool.query(
       `UPDATE cement_products SET
        name=COALESCE($3,name),cement_type=COALESCE($4,cement_type),
@@ -243,13 +245,35 @@ module.exports = function createCementSalesRouter({
 
   router.delete("/cement/prices/:id", authenticateToken, cementModuleGuard, perm("delete"), async (req, res) => {
     const companyId = companyOf(req);
-    const { rows } = await pool.query(
-      `UPDATE cement_prices SET status='INACTIF',effective_to=COALESCE(effective_to,CURRENT_DATE),updated_at=NOW()
-       WHERE id=$1 AND company_id=$2 RETURNING *`,
-      [req.params.id,companyId]
-    );
-    if (!rows[0]) return res.status(404).json({ error: "Tarif introuvable." });
-    res.json({ success:true,disabled:true,price:rows[0] });
+
+    try {
+      const { rows } = await pool.query(
+        `DELETE FROM cement_prices
+         WHERE id=$1
+           AND company_id=$2
+         RETURNING *`,
+        [req.params.id, companyId]
+      );
+
+      if (!rows[0]) {
+        return res.status(404).json({
+          error: "Tarif introuvable."
+        });
+      }
+
+      res.json({
+        success: true,
+        deleted: true,
+        price: rows[0]
+      });
+
+    } catch (e) {
+      console.error("DELETE CEMENT PRICE:", e);
+
+      res.status(500).json({
+        error: e.detail || e.message || "Suppression tarif impossible."
+      });
+    }
   });
 
   router.get("/cement/customers", authenticateToken, cementModuleGuard, perm("view"), async (req, res) => {
@@ -319,11 +343,65 @@ module.exports = function createCementSalesRouter({
     res.json(rows);
   });
 
+
+  // CAMION_CEMENT_SALES_V1
+  router.get(
+    "/cement/camions",
+    authenticateToken,
+    cementModuleGuard,
+    perm("view"),
+    async (req,res) => {
+      try {
+        const {rows}=await pool.query(
+          `SELECT id,code,immatriculation,chauffeur,statut
+             FROM camions
+            WHERE company_id=$1
+              AND statut='ACTIF'
+            ORDER BY code`,
+          [companyOf(req)]
+        );
+        res.json(rows);
+      } catch(e) {
+        console.error("CEMENT TRUCKS:",e);
+        res.status(500).json({error:"Erreur chargement camions."});
+      }
+    }
+  );
+
   router.post("/cement/sales", authenticateToken, cementModuleGuard, perm("create"), async (req, res) => {
     const client = await pool.connect();
     try {
-      const companyId = companyOf(req);
       const b = req.body || {};
+
+      const companyId = companyOf(req);
+
+
+      const camionId=Number(b.camion_id || 0);
+
+      if (!camionId) {
+        return res.status(400).json({
+          error:"Camion obligatoire pour enregistrer la vente."
+        });
+      }
+
+      const camion=(
+        await client.query(
+          `SELECT id,code
+             FROM camions
+            WHERE id=$1
+              AND company_id=$2
+              AND statut='ACTIF'`,
+          [camionId,companyId]
+        )
+      ).rows[0];
+
+      if (!camion) {
+        return res.status(400).json({
+          error:"Camion invalide pour cette entreprise."
+        });
+      }
+
+
       if (!b.cement_product_id) return res.status(400).json({ error:"Produit ciment obligatoire." });
       if (positive(b.tonnage) <= 0) return res.status(400).json({ error:"Tonnage > 0 obligatoire." });
 
@@ -359,10 +437,10 @@ module.exports = function createCementSalesRouter({
           destination,loading_place,delivery_place,cement_product_id,cement_type,strength,
           tonnage,unit_price,transport_price,transport_mode,cement_subtotal,transport_total,discount,tax_amount,
           total_amount,paid_amount,remaining_amount,payment_method,tonnage_voucher_number,tonnage_voucher_url,
-          truck,driver_name,status,sale_date,notes,created_by
+          truck,camion_id,driver_name,status,sale_date,notes,created_by
         ) VALUES(
           $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,
-          $23,$24,$25,$26,$27,$28,$29,$30,'BROUILLON',COALESCE($31,CURRENT_DATE),$32,$33
+          $23,$24,$25,$26,$27,$28,$29,$30,$31,'BROUILLON',COALESCE($32,CURRENT_DATE),$33,$34
         ) RETURNING *`,
         [
           companyId,saleNumber,customer?.id || b.customer_id || null,
@@ -372,8 +450,8 @@ module.exports = function createCementSalesRouter({
           txt(b.delivery_place || b.destination)||null,product.id,product.cement_type,product.strength,
           calc.tonnage,calc.unitPrice,calc.transportPrice,calc.transportMode,calc.cementSubtotal,calc.transportTotal,
           calc.discount,calc.taxAmount,calc.totalAmount,calc.paidAmount,calc.remainingAmount,txt(b.payment_method)||null,
-          txt(b.tonnage_voucher_number)||null,txt(b.tonnage_voucher_url)||null,txt(b.truck)||null,
-          txt(b.driver_name)||null,b.sale_date || null,txt(b.notes)||null,req.user.id
+          txt(b.tonnage_voucher_number)||null,txt(b.tonnage_voucher_url)||null,camion.code,
+          camion.id,txt(b.driver_name)||null,b.sale_date || null,txt(b.notes)||null,req.user.id
         ]
       );
 
@@ -416,6 +494,19 @@ module.exports = function createCementSalesRouter({
     const { rows } = await pool.query(
       `SELECT i.id,i.invoice_number,i.invoice_date,i.due_date,i.operation_reference,i.destination,
               i.total_amount,i.paid_amount,i.remaining_amount,i.status,
+              COALESCE((
+                SELECT SUM(a.amount)
+                FROM client_deposit_allocations a
+                WHERE a.company_id=i.company_id
+                  AND a.activity='ciment'
+                  AND a.invoice_id=i.id
+                  AND a.reverses_allocation_id IS NULL
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM client_deposit_allocations r
+                    WHERE r.reverses_allocation_id=a.id
+                  )
+              ),0) AS deposit_used,
               c.id customer_id,c.name customer_name,c.phone customer_phone,
               s.tonnage,s.cement_type,s.strength
        FROM cement_invoices i
@@ -684,6 +775,26 @@ module.exports = function createCementSalesRouter({
           );
         }
 
+        // AUTO_DEPOSIT_CEMENT_V1
+        const depositAllocation =
+          await autoAllocateClientDeposits({
+            client,
+            companyId,
+            activity: "ciment",
+            invoiceId: invoice.id,
+            userId: req.user.id,
+            userName:
+              req.user?.fullname ||
+              req.user?.email ||
+              "Utilisateur",
+            createAccountingEntry:
+              accounting.createAccountingEntry,
+          });
+
+        const finalInvoice =
+          depositAllocation.invoice || invoice;
+
+
         await client.query(
           `INSERT INTO cement_deliveries (
              company_id,
@@ -729,10 +840,50 @@ module.exports = function createCementSalesRouter({
 
         let saleStatus = "FACTUREE";
 
-        if (invoiceStatus === "PAYEE") {
+        if (finalInvoice.status === "PAYEE") {
           saleStatus = "PAYEE";
-        } else if (invoiceStatus === "PARTIELLEMENT_PAYEE") {
+        } else if (
+          finalInvoice.status === "PARTIELLEMENT_PAYEE"
+        ) {
           saleStatus = "PARTIELLEMENT_PAYEE";
+        }
+
+
+        if (sale.camion_id) {
+          await client.query(
+            `INSERT INTO camion_operations
+               (
+                 company_id,
+                 camion_id,
+                 op_date,
+                 libelle,
+                 recette,
+                 depense,
+                 piece_ref,
+                 source_type,
+                 source_id,
+                 created_by
+               )
+             VALUES
+               (
+                 $1,$2,CURRENT_DATE,$3,
+                 $4,0,$5,
+                 'cement_sale',$6,$7
+               )
+             ON CONFLICT
+               (company_id,source_type,source_id)
+               WHERE source_type='cement_sale'
+             DO NOTHING`,
+            [
+              companyId,
+              sale.camion_id,
+              `Vente ciment ${sale.sale_number} — ${sale.destination || ""}`,
+              sale.total_amount,
+              sale.sale_number,
+              sale.id,
+              req.user.id
+            ]
+          );
         }
 
         await client.query(
@@ -741,9 +892,18 @@ module.exports = function createCementSalesRouter({
              status=$3,
              validated_by=$4,
              validated_at=NOW(),
+             paid_amount=$5,
+             remaining_amount=$6,
              updated_at=NOW()
            WHERE id=$1 AND company_id=$2`,
-          [sale.id, companyId, saleStatus, req.user.id]
+          [
+            sale.id,
+            companyId,
+            saleStatus,
+            req.user.id,
+            finalInvoice.paid_amount,
+            finalInvoice.remaining_amount
+          ]
         );
 
         await audit(
@@ -768,7 +928,17 @@ module.exports = function createCementSalesRouter({
           sale: await loadSaleDetail(pool, companyId, sale.id),
           invoice_number: invoiceNumber,
           delivery_number: deliveryNumber,
-          stock_impacted: false
+          stock_impacted: false,
+          deposit_allocation: {
+            total_used:
+              depositAllocation.totalAllocated || 0,
+            allocations:
+              depositAllocation.allocations || [],
+            invoice_status:
+              finalInvoice.status,
+            remaining_invoice:
+              finalInvoice.remaining_amount
+          }
         });
       } catch (e) {
         await client.query("ROLLBACK").catch(() => {});
@@ -1505,6 +1675,272 @@ module.exports = function createCementSalesRouter({
       res.status(500).json({error:"Erreur lecture de la facture."});
     }
   });
+
+
+  // ==========================================================
+  // CEMENT_PERMANENT_DELETE_V2
+  // Modifier un brouillon / supprimer physiquement une vente
+  // ==========================================================
+
+  router.patch(
+    "/cement/sales/:id/admin",
+    authenticateToken,
+    cementModuleGuard,
+    perm("update"),
+    async (req,res) => {
+
+      const client = await pool.connect();
+
+      try {
+        const companyId = companyOf(req);
+
+        await client.query("BEGIN");
+
+        const sale = (
+          await client.query(
+            `SELECT *
+             FROM cement_sales
+             WHERE id=$1
+               AND company_id=$2
+             FOR UPDATE`,
+            [req.params.id, companyId]
+          )
+        ).rows[0];
+
+        if (!sale) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({
+            error:"Vente introuvable."
+          });
+        }
+
+        if (sale.status !== "BROUILLON") {
+          await client.query("ROLLBACK");
+          return res.status(409).json({
+            error:"Seul un brouillon peut être modifié directement."
+          });
+        }
+
+        const b = req.body || {};
+
+        const tonnage =
+          b.tonnage === undefined
+            ? Number(sale.tonnage)
+            : Number(b.tonnage);
+
+        const unitPrice =
+          b.unit_price === undefined
+            ? Number(sale.unit_price)
+            : Number(b.unit_price);
+
+        const transportPrice =
+          b.transport_price === undefined
+            ? Number(sale.transport_price)
+            : Number(b.transport_price);
+
+        if (!(tonnage > 0)) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            error:"Tonnage obligatoire."
+          });
+        }
+
+        if (!(unitPrice > 0)) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            error:"Prix ciment obligatoire."
+          });
+        }
+
+        if (transportPrice < 0) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            error:"Transport invalide."
+          });
+        }
+
+        const cementSubtotal = tonnage * unitPrice;
+
+        const transportTotal =
+          sale.transport_mode === "FORFAIT"
+            ? transportPrice
+            : tonnage * transportPrice;
+
+        const totalAmount =
+          Math.max(
+            cementSubtotal
+            + transportTotal
+            + Number(sale.tax_amount || 0)
+            - Number(sale.discount || 0),
+            0
+          );
+
+        const remainingAmount =
+          Math.max(
+            totalAmount - Number(sale.paid_amount || 0),
+            0
+          );
+
+        const {rows} = await client.query(
+          `UPDATE cement_sales
+           SET destination=COALESCE($3,destination),
+               delivery_place=COALESCE($3,delivery_place),
+               tonnage=$4,
+               unit_price=$5,
+               transport_price=$6,
+               cement_subtotal=$7,
+               transport_total=$8,
+               total_amount=$9,
+               remaining_amount=$10,
+               updated_at=NOW()
+           WHERE id=$1
+             AND company_id=$2
+           RETURNING *`,
+          [
+            sale.id,
+            companyId,
+            b.destination ?? null,
+            tonnage,
+            unitPrice,
+            transportPrice,
+            cementSubtotal,
+            transportTotal,
+            totalAmount,
+            remainingAmount
+          ]
+        );
+
+        await client.query(
+          `UPDATE cement_sale_lines
+           SET quantity=$3,
+               unit_price=$4,
+               line_total=$5
+           WHERE sale_id=$1
+             AND company_id=$2
+             AND line_type='CIMENT'`,
+          [
+            sale.id,
+            companyId,
+            tonnage,
+            unitPrice,
+            cementSubtotal
+          ]
+        );
+
+        await client.query("COMMIT");
+
+        res.json({
+          success:true,
+          sale:rows[0]
+        });
+
+      } catch(e) {
+        await client.query("ROLLBACK").catch(()=>{});
+
+        console.error("ADMIN UPDATE CEMENT SALE:",e);
+
+        res.status(500).json({
+          error:e.detail || e.message || "Modification impossible."
+        });
+
+      } finally {
+        client.release();
+      }
+    }
+  );
+
+
+  router.delete(
+    "/cement/sales/:id/permanent",
+    authenticateToken,
+    cementModuleGuard,
+    perm("delete"),
+    async (req,res) => {
+
+      const client = await pool.connect();
+
+      try {
+        const companyId = companyOf(req);
+
+        await client.query("BEGIN");
+
+        const sale = (
+          await client.query(
+            `SELECT *
+             FROM cement_sales
+             WHERE id=$1
+               AND company_id=$2
+             FOR UPDATE`,
+            [req.params.id, companyId]
+          )
+        ).rows[0];
+
+        if (!sale) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({
+            error:"Vente introuvable."
+          });
+        }
+
+        const paid = (
+          await client.query(
+            `SELECT COUNT(*)::int AS n
+             FROM cement_payments p
+             JOIN cement_invoices i
+               ON i.id=p.invoice_id
+              AND i.company_id=p.company_id
+             WHERE i.company_id=$1
+               AND i.sale_id=$2`,
+            [companyId, sale.id]
+          )
+        ).rows[0]?.n || 0;
+
+        if (Number(paid) > 0) {
+          await client.query("ROLLBACK");
+
+          return res.status(409).json({
+            error:
+              "Impossible de supprimer une vente déjà payée. " +
+              "Le paiement doit d'abord être contrepassé."
+          });
+        }
+
+        await client.query(
+          `DELETE FROM cement_invoices
+           WHERE company_id=$1
+             AND sale_id=$2`,
+          [companyId, sale.id]
+        );
+
+        await client.query(
+          `DELETE FROM cement_sales
+           WHERE id=$1
+             AND company_id=$2`,
+          [sale.id, companyId]
+        );
+
+        await client.query("COMMIT");
+
+        res.json({
+          success:true,
+          deleted:true,
+          sale_number:sale.sale_number
+        });
+
+      } catch(e) {
+        await client.query("ROLLBACK").catch(()=>{});
+
+        console.error("DELETE CEMENT SALE:",e);
+
+        res.status(500).json({
+          error:e.detail || e.message || "Suppression impossible."
+        });
+
+      } finally {
+        client.release();
+      }
+    }
+  );
 
   return router;
 };

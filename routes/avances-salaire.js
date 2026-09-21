@@ -27,7 +27,7 @@ const A = require("../services/avances-salaire");
 
 module.exports = function createAvancesRouter(deps) {
   const { pool, authenticateToken, getEffectiveCompanyId, requirePermission,
-          nextAccountingNumber, createAccountingEntry } = deps;
+          nextAccountingNumber, createAccountingEntry, permissionsService } = deps;
   const router = express.Router();
 
   const companyOf = (req) => Number(getEffectiveCompanyId(req, req.user?.company_id) || 0);
@@ -51,12 +51,47 @@ module.exports = function createAvancesRouter(deps) {
     return m;
   };
 
+  /* Le droit de voir le module ne donne jamais accès aux dossiers des autres.
+     L'accès global est une capacité distincte, réglable dans Droits et
+     permissions. Sans cette capacité, le lien compte ↔ salarié est la seule
+     portée autorisée, y compris si un employee_id arbitraire est envoyé. */
+  const contexteAcces = async (req, companyId, db = pool) => {
+    const contexte = await permissionsService.chargerContexte(
+      pool, req.user, companyId
+    );
+    const tous = permissionsService.decider(
+      contexte, "paie.avance", "view_all"
+    ).autorise;
+
+    if (tous) return { scope: "all", employee: null };
+
+    const { rows } = await db.query(
+      `SELECT id, full_name, employee_number, active
+         FROM attendance_employees
+        WHERE company_id = $1 AND user_id = $2
+        ORDER BY active DESC, id DESC
+        LIMIT 1`,
+      [companyId, Number(req.user?.id || 0)]
+    );
+    if (!rows[0]) {
+      throw T.erreur(
+        "Votre compte n'est pas encore lié à votre fiche salarié.",
+        "EMPLOYEE_ACCOUNT_NOT_LINKED", 409
+      );
+    }
+    return { scope: "self", employee: rows[0] };
+  };
+
   // ═══════════════════════════════════════════════════════════════════════
   router.get(
     "/avances", authenticateToken, requirePermission("paie.avance", "view"),
     async (req, res) => {
       const companyId = requireCompany(req, res); if (!companyId) return;
       try {
+        const acces = await contexteAcces(req, companyId);
+        const employeeFiltre = acces.scope === "self"
+          ? Number(acces.employee.id)
+          : (req.query?.employee_id ? Number(req.query.employee_id) : null);
         const { rows } = await pool.query(
           `SELECT a.id, a.reference, a.status, a.amount_requested, a.amount_authorized,
                   a.amount_paid, a.balance, a.installment_amount, a.first_period_code,
@@ -68,9 +103,9 @@ module.exports = function createAvancesRouter(deps) {
               AND ($2::int IS NULL OR a.employee_id = $2)
             ORDER BY a.created_at DESC
             LIMIT 300`,
-          [companyId, req.query?.employee_id ? Number(req.query.employee_id) : null]
+          [companyId, employeeFiltre]
         );
-        res.json({ avances: rows });
+        res.json({ avances: rows, scope: acces.scope, employee: acces.employee });
       } catch (e) { fail(res, e, "Impossible de lire les avances."); }
     }
   );
@@ -81,11 +116,14 @@ module.exports = function createAvancesRouter(deps) {
       const companyId = requireCompany(req, res); if (!companyId) return;
       try {
         const id = Number(req.params.id);
+        const acces = await contexteAcces(req, companyId);
         const { rows: avances } = await pool.query(
           `SELECT a.*, e.full_name, e.employee_number
              FROM salary_advances a
              JOIN attendance_employees e ON e.id = a.employee_id
-            WHERE a.id = $1 AND a.company_id = $2`, [id, companyId]);
+            WHERE a.id = $1 AND a.company_id = $2
+              AND ($3::int IS NULL OR a.employee_id = $3)`,
+          [id, companyId, acces.scope === "self" ? acces.employee.id : null]);
         if (!avances[0]) return res.status(404).json({ error: "Avance introuvable." });
 
         const { rows: echeances } = await pool.query(
@@ -109,7 +147,10 @@ module.exports = function createAvancesRouter(deps) {
       const companyId = requireCompany(req, res); if (!companyId) return;
       const client = await pool.connect();
       try {
-        const employeeId = Number(req.body?.employee_id);
+        const acces = await contexteAcces(req, companyId, client);
+        const employeeId = acces.scope === "self"
+          ? Number(acces.employee.id)
+          : Number(req.body?.employee_id);
         const montant = T.francs(req.body?.amount_requested);
         const mensualite = T.francs(req.body?.installment_amount || 0);
         const periode = String(req.body?.first_period_code || "").trim();

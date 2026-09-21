@@ -1,4 +1,6 @@
 const express = require("express");
+const { autoAllocateClientDeposits } =
+  require("../services/client-deposit-auto-allocation");
 const { listActiveBanks, recordSalePaymentAccounting } = require("./sales-payment-accounting");
 
 module.exports = function createSandSalesRouter({
@@ -482,6 +484,31 @@ module.exports = function createSandSalesRouter({
 
   // ---------------- VENTE : CRÉER ----------------
 
+
+  // CAMION_SAND_SALES_V1
+  router.get(
+    "/sand/camions",
+    authenticateToken,
+    sandModuleGuard,
+    perm("view"),
+    async (req,res) => {
+      try {
+        const {rows}=await pool.query(
+          `SELECT id,code,immatriculation,chauffeur,statut
+             FROM camions
+            WHERE company_id=$1
+              AND statut='ACTIF'
+            ORDER BY code`,
+          [companyOf(req)]
+        );
+        res.json(rows);
+      } catch(e) {
+        console.error("SAND TRUCKS:",e);
+        res.status(500).json({error:"Erreur chargement camions."});
+      }
+    }
+  );
+
   router.post(
     "/sand/sales",
     authenticateToken,
@@ -492,6 +519,32 @@ module.exports = function createSandSalesRouter({
 
       try {
         const companyId = companyOf(req);
+
+        const camionId=Number(req.body?.camion_id || 0);
+
+        if (!camionId) {
+          return res.status(400).json({
+            error:"Camion obligatoire pour enregistrer la vente."
+          });
+        }
+
+        const camion=(
+          await client.query(
+            `SELECT id,code
+               FROM camions
+              WHERE id=$1
+                AND company_id=$2
+                AND statut='ACTIF'`,
+            [camionId,companyId]
+          )
+        ).rows[0];
+
+        if (!camion) {
+          return res.status(400).json({
+            error:"Camion invalide pour cette entreprise."
+          });
+        }
+
 
         const customerId = Number(req.body?.customer_id);
         const productId = Number(req.body?.sand_product_id);
@@ -644,6 +697,7 @@ module.exports = function createSandSalesRouter({
              paid_amount,
              remaining_amount,
              truck,
+             camion_id,
              driver_name,
              voucher_number,
              notes,
@@ -654,7 +708,7 @@ module.exports = function createSandSalesRouter({
            VALUES(
              $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
              $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-             $21,$22,$23,$24,'BROUILLON',$25,$26
+             $21,$22,$23,$24,$25,'BROUILLON',$26,$27
            )
            RETURNING *`,
           [
@@ -678,7 +732,8 @@ module.exports = function createSandSalesRouter({
             total,
             paid,
             remaining,
-            String(req.body?.truck || "").trim() || null,
+            camion.code,
+            camion.id,
             String(req.body?.driver_name || "").trim() || null,
             String(req.body?.voucher_number || "").trim() || null,
             String(req.body?.notes || "").trim() || null,
@@ -691,7 +746,219 @@ module.exports = function createSandSalesRouter({
           ]
         );
 
-        await client.query("COMMIT");
+
+        // SAND_MULTI_TRUCK_CREATE_V1
+        const requestedTruckLines =
+          Array.isArray(req.body?.trucks)
+            ? req.body.trucks
+            : [];
+
+        if (requestedTruckLines.length > 0) {
+
+          const normalizedTruckLines =
+            requestedTruckLines.map(
+              (line,index)=>({
+                line_no:index+1,
+                camion_id:
+                  Number(line?.camion_id || 0),
+                driver_name:
+                  String(
+                    line?.driver_name || ""
+                  ).trim(),
+                quantity:
+                  Number(line?.quantity || 0)
+              })
+            );
+
+          if (
+            normalizedTruckLines.some(
+              line =>
+                !(line.camion_id > 0) ||
+                !(line.quantity > 0)
+            )
+          ) {
+            await client.query("ROLLBACK");
+
+            return res.status(400).json({
+              error:
+                "Chaque ligne camion doit avoir un camion et un volume supérieur à 0."
+            });
+          }
+
+          const assignedQuantity =
+            normalizedTruckLines.reduce(
+              (sum,line)=>
+                sum + line.quantity,
+              0
+            );
+
+          if (
+            Math.abs(
+              assignedQuantity -
+              Number(quantity)
+            ) > 0.001
+          ) {
+            await client.query("ROLLBACK");
+
+            return res.status(400).json({
+              error:
+                `La répartition des camions (${assignedQuantity} m³) doit correspondre exactement à la vente (${quantity} m³).`
+            });
+          }
+
+          const truckIds =
+            [
+              ...new Set(
+                normalizedTruckLines.map(
+                  line=>line.camion_id
+                )
+              )
+            ];
+
+          const availableTrucks =
+            (
+              await client.query(
+                `SELECT
+                   id,
+                   code,
+                   immatriculation,
+                   chauffeur
+                 FROM camions
+                 WHERE company_id=$1
+                   AND id=ANY($2::int[])
+                   AND UPPER(statut)='ACTIF'`,
+                [
+                  companyId,
+                  truckIds
+                ]
+              )
+            ).rows;
+
+          const truckMap =
+            new Map(
+              availableTrucks.map(
+                truck=>[
+                  Number(truck.id),
+                  truck
+                ]
+              )
+            );
+
+          if (
+            truckIds.some(
+              id=>!truckMap.has(Number(id))
+            )
+          ) {
+            await client.query("ROLLBACK");
+
+            return res.status(400).json({
+              error:
+                "Un ou plusieurs camions ne sont pas actifs dans l'entreprise sélectionnée."
+            });
+          }
+
+          await client.query(
+            `DELETE FROM sale_truck_assignments
+             WHERE company_id=$1
+               AND activity='sable'
+               AND sale_id=$2`,
+            [
+              companyId,
+              rows[0].id
+            ]
+          );
+
+          for (
+            const line of normalizedTruckLines
+          ) {
+            const truck =
+              truckMap.get(
+                Number(line.camion_id)
+              );
+
+            const driver =
+              line.driver_name ||
+              truck?.chauffeur ||
+              "";
+
+            await client.query(
+              `INSERT INTO sale_truck_assignments
+                 (
+                   company_id,
+                   activity,
+                   sale_id,
+                   line_no,
+                   camion_id,
+                   truck_code,
+                   driver_name,
+                   quantity,
+                   created_by
+                 )
+               VALUES
+                 ($1,'sable',$2,$3,$4,$5,$6,$7,$8)`,
+              [
+                companyId,
+                rows[0].id,
+                line.line_no,
+                line.camion_id,
+                truck?.code || "",
+                driver || null,
+                line.quantity,
+                req.user.id
+              ]
+            );
+          }
+
+          const truckLabels =
+            normalizedTruckLines.map(
+              line =>
+                truckMap.get(
+                  Number(line.camion_id)
+                )?.code || ""
+            );
+
+          const driverLabels =
+            normalizedTruckLines.map(
+              line =>
+                line.driver_name ||
+                truckMap.get(
+                  Number(line.camion_id)
+                )?.chauffeur ||
+                ""
+            );
+
+          /*
+           * camion_id devient NULL pour empêcher
+           * l'ancien moteur mono-camion de créer
+           * une recette camion en double.
+           *
+           * truck / driver_name gardent une version
+           * texte compatible pour les BL existants.
+           */
+          await client.query(
+            `UPDATE sand_sales
+                SET camion_id=NULL,
+                    truck=$3,
+                    driver_name=$4,
+                    notes=COALESCE(
+                      NULLIF(TRIM(notes),''),
+                      'Vente de sable de fleuve'
+                    ),
+                    updated_at=NOW()
+              WHERE id=$1
+                AND company_id=$2`,
+            [
+              rows[0].id,
+              companyId,
+              truckLabels.join(" / "),
+              driverLabels
+                .filter(Boolean)
+                .join(" / ") || null
+            ]
+          );
+        }
+
+await client.query("COMMIT");
 
         res.status(201).json({
           ...rows[0],
@@ -847,16 +1114,185 @@ module.exports = function createSandSalesRouter({
           )
         ).rows[0];
 
+
+        // AUTO_DEPOSIT_SAND_V1
+        const depositAllocation =
+          await autoAllocateClientDeposits({
+            client,
+            companyId,
+            activity: "sable",
+            invoiceId: invoice.id,
+            userId: req.user.id,
+            userName:
+              req.user?.fullname ||
+              req.user?.email ||
+              "Utilisateur",
+            createAccountingEntry:
+              accounting.createAccountingEntry,
+          });
+
+        const finalInvoice =
+          depositAllocation.invoice || invoice;
+
+
+
+        // SAND_MULTI_TRUCK_VALIDATE_V1
+        const multiTruckRows =
+          (
+            await client.query(
+              `SELECT
+                 id,
+                 line_no,
+                 camion_id,
+                 truck_code,
+                 driver_name,
+                 quantity
+               FROM sale_truck_assignments
+               WHERE company_id=$1
+                 AND activity='sable'
+                 AND sale_id=$2
+               ORDER BY line_no,id`,
+              [
+                companyId,
+                sale.id
+              ]
+            )
+          ).rows;
+
+        if (multiTruckRows.length > 0) {
+
+          const saleQuantity =
+            Number(
+              sale.quantity_m3 || 0
+            );
+
+          const saleTotal =
+            Number(
+              sale.total_amount || 0
+            );
+
+          let allocatedRevenue=0;
+
+          for (
+            let i=0;
+            i<multiTruckRows.length;
+            i++
+          ) {
+
+            const line =
+              multiTruckRows[i];
+
+            const isLast =
+              i ===
+              multiTruckRows.length-1;
+
+            const revenue =
+              isLast
+                ? Number(
+                    (
+                      saleTotal -
+                      allocatedRevenue
+                    ).toFixed(2)
+                  )
+                : Number(
+                    (
+                      saleTotal *
+                      Number(line.quantity) /
+                      saleQuantity
+                    ).toFixed(2)
+                  );
+
+            allocatedRevenue += revenue;
+
+            await client.query(
+              `INSERT INTO camion_operations
+                 (
+                   company_id,
+                   camion_id,
+                   op_date,
+                   libelle,
+                   recette,
+                   depense,
+                   piece_ref,
+                   source_type,
+                   source_id,
+                   created_by
+                 )
+               VALUES
+                 (
+                   $1,$2,$3,$4,
+                   $5,0,$6,
+                   'sand_sale_truck',$7,$8
+                 )`,
+              [
+                companyId,
+                line.camion_id,
+                sale.sale_date,
+                `Vente sable ${sale.sale_number} — ${line.quantity} m³ — ${line.truck_code || ""}`,
+                revenue,
+                sale.sale_number,
+                line.id,
+                req.user.id
+              ]
+            );
+          }
+        }
+
+if (!multiTruckRows.length && sale.camion_id) {
+          await client.query(
+            `INSERT INTO camion_operations
+               (
+                 company_id,
+                 camion_id,
+                 op_date,
+                 libelle,
+                 recette,
+                 depense,
+                 piece_ref,
+                 source_type,
+                 source_id,
+                 created_by
+               )
+             VALUES
+               (
+                 $1,$2,CURRENT_DATE,$3,
+                 $4,0,$5,
+                 'sand_sale',$6,$7
+               )
+             ON CONFLICT
+               (company_id,source_type,source_id)
+               WHERE source_type='sand_sale'
+             DO NOTHING`,
+            [
+              companyId,
+              sale.camion_id,
+              `Vente sable ${sale.sale_number} — ${sale.destination || ""}`,
+              sale.total_amount,
+              sale.sale_number,
+              sale.id,
+              req.user.id
+            ]
+          );
+        }
+
         const validatedSale = (
           await client.query(
             `UPDATE sand_sales
              SET status='VALIDEE',
                  validated_by=$3,
                  validated_at=NOW(),
+                 paid_amount=$4,
+                 remaining_amount=$5,
                  updated_at=NOW()
              WHERE id=$1 AND company_id=$2
              RETURNING *`,
-            [sale.id,companyId,req.user.id]
+            [
+              sale.id,
+              companyId,
+              req.user.id,
+              finalInvoice.paid_amount,
+              finalInvoice.remaining_amount
+            ]
           )
         ).rows[0];
 
@@ -866,8 +1302,18 @@ module.exports = function createSandSalesRouter({
           success:true,
           sale:validatedSale,
           delivery,
-          invoice,
-          stock_impacted:false
+          invoice: finalInvoice,
+          stock_impacted:false,
+          deposit_allocation:{
+            total_used:
+              depositAllocation.totalAllocated || 0,
+            allocations:
+              depositAllocation.allocations || [],
+            invoice_status:
+              finalInvoice.status,
+            remaining_invoice:
+              finalInvoice.remaining_amount
+          }
         });
 
       } catch(e) {
@@ -955,6 +1401,286 @@ module.exports = function createSandSalesRouter({
     }
   );
 
+
+  // ---------------- B2. CHANGER LE CAMION D'UNE VENTE VALIDEE ----------------
+  //
+  // Opération volontairement limitée :
+  // - ne change aucun montant ;
+  // - ne change pas la facture ;
+  // - ne change pas le dépôt ;
+  // - ne change aucune banque/caisse ;
+  // - synchronise vente + BL + camion_operations.
+  //
+  router.get(
+    "/sand/trucks",
+    authenticateToken,
+    sandModuleGuard,
+    perm("view"),
+    async (req,res) => {
+      try {
+        const companyId = companyOf(req);
+
+        const { rows } = await pool.query(
+          `SELECT id,code,immatriculation,chauffeur,statut
+             FROM camions
+            WHERE company_id=$1
+              AND statut='ACTIF'
+            ORDER BY code`,
+          [companyId]
+        );
+
+        res.json(rows);
+      } catch(e) {
+        console.error("GET SAND TRUCKS:",e);
+        res.status(500).json({
+          error:"Erreur chargement camions."
+        });
+      }
+    }
+  );
+
+  router.patch(
+    "/sand/sales/:id/truck",
+    authenticateToken,
+    sandModuleGuard,
+    perm("view"),
+    async (req,res) => {
+      const client = await pool.connect();
+
+      try {
+        const companyId = companyOf(req);
+        const userId = Number(req.user?.id || 0);
+
+        /*
+         * Autorisés actuellement :
+         * - utilisateur 1 : super-admin / direction
+         * - utilisateur 29 : Issa Diallo
+         *
+         * Le contrôle entreprise reste assuré par companyOf(req).
+         */
+        if (![1,29].includes(userId)) {
+          return res.status(403).json({
+            error:
+              "Vous n'êtes pas autorisé à modifier l'affectation camion."
+          });
+        }
+
+        const camionId = Number(req.body?.camion_id || 0);
+
+        if (!camionId) {
+          return res.status(400).json({
+            error:"Sélectionnez un camion."
+          });
+        }
+
+        await client.query("BEGIN");
+
+        const sale = (
+          await client.query(
+            `SELECT *
+               FROM sand_sales
+              WHERE id=$1
+                AND company_id=$2
+              FOR UPDATE`,
+            [req.params.id,companyId]
+          )
+        ).rows[0];
+
+        if (!sale) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({
+            error:"Vente introuvable."
+          });
+        }
+
+        if (sale.status !== "VALIDEE") {
+          await client.query("ROLLBACK");
+          return res.status(409).json({
+            error:
+              "Le camion ne peut être changé directement que sur une vente validée."
+          });
+        }
+
+        const camion = (
+          await client.query(
+            `SELECT id,code,immatriculation,chauffeur
+               FROM camions
+              WHERE id=$1
+                AND company_id=$2
+                AND statut='ACTIF'`,
+            [camionId,companyId]
+          )
+        ).rows[0];
+
+        if (!camion) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            error:
+              "Camion invalide pour l'entreprise active."
+          });
+        }
+
+        /*
+         * Vente : seule l'affectation logistique change.
+         */
+        const updatedSale = (
+          await client.query(
+            `UPDATE sand_sales
+                SET camion_id=$3,
+                    truck=$4,
+                    driver_name=
+                      COALESCE(NULLIF($5,''),driver_name),
+                    updated_at=NOW()
+              WHERE id=$1
+                AND company_id=$2
+              RETURNING *`,
+            [
+              sale.id,
+              companyId,
+              camion.id,
+              camion.code,
+              String(req.body?.driver_name || camion.chauffeur || "").trim()
+            ]
+          )
+        ).rows[0];
+
+        /*
+         * BL : même camion que la vente.
+         */
+        await client.query(
+          `UPDATE sand_deliveries
+              SET truck=$3,
+                  driver_name=
+                    COALESCE(NULLIF($4,''),driver_name),
+                  updated_at=NOW()
+            WHERE sale_id=$1
+              AND company_id=$2`,
+          [
+            sale.id,
+            companyId,
+            camion.code,
+            String(req.body?.driver_name || camion.chauffeur || "").trim()
+          ]
+        );
+
+        /*
+         * Recette camion :
+         * une seule ligne par vente.
+         *
+         * Si l'opération existe déjà, on déplace simplement
+         * la recette vers le nouveau camion.
+         */
+        const existingOp = (
+          await client.query(
+            `SELECT id
+               FROM camion_operations
+              WHERE company_id=$1
+                AND source_type='sand_sale'
+                AND source_id=$2
+              ORDER BY id
+              LIMIT 1
+              FOR UPDATE`,
+            [companyId,sale.id]
+          )
+        ).rows[0];
+
+        if (existingOp) {
+          await client.query(
+            `UPDATE camion_operations
+                SET camion_id=$3,
+                    op_date=$4,
+                    libelle=$5,
+                    recette=$6,
+                    depense=0,
+                    piece_ref=$7
+              WHERE id=$1
+                AND company_id=$2`,
+            [
+              existingOp.id,
+              companyId,
+              camion.id,
+              sale.sale_date || new Date(),
+              `Vente sable ${sale.sale_number} — ${sale.destination || ""}`,
+              sale.total_amount,
+              sale.sale_number
+            ]
+          );
+        } else {
+          await client.query(
+            `INSERT INTO camion_operations
+               (
+                 company_id,
+                 camion_id,
+                 op_date,
+                 libelle,
+                 recette,
+                 depense,
+                 piece_ref,
+                 source_type,
+                 source_id,
+                 created_by
+               )
+             VALUES
+               ($1,$2,$3,$4,$5,0,$6,'sand_sale',$7,$8)`,
+            [
+              companyId,
+              camion.id,
+              sale.sale_date,
+              `Vente sable ${sale.sale_number} — ${sale.destination || ""}`,
+              sale.total_amount,
+              sale.sale_number,
+              sale.id,
+              userId
+            ]
+          );
+        }
+
+        /*
+         * Sécurité : il ne doit rester qu'une seule recette
+         * sand_sale pour cette vente.
+         */
+        const countOp = Number((
+          await client.query(
+            `SELECT COUNT(*) AS n
+               FROM camion_operations
+              WHERE company_id=$1
+                AND source_type='sand_sale'
+                AND source_id=$2`,
+            [companyId,sale.id]
+          )
+        ).rows[0].n);
+
+        if (countOp !== 1) {
+          throw new Error(
+            `Nombre de recettes camion inattendu : ${countOp}`
+          );
+        }
+
+        await client.query("COMMIT");
+
+        res.json({
+          success:true,
+          sale:updatedSale,
+          truck:camion,
+          financial_impact:false,
+          message:"Camion mis à jour."
+        });
+
+      } catch(e) {
+        await client.query("ROLLBACK").catch(()=>{});
+        console.error("PATCH SAND SALE TRUCK:",e);
+
+        res.status(500).json({
+          error:"Erreur modification camion."
+        });
+
+      } finally {
+        client.release();
+      }
+    }
+  );
+
+
   // ---------------- C. FACTURES IMPAYÉES ----------------
   router.get(
     "/sand/invoices/unpaid",
@@ -966,6 +1692,19 @@ module.exports = function createSandSalesRouter({
         const companyId = companyOf(req);
         const { rows } = await pool.query(
           `SELECT i.*, i.invoice_date::text AS invoice_date, i.due_date::text AS due_date,
+                  COALESCE((
+                    SELECT SUM(a.amount)
+                    FROM client_deposit_allocations a
+                    WHERE a.company_id=i.company_id
+                      AND a.activity='sable'
+                      AND a.invoice_id=i.id
+                      AND a.reverses_allocation_id IS NULL
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM client_deposit_allocations r
+                        WHERE r.reverses_allocation_id=a.id
+                      )
+                  ),0) AS deposit_used,
                   s.destination AS site, s.quantity_m3, s.customer_name,
                   COALESCE(c.name, s.customer_name) AS client_name
              FROM sand_invoices i
@@ -1574,6 +2313,97 @@ module.exports = function createSandSalesRouter({
     }
   );
 
+
+
+  // ==========================================================
+  // SAND_PERMANENT_DELETE_V2
+  // ==========================================================
+
+  router.delete(
+    "/sand/sales/:id/permanent",
+    authenticateToken,
+    sandModuleGuard,
+    perm("delete"),
+    async (req,res) => {
+
+      const client = await pool.connect();
+
+      try {
+        const companyId = companyOf(req);
+
+        await client.query("BEGIN");
+
+        const sale = (
+          await client.query(
+            `SELECT *
+             FROM sand_sales
+             WHERE id=$1
+               AND company_id=$2
+             FOR UPDATE`,
+            [req.params.id, companyId]
+          )
+        ).rows[0];
+
+        if (!sale) {
+          await client.query("ROLLBACK");
+
+          return res.status(404).json({
+            error:"Vente introuvable."
+          });
+        }
+
+        const paid = (
+          await client.query(
+            `SELECT COUNT(*)::int AS n
+             FROM sand_payments p
+             JOIN sand_invoices i
+               ON i.id=p.invoice_id
+              AND i.company_id=p.company_id
+             WHERE i.company_id=$1
+               AND i.sale_id=$2`,
+            [companyId, sale.id]
+          )
+        ).rows[0]?.n || 0;
+
+        if (Number(paid) > 0) {
+          await client.query("ROLLBACK");
+
+          return res.status(409).json({
+            error:
+              "Impossible de supprimer une vente déjà payée. " +
+              "Le paiement doit d'abord être contrepassé."
+          });
+        }
+
+        await client.query(
+          `DELETE FROM sand_sales
+           WHERE id=$1
+             AND company_id=$2`,
+          [sale.id, companyId]
+        );
+
+        await client.query("COMMIT");
+
+        res.json({
+          success:true,
+          deleted:true,
+          sale_number:sale.sale_number
+        });
+
+      } catch(e) {
+        await client.query("ROLLBACK").catch(()=>{});
+
+        console.error("DELETE SAND SALE:",e);
+
+        res.status(500).json({
+          error:e.detail || e.message || "Suppression impossible."
+        });
+
+      } finally {
+        client.release();
+      }
+    }
+  );
 
   return router;
 };

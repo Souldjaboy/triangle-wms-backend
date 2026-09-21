@@ -55,7 +55,14 @@ async function calculerPaiePeriode(client, companyId, periode) {
      ),
      jours AS (
        SELECT d::date AS jour, extract(isodow FROM d)::int AS isodow
-         FROM generate_series($2::date, $3::date, interval '1 day') d
+         FROM generate_series(
+          $2::date,
+          LEAST(
+            $3::date,
+            (CURRENT_TIMESTAMP AT TIME ZONE 'Africa/Bamako')::date
+          ),
+          interval '1 day'
+        ) d
      ),
      employes AS (
        SELECT e.id, e.employee_number, e.full_name, e.schedule_id
@@ -75,11 +82,21 @@ async function calculerPaiePeriode(client, companyId, periode) {
               CASE
                 WHEN NULLIF(g.overridden_status, '') IS NOT NULL
                   THEN g.overridden_status IN ('PRESENT','LATE','COMPLETED')
-                WHEN r.check_in IS NOT NULL THEN true
                 WHEN g.effective_check_in IS NOT NULL THEN true
+                WHEN r.check_in IS NOT NULL THEN true
                 ELSE false
               END AS presente,
-              COALESCE(r.late_minutes, 0) AS retard
+              CASE
+                WHEN NULLIF(g.overridden_status, '') IS NOT NULL
+                  THEN CASE
+                    WHEN g.overridden_status = 'LATE'
+                      THEN COALESCE(r.late_minutes, 0)
+                    ELSE 0
+                  END
+                WHEN g.effective_check_in IS NOT NULL
+                  THEN 0
+                ELSE COALESCE(r.late_minutes, 0)
+              END AS retard
          FROM employes e
          CROSS JOIN jours j
          LEFT JOIN attendance_schedule_days d

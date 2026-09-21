@@ -1376,6 +1376,168 @@ async function activateVerifiedAccount({ companyId, userId, targetType }) {
   );
 }
 
+/* TRIANGLE_WEB_PUSH_AUTO_V2 */
+
+async function sendTriangleWebPush({
+  user_id,
+  company_id,
+  title,
+  message,
+  type,
+  priority = "normal",
+  action_url = "",
+  notification_id = null
+}) {
+  if (!user_id) return;
+
+  if (
+    !webPush ||
+    !process.env.WEB_PUSH_VAPID_PUBLIC_KEY ||
+    !process.env.WEB_PUSH_VAPID_PRIVATE_KEY
+  ) {
+    return;
+  }
+
+  webPush.setVapidDetails(
+    process.env.WEB_PUSH_CONTACT ||
+      `mailto:${
+        process.env.SMTP_FROM ||
+        process.env.SMTP_USER ||
+        "support@trianglewmspro.com"
+      }`,
+    process.env.WEB_PUSH_VAPID_PUBLIC_KEY,
+    process.env.WEB_PUSH_VAPID_PRIVATE_KEY
+  );
+
+  const result = await pool.query(
+    `SELECT
+       id,
+       endpoint,
+       p256dh,
+       auth
+     FROM push_subscriptions
+     WHERE user_id=$1
+       AND is_active=true
+       AND (
+         $2::integer IS NULL
+         OR company_id=$2
+         OR company_id IS NULL
+       )
+     ORDER BY id DESC
+     LIMIT 20`,
+    [
+      Number(user_id),
+      company_id
+        ? Number(company_id)
+        : null
+    ]
+  );
+
+  if (!result.rows.length) {
+    return;
+  }
+
+  const isCall =
+    String(type || "") === "chat_call";
+
+  const payload = JSON.stringify({
+    title:
+      title ||
+      (
+        isCall
+          ? "📞 Appel entrant Triangle"
+          : "Triangle WMS Pro"
+      ),
+
+    message:
+      message || "",
+
+    type:
+      type || "notification",
+
+    priority:
+      priority || "normal",
+
+    url:
+      action_url || "/notifications",
+
+    notification_id,
+
+    company_id:
+      company_id || null,
+
+    call:
+      isCall,
+
+    created_at:
+      new Date().toISOString()
+  });
+
+  for (const subscription of result.rows) {
+    try {
+      await webPush.sendNotification(
+        {
+          endpoint:
+            subscription.endpoint,
+
+          keys: {
+            p256dh:
+              subscription.p256dh,
+
+            auth:
+              subscription.auth
+          }
+        },
+        payload,
+        {
+          /*
+           * Appel : 2 min seulement.
+           * Message/document : 7 jours.
+           */
+          TTL:
+            isCall
+              ? 120
+              : 604800,
+
+          urgency:
+            isCall ||
+            priority === "high"
+              ? "high"
+              : "normal"
+        }
+      );
+    } catch (error) {
+      const code =
+        Number(
+          error?.statusCode ||
+          error?.status ||
+          0
+        );
+
+      console.warn(
+        "TRIANGLE WEB PUSH:",
+        subscription.id,
+        code ||
+        error?.message
+      );
+
+      if (
+        code === 404 ||
+        code === 410
+      ) {
+        await pool.query(
+          `UPDATE push_subscriptions
+           SET is_active=false,
+               updated_at=CURRENT_TIMESTAMP
+           WHERE id=$1`,
+          [subscription.id]
+        ).catch(() => {});
+      }
+    }
+  }
+}
+
+
 async function createNotification({
   user_id,
   title,
@@ -1391,12 +1553,26 @@ async function createNotification({
   assigned_to = null,
   warehouse_id = null
 }) {
-  await pool.query(
+  const result = await pool.query(
     `INSERT INTO notifications
-     (user_id, title, message, type, company_id, status, priority,
-      related_entity_type, related_entity_id, action_url, created_by,
-      assigned_to, warehouse_id)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+     (
+       user_id,
+       title,
+       message,
+       type,
+       company_id,
+       status,
+       priority,
+       related_entity_type,
+       related_entity_id,
+       action_url,
+       created_by,
+       assigned_to,
+       warehouse_id
+     )
+     VALUES
+     ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+     RETURNING id`,
     [
       user_id,
       title,
@@ -1413,7 +1589,35 @@ async function createNotification({
       warehouse_id
     ]
   );
+
+  const notificationId =
+    result.rows[0]?.id || null;
+
+  /*
+   * Le push est non bloquant pour le métier.
+   */
+  try {
+    await sendTriangleWebPush({
+      user_id,
+      company_id,
+      title,
+      message,
+      type,
+      priority,
+      action_url,
+      notification_id:
+        notificationId
+    });
+  } catch (error) {
+    console.error(
+      "TRIANGLE PUSH NON BLOQUANT:",
+      error?.message || error
+    );
+  }
+
+  return notificationId;
 }
+
 
 const COMPANY_MODULE_KEYS = [
   "dashboard",
@@ -3759,7 +3963,7 @@ app.delete(
 );
 
 /* PRODUITS SAAS */
-app.get("/products", authenticateToken, async (req, res) => {
+app.get("/products", authenticateToken, requirePermission("produit", "view"), async (req, res) => {
   try {
     const isSuperAdmin = req.user.is_super_admin === true;
     const companyId = isSuperAdmin ? getEffectiveCompanyId(req) : req.user.company_id;
@@ -3792,7 +3996,7 @@ app.get("/products", authenticateToken, async (req, res) => {
   }
 });
 
-app.post("/products", authenticateToken, async (req, res) => {
+app.post("/products", authenticateToken, requirePermission("produit", "create"), async (req, res) => {
   try {
     if (isReadOnlyRole(req.user)) {
       return res.status(403).json({ error: "Accès lecture seule." });
@@ -3938,7 +4142,7 @@ app.post("/products", authenticateToken, async (req, res) => {
 app.put(
   "/products/:id",
   authenticateToken,
-  authorizeRoles("admin", "super_admin"),
+  requirePermission("produit", "update"),
   async (req, res) => {
   try {
     if (isReadOnlyRole(req.user)) {
@@ -4058,7 +4262,7 @@ app.put(
 app.delete(
   "/products/:id",
   authenticateToken,
-  authorizeRoles("admin", "super_admin"),
+  requirePermission("produit", "delete"),
   async (req, res) => {
   try {
     if (isReadOnlyRole(req.user)) {
@@ -4110,7 +4314,7 @@ app.get("/stock-movements", authenticateToken, async (req, res) => {
 
     let values = [];
 
-    if (!isSuperAdmin) {
+    if (companyId) {
       query += ` WHERE company_id = $1 `;
       values.push(companyId);
     }
@@ -6612,6 +6816,27 @@ app.post("/pos/send-receipt-email", authenticateToken, async (req, res) => {
   }
 });
 
+/* TRIANGLE_PUSH_PUBLIC_KEY_V2 */
+app.get(
+  "/push/public-key",
+  authenticateToken,
+  async (req, res) => {
+    const publicKey =
+      process.env.WEB_PUSH_VAPID_PUBLIC_KEY || "";
+
+    if (!publicKey) {
+      return res.status(503).json({
+        error:
+          "Web Push Triangle non configuré."
+      });
+    }
+
+    res.json({
+      publicKey
+    });
+  }
+);
+
 app.post("/push/subscribe", authenticateToken, async (req, res) => {
   try {
     if (!process.env.WEB_PUSH_VAPID_PUBLIC_KEY || !process.env.WEB_PUSH_VAPID_PRIVATE_KEY) {
@@ -7660,6 +7885,14 @@ function accountingErrorMessage(error, fallback) {
   return error?.detail || error?.message || fallback;
 }
 
+/* Une notification ne doit jamais contourner les droits de comptabilité.
+   Ce garde couvre toutes les routes /accounting, même les plus anciennes. */
+app.use(
+  "/accounting",
+  authenticateToken,
+  requirePermission("comptabilite", "view")
+);
+
 app.get("/accounting/dashboard", authenticateToken, async (req, res) => {
   try {
     if (!canViewAccounting(req.user)) {
@@ -7686,19 +7919,24 @@ app.get("/accounting/dashboard", authenticateToken, async (req, res) => {
     const dailyIn = await pool.query(
       `SELECT COALESCE(SUM(amount),0)::numeric AS total
        FROM accounting_transactions
-       WHERE direction='entrée' AND DATE(created_at)=CURRENT_DATE ${andFilter}`,
+       WHERE direction='entrée'
+         AND COALESCE(show_in_financial_movements,TRUE)=TRUE
+         AND DATE(created_at)=CURRENT_DATE ${andFilter}`,
       values
     );
     const dailyOut = await pool.query(
       `SELECT COALESCE(SUM(amount),0)::numeric AS total
        FROM accounting_transactions
-       WHERE direction='sortie' AND DATE(created_at)=CURRENT_DATE ${andFilter}`,
+       WHERE direction='sortie'
+         AND COALESCE(show_in_financial_movements,TRUE)=TRUE
+         AND DATE(created_at)=CURRENT_DATE ${andFilter}`,
       values
     );
     const monthExpenses = await pool.query(
       `SELECT COALESCE(SUM(amount),0)::numeric AS total
        FROM accounting_transactions
        WHERE direction='sortie'
+         AND COALESCE(show_in_financial_movements,TRUE)=TRUE
          AND date_trunc('month', created_at)=date_trunc('month', CURRENT_DATE)
          ${andFilter}`,
       values
@@ -7976,7 +8214,9 @@ app.get("/accounting/transactions", authenticateToken, async (req, res) => {
        FROM accounting_transactions t
        LEFT JOIN accounting_banks b ON b.id=t.bank_id
        LEFT JOIN caisses c ON c.id=t.caisse_id
-       ${filter ? "WHERE t.company_id=$1" : ""}
+       ${filter
+         ? "WHERE t.company_id=$1 AND COALESCE(t.show_in_financial_movements,TRUE)=TRUE"
+         : "WHERE COALESCE(t.show_in_financial_movements,TRUE)=TRUE"}
        ORDER BY t.id DESC
        LIMIT 300`,
       values
@@ -13375,9 +13615,63 @@ app.get("/inventory-history", authenticateToken, async (req, res) => {
 });
 
 /* ENTREPÔTS SAAS JWT */
-app.get("/warehouses", authenticateToken, async (req, res) => {
+const codeRayonAutomatique = (index) => {
+  let n = index + 1;
+  let out = "";
+  while (n > 0) {
+    n -= 1;
+    out = String.fromCharCode(65 + (n % 26)) + out;
+    n = Math.floor(n / 26);
+  }
+  return out;
+};
+
+/* `locations` ne possède pas une table séparée de rayons : un rayon existe
+   lorsqu'au moins un vrai bac le porte. Modifier seulement racks_count
+   changeait donc le chiffre affiché sans créer le moindre rayon utilisable.
+   On matérialise chaque nouveau rayon avec un bac vide minimal. On ne supprime
+   jamais automatiquement les rayons surnuméraires : ils peuvent contenir du
+   stock et doivent être archivés explicitement depuis Emplacements. */
+async function synchroniserRayonsEntrepot(runner, warehouse, nombreDemande) {
+  const cible = Math.max(0, Math.min(200, Math.floor(Number(nombreDemande || 0))));
+  if (!cible) return { created: 0 };
+
+  const existantsResult = await runner.query(
+    `SELECT DISTINCT UPPER(COALESCE(NULLIF(rayon_code,''), zone, '')) AS code
+       FROM locations
+      WHERE company_id = $1 AND warehouse_id = $2 AND archived_at IS NULL`,
+    [warehouse.company_id, warehouse.id]
+  );
+  const existants = new Set(existantsResult.rows.map((r) => String(r.code || "")).filter(Boolean));
+  let created = 0;
+  for (let i = 0; existants.size < cible && i < 500; i += 1) {
+    const row = codeRayonAutomatique(i);
+    if (existants.has(row)) continue;
+    const shelf = "1", level = "1", bin = "BIN1";
+    const emplacement = `${warehouse.code}-${row}-${shelf}-${level}`;
+    const full = `${emplacement}-${bin}`;
+    await runner.query(
+      `INSERT INTO locations
+         (warehouse_id, warehouse_code, zone, rayon, etagere, emplacement_code,
+          rayon_code, case_code, level_code, bin_code, status, company_id,
+          full_code, is_active, occupancy_status, level_rank, bin_rank)
+       SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'Disponible',$11,$12,TRUE,'EMPTY',1,1
+        WHERE NOT EXISTS (
+          SELECT 1 FROM locations
+           WHERE company_id = $11 AND UPPER(COALESCE(full_code, emplacement_code, '')) = UPPER($12)
+        )`,
+      [warehouse.id, warehouse.code, row, shelf, level, emplacement,
+       row, shelf, level, bin, warehouse.company_id, full]
+    );
+    existants.add(row);
+    created += 1;
+  }
+  return { created };
+}
+
+app.get("/warehouses", authenticateToken, requirePermission("entrepot", "view"), async (req, res) => {
   try {
-    const companyId = req.user.company_id;
+    const companyId = getEffectiveCompanyId(req, req.user.company_id);
     const isSuperAdmin = req.user.is_super_admin === true;
 
     let query = `
@@ -13404,10 +13698,17 @@ app.get("/warehouses", authenticateToken, async (req, res) => {
   }
 });
 
-app.post("/warehouses", authenticateToken, async (req, res) => {
+app.post("/warehouses", authenticateToken, requirePermission("entrepot", "create"), async (req, res) => {
   try {
-    const companyId = req.user.company_id;
     const isSuperAdmin = req.user.is_super_admin === true;
+
+    const companyId = Number(getEffectiveCompanyId(req, req.user.company_id) || 0);
+
+    if (!companyId) {
+      return res.status(400).json({
+        error: "Entreprise active requise pour créer un entrepôt"
+      });
+    }
 
     if (!isSuperAdmin) {
       const limits = await getCompanyPlanLimits(companyId);
@@ -13417,10 +13718,16 @@ app.post("/warehouses", authenticateToken, async (req, res) => {
         [companyId]
       );
 
-      const currentWarehouses = Number(countResult.rows[0].count);
-      const maxWarehouses = Number(limits?.max_warehouses || 0);
+      const currentWarehouses =
+        Number(countResult.rows[0].count);
 
-      if (maxWarehouses > 0 && currentWarehouses >= maxWarehouses) {
+      const maxWarehouses =
+        Number(limits?.max_warehouses || 0);
+
+      if (
+        maxWarehouses > 0 &&
+        currentWarehouses >= maxWarehouses
+      ) {
         return res.status(403).json({
           error:
             "Limite entrepôts atteinte pour votre formule. Veuillez passer à une formule supérieure."
@@ -13428,93 +13735,275 @@ app.post("/warehouses", authenticateToken, async (req, res) => {
       }
     }
 
-    const { code, name, location, manager, racks_count, status } = req.body;
+    const {
+      code,
+      name,
+      location,
+      manager,
+      racks_count,
+      status
+    } = req.body;
 
-    const result = await pool.query(
-      `INSERT INTO warehouses
-      (
-        code,
-        name,
-        location,
-        manager,
-        racks_count,
-        status,
-        company_id
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7)
-      RETURNING *`,
-      [
-        code,
-        name,
-        location || "",
-        manager || "",
-        Number(racks_count || 0),
-        status || "Actif",
-        companyId
-      ]
+    const normalizedCode =
+      String(code || "").trim();
+
+    const normalizedName =
+      String(name || normalizedCode).trim();
+
+    const normalizedLocation =
+      String(location || "").trim();
+
+    const normalizedManager =
+      String(manager || "").trim();
+
+    const rawStatus =
+      String(status || "active")
+        .trim()
+        .toLowerCase();
+
+    const normalizedStatus =
+      rawStatus === "inactive" ||
+      rawStatus === "inactif"
+        ? "inactive"
+        : "active";
+
+    if (!normalizedCode) {
+      return res.status(400).json({
+        error: "Code entrepôt obligatoire"
+      });
+    }
+
+    if (!normalizedName) {
+      return res.status(400).json({
+        error: "Nom entrepôt obligatoire"
+      });
+    }
+
+    const duplicate = await pool.query(
+      `SELECT id, code, name
+         FROM warehouses
+        WHERE company_id = $1
+          AND UPPER(BTRIM(code)) = UPPER($2)
+        LIMIT 1`,
+      [companyId, normalizedCode]
     );
 
-    res.status(201).json(result.rows[0]);
+    if (duplicate.rows.length > 0) {
+      return res.status(409).json({
+        error:
+          "Un entrepôt avec ce code existe déjà dans cette entreprise"
+      });
+    }
+
+    const client = await pool.connect();
+    let result;
+    let rayons;
+    try {
+      await client.query("BEGIN");
+      result = await client.query(
+        `INSERT INTO warehouses
+       (
+         code,
+         name,
+         location,
+         manager,
+         racks_count,
+         status,
+         company_id
+       )
+       VALUES ($1,$2,$3,$4,$5,$6,$7)
+       RETURNING *`,
+      [
+        normalizedCode,
+        normalizedName,
+        normalizedLocation,
+        normalizedManager,
+        Number(racks_count || 0),
+        normalizedStatus,
+        companyId
+        ]
+      );
+      rayons = await synchroniserRayonsEntrepot(client, result.rows[0], racks_count);
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
+
+    res.status(201).json({ ...result.rows[0], rayons_created: rayons.created });
+
   } catch (error) {
     console.error(error);
+
     res.status(500).json({
       error: "Erreur ajout entrepôt"
     });
   }
 });
 
-app.put("/warehouses/:id", authenticateToken, async (req, res) => {
+
+app.put("/warehouses/:id", authenticateToken, requirePermission("entrepot", "update"), async (req, res) => {
   try {
-    const companyId = req.user.company_id;
     const isSuperAdmin = req.user.is_super_admin === true;
 
-    const { id } = req.params;
-    const { code, name, location, manager, racks_count, status } = req.body;
+    const companyId = Number(getEffectiveCompanyId(req, req.user.company_id) || 0);
 
-    let query = `
-      UPDATE warehouses
-      SET code=$1, name=$2, location=$3, manager=$4, racks_count=$5, status=$6
-      WHERE id=$7
-    `;
-
-    const values = [
-      code,
-      name,
-      location || "",
-      manager || "",
-      Number(racks_count || 0),
-      status || "Actif",
-      id
-    ];
-
-    if (!isSuperAdmin) {
-      query += ` AND company_id=$8`;
-      values.push(companyId);
+    if (!companyId) {
+      return res.status(400).json({
+        error: "Entreprise active requise pour modifier un entrepôt"
+      });
     }
 
-    query += ` RETURNING *`;
+    const { id } = req.params;
 
-    const result = await pool.query(query, values);
+    const warehouseId =
+      Number(id);
 
-    res.json(result.rows[0]);
+    if (!Number.isInteger(warehouseId) || warehouseId <= 0) {
+      return res.status(400).json({
+        error: "Identifiant entrepôt invalide"
+      });
+    }
+
+    const {
+      code,
+      name,
+      location,
+      manager,
+      racks_count,
+      status
+    } = req.body;
+
+    const normalizedCode =
+      String(code || "").trim();
+
+    const normalizedName =
+      String(name || normalizedCode).trim();
+
+    const normalizedLocation =
+      String(location || "").trim();
+
+    const normalizedManager =
+      String(manager || "").trim();
+
+    const rawStatus =
+      String(status || "active")
+        .trim()
+        .toLowerCase();
+
+    const normalizedStatus =
+      rawStatus === "inactive" ||
+      rawStatus === "inactif"
+        ? "inactive"
+        : "active";
+
+    if (!normalizedCode) {
+      return res.status(400).json({
+        error: "Code entrepôt obligatoire"
+      });
+    }
+
+    if (!normalizedName) {
+      return res.status(400).json({
+        error: "Nom entrepôt obligatoire"
+      });
+    }
+
+    const existing = await pool.query(
+      `SELECT id
+         FROM warehouses
+        WHERE id = $1
+          AND company_id = $2
+        LIMIT 1`,
+      [warehouseId, companyId]
+    );
+
+    if (!existing.rows.length) {
+      return res.status(404).json({
+        error:
+          "Entrepôt introuvable dans l'entreprise active"
+      });
+    }
+
+    const duplicate = await pool.query(
+      `SELECT id
+         FROM warehouses
+        WHERE company_id = $1
+          AND UPPER(BTRIM(code)) = UPPER($2)
+          AND id <> $3
+        LIMIT 1`,
+      [
+        companyId,
+        normalizedCode,
+        warehouseId
+      ]
+    );
+
+    if (duplicate.rows.length > 0) {
+      return res.status(409).json({
+        error:
+          "Un autre entrepôt utilise déjà ce code"
+      });
+    }
+
+    const client = await pool.connect();
+    let result;
+    let rayons;
+    try {
+      await client.query("BEGIN");
+      result = await client.query(
+        `UPDATE warehouses
+          SET code = $1,
+              name = $2,
+              location = $3,
+              manager = $4,
+              racks_count = $5,
+              status = $6,
+              updated_at = NOW()
+        WHERE id = $7
+          AND company_id = $8
+        RETURNING *`,
+      [
+        normalizedCode,
+        normalizedName,
+        normalizedLocation,
+        normalizedManager,
+        Number(racks_count || 0),
+        normalizedStatus,
+        warehouseId,
+        companyId
+        ]
+      );
+      rayons = await synchroniserRayonsEntrepot(client, result.rows[0], racks_count);
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
+
+    res.json({ ...result.rows[0], rayons_created: rayons.created });
+
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: "Erreur modification entrepôt" });
+
+    res.status(500).json({
+      error: "Erreur modification entrepôt"
+    });
   }
 });
 
-app.delete("/warehouses/:id", authenticateToken, async (req, res) => {
+
+app.delete("/warehouses/:id", authenticateToken, requirePermission("entrepot", "delete"), async (req, res) => {
   try {
-    const companyId = req.user.company_id;
+    const companyId = getEffectiveCompanyId(req, req.user.company_id);
     const isSuperAdmin = req.user.is_super_admin === true;
 
-    let query = "DELETE FROM warehouses WHERE id=$1";
-    const values = [req.params.id];
-
-    if (!isSuperAdmin) {
-      query += " AND company_id=$2";
-      values.push(companyId);
-    }
+    let query = "DELETE FROM warehouses WHERE id=$1 AND company_id=$2";
+    const values = [req.params.id, companyId];
 
     query += " RETURNING *";
 
@@ -14364,6 +14853,43 @@ async function handleGlobalSearch(req, res) {
 /* RECHERCHE GLOBALE INTELLIGENTE */
 app.get("/global-search", authenticateToken, handleGlobalSearch);
 app.get("/search", authenticateToken, handleGlobalSearch);
+
+
+/* CHAT_V2_ROUTER_20260912 */
+const chatV2Router = require("./routes/chat-v2")({
+  pool,
+  authenticateToken,
+  createNotification,
+  getEffectiveCompanyId,
+  requirePermission
+});
+
+app.use("/", chatV2Router);
+
+
+/* TRIANGLE_FRET_CAMERAS_V1 */
+
+const fretChineMaliRouter =
+  require("./routes/fret-chine-mali")({
+    pool,
+    authenticateToken,
+    getEffectiveCompanyId,
+    requirePermission
+  });
+
+app.use("/", fretChineMaliRouter);
+
+
+const camerasRouter =
+  require("./routes/cameras")({
+    pool,
+    authenticateToken,
+    getEffectiveCompanyId,
+    requirePermission
+  });
+
+app.use("/", camerasRouter);
+
 
 /* CHAT INTERNE & NOTIFICATIONS */
 
@@ -18572,7 +19098,7 @@ app.get("/me/permissions", authenticateToken, async (req, res) => {
 const ACCENTS_FROM = "áàâäãåéèêëíìîïóòôöõúùûüýÿçñÁÀÂÄÃÅÉÈÊËÍÌÎÏÓÒÔÖÕÚÙÛÜÝÇÑ";
 const ACCENTS_TO   = "aaaaaaeeeeiiiiooooouuuuyycnAAAAAAEEEEIIIIOOOOOUUUUYCN";
 
-app.get("/products/search", authenticateToken, async (req, res) => {
+app.get("/products/search", authenticateToken, requirePermission("produit", "view"), async (req, res) => {
   try {
     const companyId = getEffectiveCompanyId(req, req.user.company_id);
     const q = String(req.query.q || "").trim();
@@ -18828,7 +19354,7 @@ app.use(
   "/",
   createAvancesRouter({
     pool, authenticateToken, getEffectiveCompanyId, requirePermission,
-    nextAccountingNumber, createAccountingEntry,
+    nextAccountingNumber, createAccountingEntry, permissionsService,
   })
 );
 
@@ -19084,6 +19610,47 @@ app.post("/companies/switch", authenticateToken, async (req,res) => {
     res.status(500).json({error:"Erreur changement entreprise."});
   }
 });
+
+
+/* DOCUMENT DESIGN SETTINGS — Triangle WMS */
+const createDocumentDesignRouter =
+  require("./routes/document-design");
+
+app.use(
+  "/",
+  createDocumentDesignRouter({
+    pool,
+    authenticateToken,
+    getEffectiveCompanyId,
+    authorizeRoles
+  })
+);
+
+
+/* TRIANGLE_REMINDERS_MODULE */
+const createRemindersRouter = require("./routes/reminders");
+app.use(
+  "/reminders",
+  createRemindersRouter({
+    pool,
+    authenticateToken
+  })
+);
+
+
+/* TRIANGLE_MEETING_PRESENTATION_V1 */
+const createMeetingPresentationRouter =
+  require("./routes/meeting-presentation");
+
+app.use(
+  "/",
+  createMeetingPresentationRouter({
+    pool,
+    authenticateToken,
+    getEffectiveCompanyId,
+    requirePermission,
+  })
+);
 
 app.listen(5050, () => {
   console.log("Backend sécurisé démarré sur le port 5050");

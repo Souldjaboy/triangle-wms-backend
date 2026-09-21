@@ -47,18 +47,78 @@ class ReceptionError extends Error {
 
 /* Entrepôt créé seulement s'il manque — jamais de doublon, aucun impact stock. */
 async function ensureWarehouse(client, companyId, code, name = null) {
-  const found = (await client.query(
-    `SELECT * FROM warehouses WHERE company_id=$1 AND UPPER(code)=UPPER($2) LIMIT 1`,
-    [companyId, code]
-  )).rows[0];
-  if (found) return { warehouse: found, created: false };
-  const { rows } = await client.query(
-    `INSERT INTO warehouses (code, name, status, company_id, created_at, updated_at)
-     VALUES ($1,$2,'actif',$3,NOW(),NOW()) RETURNING *`,
-    [code, name || code, companyId]
-  );
-  return { warehouse: rows[0], created: true };
+  const normalizedCompanyId =
+    Number(companyId || 0);
+
+  const normalizedCode =
+    String(code || "").trim();
+
+  const normalizedName =
+    String(name || normalizedCode).trim();
+
+  if (!normalizedCompanyId) {
+    throw new ReceptionError(
+      "Entreprise requise pour l'entrepôt",
+      "WAREHOUSE_COMPANY_REQUIRED",
+      400
+    );
+  }
+
+  if (!normalizedCode) {
+    throw new ReceptionError(
+      "Code entrepôt obligatoire",
+      "WAREHOUSE_CODE_REQUIRED",
+      400
+    );
+  }
+
+  const found = (
+    await client.query(
+      `SELECT *
+         FROM warehouses
+        WHERE company_id = $1
+          AND UPPER(BTRIM(code)) = UPPER($2)
+        LIMIT 1`,
+      [
+        normalizedCompanyId,
+        normalizedCode
+      ]
+    )
+  ).rows[0];
+
+  if (found) {
+    return {
+      warehouse: found,
+      created: false
+    };
+  }
+
+  const { rows } =
+    await client.query(
+      `INSERT INTO warehouses
+       (
+         code,
+         name,
+         status,
+         company_id,
+         created_at,
+         updated_at
+       )
+       VALUES ($1,$2,'active',$3,NOW(),NOW())
+       RETURNING *`,
+      [
+        normalizedCode,
+        normalizedName,
+        normalizedCompanyId
+      ]
+    );
+
+  return {
+    warehouse: rows[0],
+    created: true
+  };
 }
+
 
 async function nextReceptionNumber(client, companyId) {
   const d = new Date();

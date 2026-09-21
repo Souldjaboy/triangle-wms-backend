@@ -72,7 +72,14 @@ module.exports = function createPointageRapportsRouter(deps) {
   const REQUETE_DETAIL = `
     WITH jours AS (
       SELECT d::date AS jour, extract(isodow FROM d)::int AS isodow
-        FROM generate_series($2::date, $3::date, interval '1 day') d
+        FROM generate_series(
+          $2::date,
+          LEAST(
+            $3::date,
+            (CURRENT_TIMESTAMP AT TIME ZONE 'Africa/Bamako')::date
+          ),
+          interval '1 day'
+        ) d
     ),
     cfg AS (
       SELECT COALESCE(saturday_mode, 'NORMAL') AS samedi, COALESCE(timezone,'Africa/Bamako') AS tz
@@ -122,15 +129,55 @@ module.exports = function createPointageRapportsRouter(deps) {
       return { ...l, du, statut: l.overridden_status, source: "correction_administrative",
                arrivee: null, depart: null, motif: l.override_reason };
     }
-    if (l.check_in) {
-      return { ...l, du, statut: l.statut_brut, source: (l.sources || "MANUEL").split(",")[0],
-               arrivee: l.check_in, depart: l.check_out, motif: "" };
-    }
+    /*
+     * PRIORITE EFFECTIVE :
+     * 1. correction administrative
+     *    -> déjà traitée juste au-dessus
+     * 2. régularisation
+     * 3. pointage brut
+     */
+
     if (l.effective_check_in) {
-      return { ...l, du, statut: l.effective_status, source: "regularisation",
-               arrivee: l.effective_check_in, depart: l.effective_check_out,
-               motif: l.motif_regularisation };
+      const debut = new Date(l.effective_check_in);
+      const fin = l.effective_check_out
+        ? new Date(l.effective_check_out)
+        : null;
+
+      return {
+        ...l,
+        du,
+        statut: l.effective_status || "COMPLETED",
+        source: "regularisation",
+        arrivee: l.effective_check_in,
+        depart: l.effective_check_out,
+        late_minutes: 0,
+        worked_minutes:
+          fin &&
+          !Number.isNaN(debut.getTime()) &&
+          !Number.isNaN(fin.getTime())
+            ? Math.max(
+                0,
+                Math.round(
+                  (fin.getTime() - debut.getTime()) / 60000
+                )
+              )
+            : Number(l.worked_minutes || 0),
+        motif: l.motif_regularisation
+      };
     }
+
+    if (l.check_in) {
+      return {
+        ...l,
+        du,
+        statut: l.statut_brut,
+        source: (l.sources || "MANUEL").split(",")[0],
+        arrivee: l.check_in,
+        depart: l.check_out,
+        motif: ""
+      };
+    }
+
     if (l.dimanche) return { ...l, du, statut: "REPOS", source: "calendrier", arrivee: null, depart: null, motif: "" };
     if (samediChome) return { ...l, du, statut: "REPOS", source: "calendrier", arrivee: null, depart: null, motif: "" };
     if (l.ferie) return { ...l, du, statut: "FERIE", source: "calendrier", arrivee: null, depart: null, motif: l.ferie_label || "" };

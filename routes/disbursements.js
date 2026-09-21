@@ -120,7 +120,30 @@ module.exports = function createDisbursementsRouter(deps) {
      pas son existence), même en changeant l'ID dans l'URL. */
   async function loadScoped(req, id) {
     const companyId = companyOf(req);
-    const { rows } = await pool.query(`SELECT * FROM disbursement_requests WHERE id=$1 AND company_id=$2`, [id, companyId]);
+    const { rows } = await pool.query(
+      `SELECT d.*,
+              (
+              SELECT
+                string_agg(
+                  DISTINCT c.code,
+                  ', '
+                  ORDER BY c.code
+                )
+
+              FROM disbursement_request_lines dl
+
+              JOIN camions c
+                ON c.id=dl.camion_id
+               AND c.company_id=dl.company_id
+
+              WHERE dl.request_id=d.id
+                AND dl.company_id=d.company_id
+
+            ) AS camion_code
+         FROM disbursement_requests d
+        WHERE d.id=$1 AND d.company_id=$2`,
+      [id, companyId]
+    );
     const row = rows[0];
     if (!row) return null;
     if (await canSeeAll(req)) return row;
@@ -130,14 +153,158 @@ module.exports = function createDisbursementsRouter(deps) {
 
   async function shortNumber(client, prefix, companyId) {
     const d = new Date();
-    const stamp = String(d.getFullYear()).slice(2) + String(d.getMonth() + 1).padStart(2, "0") + String(d.getDate()).padStart(2, "0");
-    const { rows } = await client.query(
-      `INSERT INTO stock_request_counters (company_id, year, prefix, last_seq) VALUES ($1,$2,$3,1)
-       ON CONFLICT (company_id, year, prefix) DO UPDATE SET last_seq = stock_request_counters.last_seq + 1
-       RETURNING last_seq`,
-      [companyId, d.getFullYear(), `${prefix}#${stamp}`]
+
+    const stamp =
+      String(d.getFullYear()).slice(2) +
+      String(d.getMonth() + 1).padStart(2, "0") +
+      String(d.getDate()).padStart(2, "0");
+
+    const counterKey = `${prefix}#${stamp}`;
+
+    /*
+     * DISBURSEMENT_VOUCHER_NUMBER_V1
+     *
+     * DD :
+     *   numéro de demande global, unique entre sociétés.
+     *
+     * BD :
+     *   numéro de bon unique DANS chaque société,
+     *   basé sur voucher_number et non request_number.
+     */
+    if (prefix === "BD") {
+
+      await client.query(
+        `SELECT pg_advisory_xact_lock(hashtext($1))`,
+        [`triangle-voucher:${companyId}:${counterKey}`]
+      );
+
+      const voucherRows = await client.query(
+        `SELECT
+           COALESCE(
+             MAX(
+               substring(
+                 voucher_number
+                 FROM '([0-9]+)$'
+               )::integer
+             ),
+             0
+           ) AS last_seq
+         FROM disbursement_requests
+         WHERE company_id=$1
+           AND voucher_number LIKE $2`,
+        [
+          companyId,
+          `${prefix}-${stamp}-%`
+        ]
+      );
+
+      const nextVoucherSeq =
+        Number(
+          voucherRows.rows[0]?.last_seq || 0
+        ) + 1;
+
+      await client.query(
+        `INSERT INTO stock_request_counters
+           (
+             company_id,
+             year,
+             prefix,
+             last_seq
+           )
+         VALUES ($1,$2,$3,$4)
+
+         ON CONFLICT
+           (company_id,year,prefix)
+
+         DO UPDATE
+           SET last_seq =
+             GREATEST(
+               stock_request_counters.last_seq,
+               EXCLUDED.last_seq
+             )`,
+        [
+          companyId,
+          d.getFullYear(),
+          counterKey,
+          nextVoucherSeq
+        ]
+      );
+
+      return (
+        `${prefix}-${stamp}-` +
+        String(nextVoucherSeq).padStart(3, "0")
+      );
+    }
+
+    /*
+     * DISBURSEMENT_GLOBAL_NUMBER_V1
+     *
+     * request_number possède une contrainte UNIQUE globale.
+     * Il ne faut donc PAS générer DD-... séparément
+     * pour Triangle et FAT & MAT.
+     *
+     * Le verrou transactionnel garantit que deux utilisateurs
+     * ne reçoivent jamais le même numéro simultanément.
+     */
+    await client.query(
+      `SELECT pg_advisory_xact_lock(hashtext($1))`,
+      [`triangle-disbursement:${counterKey}`]
     );
-    return `${prefix}-${stamp}-${String(rows[0].last_seq).padStart(3, "0")}`;
+
+    const { rows } = await client.query(
+      `SELECT
+         COALESCE(
+           MAX(
+             substring(
+               request_number
+               FROM '([0-9]+)$'
+             )::integer
+           ),
+           0
+         ) AS last_seq
+       FROM disbursement_requests
+       WHERE request_number LIKE $1`,
+      [`${prefix}-${stamp}-%`]
+    );
+
+    const nextSeq =
+      Number(rows[0]?.last_seq || 0) + 1;
+
+    /*
+     * On resynchronise aussi le compteur historique
+     * de l'entreprise, mais il ne décide plus du numéro.
+     */
+    await client.query(
+      `INSERT INTO stock_request_counters
+         (
+           company_id,
+           year,
+           prefix,
+           last_seq
+         )
+       VALUES ($1,$2,$3,$4)
+
+       ON CONFLICT
+         (company_id,year,prefix)
+
+       DO UPDATE
+         SET last_seq =
+           GREATEST(
+             stock_request_counters.last_seq,
+             EXCLUDED.last_seq
+           )`,
+      [
+        companyId,
+        d.getFullYear(),
+        counterKey,
+        nextSeq
+      ]
+    );
+
+    return (
+      `${prefix}-${stamp}-` +
+      String(nextSeq).padStart(3, "0")
+    );
   }
 
   async function audit(client, companyId, userId, action, entityId, reference, oldV, newV, ip) {
@@ -150,11 +317,70 @@ module.exports = function createDisbursementsRouter(deps) {
   }
 
   // ---------- CRÉATION MULTI-LIGNES (aucun impact trésorerie) ----------
-  router.post("/disbursements", authenticateToken, permRequest("create"), async (req, res) => {
+
+  /*
+   * Camions disponibles pour une demande de décaissement.
+   *
+   * Important :
+   * - pas besoin d'ouvrir le module général Camions ;
+   * - on utilise l'entreprise ACTIVE de la session ;
+   * - uniquement les camions ACTIFS de cette entreprise.
+   */
+  router.get(
+    "/disbursement-camions",
+    authenticateToken,
+    async (req, res) => {
+
+      try {
+
+        const companyId = companyOf(req);
+
+        if (!companyId) {
+          return res.status(400).json({
+            error: "Entreprise active introuvable."
+          });
+        }
+
+        const { rows } = await pool.query(
+          `SELECT
+             id,
+             code,
+             statut
+           FROM camions
+           WHERE company_id=$1
+             AND statut='ACTIF'
+           ORDER BY code`,
+          [companyId]
+        );
+
+        return res.json(rows);
+
+      } catch (error) {
+
+        console.error(
+          "GET /disbursement-camions:",
+          error
+        );
+
+        return res.status(500).json({
+          error:
+            "Erreur chargement des camions."
+        });
+
+      }
+    }
+  );
+
+
+router.post("/disbursements", authenticateToken, permRequest("create"), async (req, res) => {
     const client = await pool.connect();
 
     try {
       const b = req.body || {};
+
+      // MULTI_CAMION_LINES_V2
+      const detailedPricingRequired =
+        [1,5].includes(Number(companyOf(req)));
 
       /*
        * Compatibilité :
@@ -193,12 +419,46 @@ module.exports = function createDisbursementsRouter(deps) {
             ""
           ).trim();
 
-        const lineAmount = Number(raw.amount);
+        const quantity = Number(raw.quantity);
+        const unitPrice = Number(raw.unit_price);
+
+        const lineCamionId =
+          raw.camion_id !== undefined &&
+          raw.camion_id !== null &&
+          String(raw.camion_id).trim() !== ""
+            ? Number(raw.camion_id)
+            : null;
+
+        const lineAmount =
+          detailedPricingRequired
+            ? quantity * unitPrice
+            : (
+                quantity > 0 && unitPrice > 0
+                  ? quantity * unitPrice
+                  : Number(raw.amount)
+              );
 
         if (!label) {
           return res.status(400).json({
             error: `Libellé obligatoire à la ligne ${i + 1}.`
           });
+        }
+
+        if (detailedPricingRequired) {
+
+          if (!(quantity > 0)) {
+            return res.status(400).json({
+              error:
+                `Quantité obligatoire et supérieure à zéro à la ligne ${i + 1}.`
+            });
+          }
+
+          if (!(unitPrice > 0)) {
+            return res.status(400).json({
+              error:
+                `Prix unitaire obligatoire et supérieur à zéro à la ligne ${i + 1}.`
+            });
+          }
         }
 
         if (!(lineAmount > 0)) {
@@ -211,6 +471,15 @@ module.exports = function createDisbursementsRouter(deps) {
           line_no: i + 1,
           category,
           label,
+          quantity:
+            Number.isFinite(quantity)
+              ? quantity
+              : null,
+          unit_price:
+            Number.isFinite(unitPrice)
+              ? unitPrice
+              : null,
+          camion_id: lineCamionId,
           amount: lineAmount,
         });
       }
@@ -243,6 +512,77 @@ module.exports = function createDisbursementsRouter(deps) {
       }
 
       const companyId = companyOf(req);
+
+      // CAMION PAR LIGNE
+
+      /*
+       * DISBURSEMENT_TRUCK_OPTIONAL_BACK_V3
+       *
+       * Aucun camion n'est obligatoire.
+       * S'il est renseigné, le contrôle
+       * société + statut ACTIF ci-dessous
+       * reste entièrement appliqué.
+       */
+
+      /*
+       * Vérifier tous les camions choisis contre
+       * l'entreprise active.
+       */
+      const selectedTruckIds =
+        [
+          ...new Set(
+            lines
+              .map(
+                (line) =>
+                  Number(line.camion_id || 0)
+              )
+              .filter(Boolean)
+          )
+        ];
+
+
+      if (selectedTruckIds.length > 0) {
+
+        const truckRows = (
+          await client.query(
+            `SELECT id
+               FROM camions
+              WHERE company_id=$1
+                AND statut='ACTIF'
+                AND id=ANY($2::int[])`,
+            [
+              companyId,
+              selectedTruckIds
+            ]
+          )
+        ).rows;
+
+
+        const validTruckIds =
+          new Set(
+            truckRows.map(
+              (row) => Number(row.id)
+            )
+          );
+
+
+        const invalidTruck =
+          selectedTruckIds.find(
+            (id) =>
+              !validTruckIds.has(Number(id))
+          );
+
+
+        if (invalidTruck) {
+
+          return res.status(400).json({
+            error:
+              "Un camion sélectionné n'appartient pas à cette entreprise ou est inactif."
+          });
+
+        }
+      }
+
 
       await client.query("BEGIN");
 
@@ -286,10 +626,11 @@ module.exports = function createDisbursementsRouter(deps) {
              reason,
              status,
              payment_method,
-             initial_attachment_url
+             initial_attachment_url,
+             camion_id
            )
          VALUES
-           ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+          ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
          RETURNING *`,
         [
           companyId,
@@ -305,13 +646,16 @@ module.exports = function createDisbursementsRouter(deps) {
           status,
           b.payment_method || null,
           b.initial_attachment_url || null,
+          null,
         ]
       );
 
       const request = rows[0];
 
       for (const line of lines) {
+
         await client.query(
+
           `INSERT INTO disbursement_request_lines
              (
                company_id,
@@ -319,19 +663,31 @@ module.exports = function createDisbursementsRouter(deps) {
                line_no,
                category,
                label,
+               quantity,
+               unit_price,
+               camion_id,
                amount
              )
-           VALUES ($1,$2,$3,$4,$5,$6)`,
+
+           VALUES
+             ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+
           [
             companyId,
             request.id,
             line.line_no,
             line.category,
             line.label,
+            line.quantity,
+            line.unit_price,
+            line.camion_id,
             line.amount,
           ]
+
         );
+
       }
+
 
       await audit(
         client,
@@ -405,7 +761,29 @@ module.exports = function createDisbursementsRouter(deps) {
       const seeAll = await canSeeAll(req);
       if (req.query.mine === "1" || !seeAll) { params.push(req.user.id); where += ` AND requester_id=$${params.length}`; }
       const { rows } = await pool.query(
-        `SELECT * FROM disbursement_requests WHERE ${where} ORDER BY created_at DESC LIMIT 300`, params
+        `SELECT d.*,
+                  (
+            SELECT
+              string_agg(
+                DISTINCT c.code,
+                ', '
+                ORDER BY c.code
+              )
+
+            FROM disbursement_request_lines dl
+
+            JOIN camions c
+              ON c.id=dl.camion_id
+             AND c.company_id=dl.company_id
+
+            WHERE dl.request_id=d.id
+              AND dl.company_id=d.company_id
+
+          ) AS camion_code
+             FROM disbursement_requests d
+            WHERE ${where}
+            ORDER BY d.created_at DESC
+            LIMIT 300`, params
       );
       res.json(rows);
     } catch (e) { console.error(e); res.status(500).json({ error: "Erreur demandes." }); }
@@ -417,7 +795,806 @@ module.exports = function createDisbursementsRouter(deps) {
     res.json(row);
   });
 
-  // ---------- SOUMISSION ----------
+
+  /*
+   * DISBURSEMENT_EDIT_NO_DESCRIPTION_V6
+   * DISBURSEMENT_EDIT_BEFORE_DIRECTION_V1
+   *
+   * Le demandeur peut modifier :
+   * - BROUILLON
+   * - EN_ATTENTE_DIRECTION
+   *
+   * Dès validation Direction :
+   * verrouillage définitif du contenu financier.
+   */
+  router.put(
+    "/disbursements/:id",
+    authenticateToken,
+    permRequest("update"),
+    async (req, res) => {
+
+      const client =
+        await pool.connect();
+
+      try {
+
+        const companyId =
+          companyOf(req);
+
+        const b =
+          req.body || {};
+
+        await client.query("BEGIN");
+
+
+        const cur = (
+          await client.query(
+            `SELECT *
+               FROM disbursement_requests
+              WHERE id=$1
+                AND company_id=$2
+              FOR UPDATE`,
+            [
+              req.params.id,
+              companyId
+            ]
+          )
+        ).rows[0];
+
+
+        if (!cur) {
+
+          await client.query("ROLLBACK");
+
+          return res
+            .status(404)
+            .json({
+              error:
+                "Demande introuvable."
+            });
+        }
+
+
+        /*
+         * Seul le créateur modifie sa demande.
+         */
+        if (
+          Number(cur.requester_id) !==
+          Number(req.user.id)
+        ) {
+
+          await client.query("ROLLBACK");
+
+          return res
+            .status(403)
+            .json({
+              error:
+                "Seul le demandeur peut modifier cette demande."
+            });
+        }
+
+
+        if (
+          ![
+            S.DRAFT,
+            S.WAITING_DIR
+          ].includes(cur.status)
+        ) {
+
+          await client.query("ROLLBACK");
+
+          return res
+            .status(409)
+            .json({
+              error:
+                "Cette demande a déjà été traitée par la Direction et ne peut plus être modifiée.",
+              code:
+                "REQUEST_LOCKED"
+            });
+        }
+
+
+        const rawLines =
+          Array.isArray(b.lines)
+            ? b.lines
+            : [];
+
+
+        if (
+          rawLines.length < 1 ||
+          rawLines.length > 50
+        ) {
+
+          await client.query("ROLLBACK");
+
+          return res
+            .status(400)
+            .json({
+              error:
+                "La demande doit contenir entre 1 et 50 lignes."
+            });
+        }
+
+
+        const lines = [];
+
+        for (
+          let i = 0;
+          i < rawLines.length;
+          i += 1
+        ) {
+
+          const raw =
+            rawLines[i] || {};
+
+          const category =
+            String(
+              raw.category || ""
+            ).trim();
+
+          const label =
+            String(
+              raw.label || ""
+            ).trim();
+
+          const quantity =
+            Number(raw.quantity);
+
+          const unitPrice =
+            Number(raw.unit_price);
+
+          const camionId =
+            raw.camion_id !== undefined &&
+            raw.camion_id !== null &&
+            String(raw.camion_id).trim() !== ""
+              ? Number(raw.camion_id)
+              : null;
+
+
+          if (!category) {
+
+            await client.query("ROLLBACK");
+
+            return res
+              .status(400)
+              .json({
+                error:
+                  `Catégorie obligatoire à la ligne ${i + 1}.`
+              });
+          }
+
+
+          if (!label) {
+
+            await client.query("ROLLBACK");
+
+            return res
+              .status(400)
+              .json({
+                error:
+                  `Libellé obligatoire à la ligne ${i + 1}.`
+              });
+          }
+
+
+          if (!(quantity > 0)) {
+
+            await client.query("ROLLBACK");
+
+            return res
+              .status(400)
+              .json({
+                error:
+                  `Quantité obligatoire à la ligne ${i + 1}.`
+              });
+          }
+
+
+          if (!(unitPrice > 0)) {
+
+            await client.query("ROLLBACK");
+
+            return res
+              .status(400)
+              .json({
+                error:
+                  `Prix unitaire obligatoire à la ligne ${i + 1}.`
+              });
+          }
+
+
+          const amount =
+            quantity *
+            unitPrice;
+
+
+          if (!(amount > 0)) {
+
+            await client.query("ROLLBACK");
+
+            return res
+              .status(400)
+              .json({
+                error:
+                  `Montant invalide à la ligne ${i + 1}.`
+              });
+          }
+
+
+          lines.push({
+            line_no:
+              i + 1,
+            category,
+            label,
+            quantity,
+            unit_price:
+              unitPrice,
+            camion_id:
+              camionId,
+            amount
+          });
+        }
+
+
+        /*
+         * Vérifier uniquement les camions
+         * réellement sélectionnés.
+         */
+        const selectedTruckIds =
+          [
+            ...new Set(
+              lines
+                .map(
+                  (line) =>
+                    Number(
+                      line.camion_id || 0
+                    )
+                )
+                .filter(Boolean)
+            )
+          ];
+
+
+        if (
+          selectedTruckIds.length > 0
+        ) {
+
+          const truckRows = (
+            await client.query(
+              `SELECT id
+                 FROM camions
+                WHERE company_id=$1
+                  AND statut='ACTIF'
+                  AND id=ANY($2::int[])`,
+              [
+                companyId,
+                selectedTruckIds
+              ]
+            )
+          ).rows;
+
+
+          const validIds =
+            new Set(
+              truckRows.map(
+                (row) =>
+                  Number(row.id)
+              )
+            );
+
+
+          const invalid =
+            selectedTruckIds.find(
+              (id) =>
+                !validIds.has(
+                  Number(id)
+                )
+            );
+
+
+          if (invalid) {
+
+            await client.query("ROLLBACK");
+
+            return res
+              .status(400)
+              .json({
+                error:
+                  "Un camion sélectionné n'appartient pas à cette entreprise ou est inactif."
+              });
+          }
+        }
+
+
+        const amount =
+          lines.reduce(
+            (sum, line) =>
+              sum +
+              Number(line.amount),
+            0
+          );
+
+
+        const reason =
+          String(
+            b.reason || ""
+          ).trim();
+
+
+        if (!reason) {
+
+          await client.query("ROLLBACK");
+
+          return res
+            .status(400)
+            .json({
+              error:
+                "Objet / motif obligatoire."
+            });
+        }
+
+
+        const before = {
+          reason:
+            cur.reason,
+          amount:
+            cur.amount,
+          beneficiary_name:
+            cur.beneficiary_name,
+          urgency:
+            cur.urgency,
+          payment_method:
+            cur.payment_method,
+          status:
+            cur.status
+        };
+
+
+        const updated = (
+          await client.query(
+            `UPDATE disbursement_requests
+                SET beneficiary_name=$3,
+                    amount=$4,
+                    category=$5,
+                    urgency=$6,
+                    reason=$7,
+                    payment_method=$8,
+                    updated_at=NOW()
+              WHERE id=$1
+                AND company_id=$2
+              RETURNING *`,
+            [
+              cur.id,
+              companyId,
+              String(
+                b.beneficiary_name || ""
+              ).trim() || null,
+              amount,
+              lines.length === 1
+                ? lines[0].category
+                : "Multi-catégories",
+              b.urgency ||
+                "normale",
+              reason,
+              b.payment_method ||
+                null
+            ]
+          )
+        ).rows[0];
+
+
+        /*
+         * Remplacer uniquement les lignes
+         * tant que Direction n'a pas validé.
+         */
+        await client.query(
+          `DELETE FROM disbursement_request_lines
+            WHERE request_id=$1
+              AND company_id=$2`,
+          [
+            cur.id,
+            companyId
+          ]
+        );
+
+
+        for (
+          const line of lines
+        ) {
+
+          await client.query(
+            `INSERT INTO disbursement_request_lines
+               (
+                 company_id,
+                 request_id,
+                 line_no,
+                 category,
+                 label,
+                 quantity,
+                 unit_price,
+                 camion_id,
+                 amount
+               )
+             VALUES
+               ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+            [
+              companyId,
+              cur.id,
+              line.line_no,
+              line.category,
+              line.label,
+              line.quantity,
+              line.unit_price,
+              line.camion_id,
+              line.amount
+            ]
+          );
+        }
+
+
+        await audit(
+          client,
+          companyId,
+          req.user.id,
+          "update",
+          cur.id,
+          cur.request_number,
+          before,
+          {
+            reason:
+              updated.reason,
+            amount:
+              updated.amount,
+            beneficiary_name:
+              updated.beneficiary_name,
+            urgency:
+              updated.urgency,
+            payment_method:
+              updated.payment_method,
+            description:
+              updated.description,
+            status:
+              updated.status,
+            lines
+          },
+          req.ip
+        );
+
+
+        await client.query("COMMIT");
+
+
+        /*
+         * Si déjà soumise,
+         * prévenir à nouveau la Direction.
+         */
+        if (
+          cur.status ===
+          S.WAITING_DIR
+        ) {
+
+          await notify(
+            await usersWithCapability(
+              companyId,
+              "demande",
+              DIRECTION_ROLES
+            ),
+            {
+              company_id:
+                companyId,
+              type:
+                "finance",
+              title:
+                "Demande modifiée avant validation",
+              message:
+                `${cur.request_number} a été modifiée par le demandeur — ${amount} FCFA`,
+              related_entity_type:
+                "disbursement_request",
+              related_entity_id:
+                cur.id,
+              action_url:
+                `/direction?id=${cur.id}`,
+              created_by:
+                req.user.id,
+              priority:
+                "high"
+            }
+          );
+        }
+
+
+        return res.json({
+          ...updated,
+          lines,
+          treasury_impacted:
+            false
+        });
+
+
+      } catch (e) {
+
+        await client
+          .query("ROLLBACK")
+          .catch(() => {});
+
+        console.error(
+          "disbursements update:",
+          e
+        );
+
+        return res
+          .status(500)
+          .json({
+            error:
+              "Erreur modification de la demande."
+          });
+
+      } finally {
+
+        client.release();
+      }
+
+    }
+  );
+
+
+  
+  /*
+   * DISBURSEMENT_REQUESTER_DELETE_CORRECTION_V1
+   *
+   * REGLES :
+   * - Le demandeur peut supprimer/annuler sa propre demande
+   *   tant qu'elle n'a PAS été validée par la Direction.
+   * - La suppression est logique : statut ANNULEE.
+   *   Aucun historique financier n'est détruit.
+   * - La Direction peut demander une correction uniquement
+   *   sur EN_ATTENTE_DIRECTION.
+   * - Une demande à corriger revient en BROUILLON afin que
+   *   le demandeur puisse la modifier puis la soumettre à nouveau.
+   */
+
+  router.delete(
+    "/disbursements/:id",
+    authenticateToken,
+    permRequest("update"),
+    async (req, res) => {
+      const client = await pool.connect();
+
+      try {
+        const companyId = companyOf(req);
+
+        await client.query("BEGIN");
+
+        const cur = (
+          await client.query(
+            `SELECT *
+               FROM disbursement_requests
+              WHERE id=$1
+                AND company_id=$2
+              FOR UPDATE`,
+            [req.params.id, companyId]
+          )
+        ).rows[0];
+
+        if (!cur) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({
+            error: "Demande introuvable."
+          });
+        }
+
+        if (
+          Number(cur.requester_id) !==
+          Number(req.user.id)
+        ) {
+          await client.query("ROLLBACK");
+          return res.status(403).json({
+            error:
+              "Seul le demandeur peut supprimer cette demande."
+          });
+        }
+
+        if (
+          ![
+            S.DRAFT,
+            S.WAITING_DIR
+          ].includes(cur.status)
+        ) {
+          await client.query("ROLLBACK");
+
+          return res.status(409).json({
+            error:
+              "Cette demande a déjà été traitée par la Direction et ne peut plus être supprimée.",
+            code: "REQUEST_LOCKED"
+          });
+        }
+
+        const row = (
+          await client.query(
+            `UPDATE disbursement_requests
+                SET status=$3,
+                    updated_at=NOW()
+              WHERE id=$1
+                AND company_id=$2
+          RETURNING *`,
+            [
+              cur.id,
+              companyId,
+              S.CANCELLED
+            ]
+          )
+        ).rows[0];
+
+        await audit(
+          client,
+          companyId,
+          req.user.id,
+          "cancel_by_requester",
+          cur.id,
+          cur.request_number,
+          { status: cur.status },
+          { status: S.CANCELLED },
+          req.ip
+        );
+
+        await client.query("COMMIT");
+
+        return res.json({
+          ...row,
+          deleted: true,
+          treasury_impacted: false
+        });
+
+      } catch (e) {
+        await client
+          .query("ROLLBACK")
+          .catch(() => {});
+
+        console.error(
+          "Erreur annulation demande:",
+          e
+        );
+
+        return res.status(500).json({
+          error:
+            "Erreur lors de la suppression de la demande."
+        });
+
+      } finally {
+        client.release();
+      }
+    }
+  );
+
+
+  router.post(
+    "/disbursements/:id/correction",
+    authenticateToken,
+    permDirection("validate"),
+    async (req, res) => {
+      const client = await pool.connect();
+
+      try {
+        const companyId = companyOf(req);
+
+        const comment =
+          String(
+            req.body?.comment ||
+            req.body?.reason ||
+            ""
+          ).trim();
+
+        if (!comment) {
+          return res.status(400).json({
+            error:
+              "Le motif de correction est obligatoire."
+          });
+        }
+
+        await client.query("BEGIN");
+
+        const cur = (
+          await client.query(
+            `SELECT *
+               FROM disbursement_requests
+              WHERE id=$1
+                AND company_id=$2
+              FOR UPDATE`,
+            [req.params.id, companyId]
+          )
+        ).rows[0];
+
+        if (!cur) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({
+            error: "Demande introuvable."
+          });
+        }
+
+        if (cur.status !== S.WAITING_DIR) {
+          await client.query("ROLLBACK");
+
+          return res.status(409).json({
+            error:
+              "Une correction ne peut être demandée que pour une demande en attente de validation Direction.",
+            code: "REQUEST_NOT_WAITING_DIRECTION"
+          });
+        }
+
+        const correctionComment =
+          `CORRECTION DEMANDÉE : ${comment}`;
+
+        const row = (
+          await client.query(
+            `UPDATE disbursement_requests
+                SET status=$3,
+                    approval_comment=$4,
+                    approved_by=NULL,
+                    approved_at=NULL,
+                    updated_at=NOW()
+              WHERE id=$1
+                AND company_id=$2
+          RETURNING *`,
+            [
+              cur.id,
+              companyId,
+              S.DRAFT,
+              correctionComment
+            ]
+          )
+        ).rows[0];
+
+        await audit(
+          client,
+          companyId,
+          req.user.id,
+          "correction_requested",
+          cur.id,
+          cur.request_number,
+          {
+            status: cur.status,
+            approval_comment:
+              cur.approval_comment
+          },
+          {
+            status: S.DRAFT,
+            approval_comment:
+              correctionComment
+          },
+          req.ip
+        );
+
+        await client.query("COMMIT");
+
+        return res.json({
+          ...row,
+          correction_requested: true,
+          treasury_impacted: false
+        });
+
+      } catch (e) {
+        await client
+          .query("ROLLBACK")
+          .catch(() => {});
+
+        console.error(
+          "Erreur demande correction:",
+          e
+        );
+
+        return res.status(500).json({
+          error:
+            "Erreur lors de la demande de correction."
+        });
+
+      } finally {
+        client.release();
+      }
+    }
+  );
+
+
+// ---------- SOUMISSION ----------
   router.post("/disbursements/:id/submit", authenticateToken, permRequest("update"), async (req, res) => {
     const client = await pool.connect();
     try {
@@ -555,7 +1732,10 @@ module.exports = function createDisbursementsRouter(deps) {
         accountLabel: b.account_label || "Caisse", debit: 0, credit: real, description: `Décaissement ${cur.request_number}`, createdBy: req.user.id });
 
       const me = (await client.query(`SELECT fullname FROM users WHERE id=$1`, [req.user.id])).rows[0] || {};
+
       const voucher = await shortNumber(client, "BD", companyId);
+
+
       const { rows } = await client.query(
         `UPDATE disbursement_requests SET status=$3, amount_disbursed=$4, disbursed_by=$5, disbursed_by_name=$6,
            disbursed_at=NOW(), payment_method=COALESCE($7, payment_method),
@@ -612,7 +1792,10 @@ module.exports = function createDisbursementsRouter(deps) {
     if (!req) return null;
     const justified = Number((await client.query(
       `SELECT COALESCE(SUM(amount),0) s FROM disbursement_receipts
-        WHERE request_id=$1 AND company_id=$2 AND review_status <> 'REFUSE'`, [requestId, companyId]
+        WHERE request_id=$1
+          AND company_id=$2
+          AND review_status <> 'REFUSE'
+          AND COALESCE(receipt_type,'FILE') <> 'PENDING'`, [requestId, companyId]
     )).rows[0].s) || 0;
     const refunded = Number((await client.query(
       `SELECT COALESCE(SUM(amount),0) s FROM disbursement_refunds WHERE request_id=$1 AND company_id=$2`, [requestId, companyId]
@@ -645,6 +1828,9 @@ module.exports = function createDisbursementsRouter(deps) {
            line_no,
            category,
            label,
+           quantity,
+           unit_price,
+           camion_id,
            amount
          FROM disbursement_request_lines
          WHERE request_id=$1
@@ -664,36 +1850,262 @@ module.exports = function createDisbursementsRouter(deps) {
     } catch (e) { console.error(e); res.status(500).json({ error: "Erreur détail." }); }
   });
 
-  // Dépôt d'un justificatif AVEC montant (photo mobile, PDF, JPG, PNG).
+  // Dépôt d'un justificatif :
+  // FILE = photo / fichier,
+  // PENDING = reçu promis pour plus tard,
+  // DECLARATION = aucun reçu physique, déclaration interne.
   router.post("/disbursements/:id/receipts", authenticateToken, permRequest("update"), receiptUpload, async (req, res) => {
     try {
       const companyId = companyOf(req);
-      const cur = (await pool.query(`SELECT * FROM disbursement_requests WHERE id=$1 AND company_id=$2`, [req.params.id, companyId])).rows[0];
-      if (!cur) return res.status(404).json({ error: "Demande introuvable." });
-      const url = req.file ? `/uploads/disbursements/${req.file.filename}` : (req.body?.file_url || null);
-      if (!url) return res.status(400).json({ error: "Aucun fichier (PDF, JPG, JPEG ou PNG)." });
+
+      const cur = (
+        await pool.query(
+          `SELECT * FROM disbursement_requests
+            WHERE id=$1 AND company_id=$2`,
+          [req.params.id, companyId]
+        )
+      ).rows[0];
+
+      if (!cur) {
+        return res.status(404).json({
+          error: "Demande introuvable."
+        });
+      }
+
+      const initialReceipt =
+        ["1", "true", "yes", "on"].includes(
+          String(req.body?.initial || "")
+            .trim()
+            .toLowerCase()
+        );
+
+      /*
+       * JUSTIFICATIF INITIAL :
+       * - autorisé AVANT le décaissement ;
+       * - montant toujours égal à 0 ;
+       * - simple pièce de dossier ;
+       * - ne justifie aucune somme ;
+       * - ne change aucun statut financier.
+       *
+       * JUSTIFICATIF NORMAL :
+       * - reste interdit avant décaissement.
+       */
+      if (
+        !initialReceipt &&
+        !(Number(cur.amount_disbursed) > 0)
+      ) {
+        return res.status(409).json({
+          error: "Aucun justificatif financier ne peut être ajouté avant le décaissement."
+        });
+      }
+
+      if (
+        initialReceipt &&
+        Number(cur.amount_disbursed) > 0
+      ) {
+        return res.status(409).json({
+          error: "Une pièce initiale ne peut être ajoutée qu'avant le décaissement."
+        });
+      }
+
+      const receiptType =
+        String(req.body?.receipt_type || "FILE")
+          .trim()
+          .toUpperCase();
+
+      if (!["FILE", "PENDING", "DECLARATION"].includes(receiptType)) {
+        return res.status(400).json({
+          error: "Type de justificatif invalide."
+        });
+      }
+
       const amount = Number(req.body?.amount) || 0;
+      const label = String(req.body?.label || "").trim() || null;
+
+      if (initialReceipt && amount !== 0) {
+        return res.status(400).json({
+          error: "Une pièce initiale doit avoir un montant égal à 0."
+        });
+      }
+
+      let url =
+        req.file
+          ? `/uploads/disbursements/${req.file.filename}`
+          : (req.body?.file_url || null);
+
+      let expectedDate = null;
+      let declarationText = null;
+      let supplierName = null;
+
+      if (receiptType === "FILE") {
+        if (!url) {
+          return res.status(400).json({
+            error: "Prenez une photo ou choisissez un fichier."
+          });
+        }
+
+        if (
+          !initialReceipt &&
+          !(amount > 0)
+        ) {
+          return res.status(400).json({
+            error: "Le montant justifié est obligatoire."
+          });
+        }
+      }
+
+      if (receiptType === "PENDING") {
+        expectedDate =
+          String(req.body?.expected_date || "").trim() || null;
+
+        if (!expectedDate) {
+          return res.status(400).json({
+            error: "Indiquez la date prévue de remise du reçu."
+          });
+        }
+
+        url = null;
+      }
+
+      if (receiptType === "DECLARATION") {
+        declarationText =
+          String(req.body?.declaration_text || "").trim();
+
+        supplierName =
+          String(req.body?.supplier_name || "").trim();
+
+        if (
+          !initialReceipt &&
+          !(amount > 0)
+        ) {
+          return res.status(400).json({
+            error: "Le montant de la déclaration est obligatoire."
+          });
+        }
+
+        if (supplierName.length < 2) {
+          return res.status(400).json({
+            error: "Nom de la personne ou du fournisseur obligatoire."
+          });
+        }
+
+        if (declarationText.length < 10) {
+          return res.status(400).json({
+            error: "La déclaration doit expliquer l'achat et l'absence de reçu."
+          });
+        }
+
+        url = null;
+      }
+
       const { rows } = await pool.query(
-        `INSERT INTO disbursement_receipts (company_id, request_id, file_url, file_name, mime_type, amount, label, uploaded_by)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-        [companyId, cur.id, url, req.file ? req.file.originalname : (req.body?.file_name || null),
-         req.file ? req.file.mimetype : null, amount, req.body?.label || null, req.user.id]
+        `INSERT INTO disbursement_receipts
+           (
+             company_id,
+             request_id,
+             file_url,
+             file_name,
+             mime_type,
+             amount,
+             label,
+             receipt_type,
+             expected_date,
+             declaration_text,
+             supplier_name,
+             uploaded_by
+           )
+         VALUES
+           ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+         RETURNING *`,
+        [
+          companyId,
+          cur.id,
+          url,
+          req.file
+            ? req.file.originalname
+            : (
+                receiptType === "PENDING"
+                  ? "Reçu à fournir plus tard"
+                  : receiptType === "DECLARATION"
+                    ? "Déclaration sans reçu"
+                    : null
+              ),
+          req.file ? req.file.mimetype : null,
+          amount,
+          label,
+          receiptType,
+          expectedDate,
+          declarationText,
+          supplierName,
+          req.user.id
+        ]
       );
-      // Le premier justificatif fait avancer le statut + renseigne receipt_url (compat).
-      await pool.query(
-        `UPDATE disbursement_requests SET receipt_url=COALESCE(receipt_url,$3), receipt_uploaded_at=NOW(),
-           status=CASE WHEN status=$4 THEN $5 ELSE status END, updated_at=NOW()
-         WHERE id=$1 AND company_id=$2`,
-        [cur.id, companyId, url, S.WAITING_RECEIPTS, S.RECEIPTS_UPLOADED]
+
+      /*
+       * PENDING ne justifie encore aucun montant et
+       * ne change pas l'état en JUSTIFICATIFS_DEPOSES.
+       */
+      if (
+        !initialReceipt &&
+        receiptType !== "PENDING"
+      ) {
+        await pool.query(
+          `UPDATE disbursement_requests
+              SET receipt_url=COALESCE(receipt_url,$3),
+                  receipt_uploaded_at=NOW(),
+                  status=CASE
+                    WHEN status=$4 THEN $5
+                    ELSE status
+                  END,
+                  updated_at=NOW()
+            WHERE id=$1
+              AND company_id=$2`,
+          [
+            cur.id,
+            companyId,
+            url,
+            S.WAITING_RECEIPTS,
+            S.RECEIPTS_UPLOADED
+          ]
+        );
+      }
+
+      await notify(
+        await usersWithCapability(
+          companyId,
+          "comptabilite",
+          ACCOUNTING_ROLES
+        ),
+        {
+          company_id: companyId,
+          type: "finance",
+          title:
+            receiptType === "PENDING"
+              ? "Reçu annoncé pour plus tard"
+              : "Justificatif à contrôler",
+          message:
+            receiptType === "PENDING"
+              ? `${cur.request_number} : reçu attendu le ${expectedDate}.`
+              : `${cur.request_number} : justificatif de ${amount} FCFA déposé.`,
+          related_entity_type: "disbursement_request",
+          related_entity_id: cur.id,
+          action_url: `/decaissements?id=${cur.id}`,
+          created_by: req.user.id
+        }
       );
-      await notify(await usersWithCapability(companyId, "comptabilite", ACCOUNTING_ROLES), {
-        company_id: companyId, type: "finance", title: "Justificatif à contrôler",
-        message: `${cur.request_number} : justificatif de ${amount} FCFA déposé.`,
-        related_entity_type: "disbursement_request", related_entity_id: cur.id,
-        action_url: `/decaissements?id=${cur.id}`, created_by: req.user.id,
+
+      res.status(201).json({
+        receipt: rows[0],
+        amounts: await amountsOf(companyId, cur.id),
+        treasury_impacted: false
       });
-      res.status(201).json({ receipt: rows[0], amounts: await amountsOf(companyId, cur.id), treasury_impacted: false });
-    } catch (e) { console.error("receipts:", e); res.status(500).json({ error: "Erreur justificatif." }); }
+
+    } catch (e) {
+      console.error("receipts:", e);
+      res.status(500).json({
+        error: "Erreur justificatif."
+      });
+    }
   });
 
   // Contrôle d'un justificatif par le comptable.
