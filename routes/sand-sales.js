@@ -1034,6 +1034,31 @@ await client.query("COMMIT");
           req.user.email ||
           "Utilisateur";
 
+        /* QUI A LIVRÉ N'EST PAS QUI A SAISI.
+           `delivered_by` recevait `author`, c'est-à-dire le nom de la personne
+           CONNECTÉE au moment de l'enregistrement. Un stagiaire qui saisit les
+           bons depuis le bureau voyait donc son nom signer des livraisons
+           qu'il n'a jamais faites — et le client lisait ce nom comme celui du
+           livreur. C'est ce qui a mis « Djoulédé Traoré » sur les bons de
+           FAT & MAT.
+
+           L'ordre est désormais : ce qui est saisi, sinon le livreur réglé
+           pour la société (migration 090), sinon l'auteur — ce dernier cas
+           n'étant qu'un repli pour ne rien laisser vide tant que le réglage
+           n'est pas renseigné. */
+        const livreurSociete = (
+          await client.query(
+            `SELECT COALESCE(default_delivered_by, '') AS nom
+               FROM company_settings WHERE company_id = $1 LIMIT 1`,
+            [companyId]
+          )
+        ).rows[0]?.nom || "";
+
+        const livrePar =
+          String(req.body?.delivered_by || "").trim() ||
+          livreurSociete ||
+          author;
+
         const delivery = (
           await client.query(
             `INSERT INTO sand_deliveries(
@@ -1060,7 +1085,7 @@ await client.query("COMMIT");
               sale.truck,
               sale.driver_name,
               sale.voucher_number,
-              author,
+              livrePar,
               sale.notes,
               req.user.id
             ]
