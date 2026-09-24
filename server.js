@@ -19372,7 +19372,7 @@ app.use(
   "/",
   createAttendanceWorkforceRouter({
     pool, authenticateToken, getEffectiveCompanyId, requirePermission,
-    nextAccountingNumber, createAccountingEntry,
+    nextAccountingNumber, createAccountingEntry, hashPassword, logActivity,
   })
 );
 

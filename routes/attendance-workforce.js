@@ -1,13 +1,16 @@
 "use strict";
 
 const express = require("express");
+const crypto = require("crypto");
 const A = require("../services/attendance-workforce");
+const identifiants = require("../services/identifiants");
+const companyContext = require("../services/company-context");
 const AV = require("../services/avances-salaire");
 const P = require("../services/attendance-payroll");
 
 module.exports = function createAttendanceWorkforceRouter(deps) {
   const { pool, authenticateToken, getEffectiveCompanyId, requirePermission,
-          nextAccountingNumber, createAccountingEntry } = deps;
+          nextAccountingNumber, createAccountingEntry, hashPassword, logActivity } = deps;
 
   /* Les routes de paie sont gardées par le moteur de droits, comme partout
      ailleurs. Sans cela, elles reposaient sur `canManagePayroll()`, qui
@@ -29,6 +32,14 @@ module.exports = function createAttendanceWorkforceRouter(deps) {
     console.error(fallback, error);
     res.status(error.httpStatus || 500).json({ error: error.message || fallback, code: error.code });
   };
+  /* Mot de passe provisoire d'un compte créé avec un salarié. Personne ne le
+     reçoit : il n'existe que pour que la colonne ne soit pas vide, et il est
+     remplacé depuis la fiche du compte. On garantit une lettre et un chiffre
+     parce que `validatePasswordStrength` les exige — un tirage purement
+     aléatoire échouerait un jour sur mille, et ce jour-là sans explication. */
+  const motDePasseProvisoire = () =>
+    `Aa1${crypto.randomBytes(12).toString("base64url")}`;
+
   const requireCompany = (req, res) => {
     const companyId = companyOf(req);
     if (!companyId) res.status(409).json({ error: "Entreprise active requise.", code: "COMPANY_REQUIRED" });
@@ -219,6 +230,239 @@ module.exports = function createAttendanceWorkforceRouter(deps) {
     } finally { client.release(); }
   });
 
+  /* ══════════════════════════════════════════════════════════════════════
+     AJOUTER UN SALARIÉ
+
+     Une personne, deux enregistrements qui ne se confondent pas : `users`
+     porte l'identité (se connecter, un rôle, une société),
+     `attendance_employees` porte la fiche RH (matricule, site, horaire,
+     salaire). L'un peut exister sans l'autre — un gardien que l'opérateur
+     pointe n'a pas besoin de compte — mais jamais deux fiches RH pour la même
+     personne dans la même société. `uq_attendance_employee_user` l'interdit
+     déjà ; on le vérifie ici avant d'écrire, pour répondre une phrase plutôt
+     qu'une violation d'index que personne ne sait lire.
+
+     `site_id` et `schedule_id` sont obligatoires, et ce n'est pas une
+     préférence : la liste de l'effectif les joint en JOIN interne. Un salarié
+     créé sans eux existerait en base et resterait invisible à l'écran — le
+     pire des deux mondes, puisque personne ne peut corriger ce qu'il ne voit
+     pas.
+
+     Une seule transaction pour l'ensemble. Un compte créé sans sa fiche RH
+     laisserait une identité orpheline qu'aucun écran ne montre, et un
+     matricule consommé sans salarié derrière.
+     ══════════════════════════════════════════════════════════════════════ */
+  router.post("/attendance-v2/employees", authenticateToken, async (req, res) => {
+    const companyId = requireCompany(req, res); if (!companyId) return;
+    if (!A.isSuperAdmin(req.user)) return res.status(403).json({ error: "Réservé au super administrateur." });
+
+    const fullName = String(req.body?.full_name || "").trim();
+    const siteId = Number(req.body?.site_id);
+    const scheduleId = Number(req.body?.schedule_id);
+    const jobTitle = String(req.body?.job_title || "").trim();
+    const telephone = String(req.body?.phone || "").trim();
+    const compteDemande = Number(req.body?.user_id) || null;
+
+    if (fullName.length < 3) {
+      return res.status(400).json({ error: "Nom complet obligatoire (3 caractères minimum).", code: "FULL_NAME_REQUIRED" });
+    }
+    if (!siteId || !scheduleId) {
+      return res.status(400).json({
+        error: "Site et horaire sont obligatoires : sans eux, le salarié n'apparaîtrait pas dans la liste.",
+        code: "SITE_AND_SCHEDULE_REQUIRED",
+      });
+    }
+
+    const salaireMensuel = req.body?.monthly_salary === undefined || req.body?.monthly_salary === null
+      || req.body?.monthly_salary === "" ? null : Number(req.body.monthly_salary);
+    const salaireJournalier = req.body?.daily_rate === undefined || req.body?.daily_rate === null
+      || req.body?.daily_rate === "" ? null : Number(req.body.daily_rate);
+    if ((salaireMensuel !== null && (!Number.isFinite(salaireMensuel) || salaireMensuel < 0))
+        || (salaireJournalier !== null && (!Number.isFinite(salaireJournalier) || salaireJournalier < 0))) {
+      return res.status(400).json({ error: "Salaire mensuel ou journalier invalide.", code: "SALARY_INVALID" });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      /* Le site et l'horaire doivent appartenir à l'entreprise active. Les
+         accepter d'ailleurs rattacherait un salarié de Triangle à un site de
+         FAT & MAT, et le ferait apparaître dans l'effectif de l'autre. */
+      const { rows: perimetre } = await client.query(
+        `SELECT (SELECT 1 FROM attendance_work_sites WHERE id=$2 AND company_id=$1) AS site,
+                (SELECT 1 FROM attendance_work_schedules WHERE id=$3 AND company_id=$1) AS horaire`,
+        [companyId, siteId, scheduleId]
+      );
+      if (!perimetre[0]?.site || !perimetre[0]?.horaire) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          error: "Ce site ou cet horaire n'appartient pas à l'entreprise active.",
+          code: "SITE_OR_SCHEDULE_NOT_IN_COMPANY",
+        });
+      }
+
+      /* ── L'IDENTITÉ : rattacher un compte existant, en créer un, ou aucun ── */
+      let userId = null;
+      let compteCree = null;
+
+      if (compteDemande) {
+        const { rows } = await client.query(
+          `SELECT id, fullname, company_id FROM users WHERE id=$1 AND company_id=$2`,
+          [compteDemande, companyId]
+        );
+        if (!rows[0]) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            error: "Ce compte n'existe pas dans l'entreprise active.",
+            code: "USER_NOT_IN_COMPANY",
+          });
+        }
+        const { rows: deja } = await client.query(
+          `SELECT id, full_name FROM attendance_employees WHERE company_id=$1 AND user_id=$2`,
+          [companyId, compteDemande]
+        );
+        if (deja[0]) {
+          await client.query("ROLLBACK");
+          return res.status(409).json({
+            error: `Ce compte a déjà une fiche salarié dans cette entreprise : ${deja[0].full_name}.`,
+            code: "EMPLOYEE_ALREADY_LINKED",
+          });
+        }
+        userId = rows[0].id;
+      } else if (identifiants.emailReel(req.body?.email) || telephone) {
+        /* Un compte a besoin d'UN moyen d'être reconnu, pas des deux : le
+           téléphone tient lieu d'adresse pour qui n'en a pas. Même lecture
+           que POST /users, pour que les deux chemins ne divergent jamais. */
+        const identite = identifiants.lireIdentifiants({ email: req.body?.email, phone: telephone });
+        if (identite.telephoneIllisible) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            error: "Ce numéro de téléphone n'est pas exploitable. Exemples acceptés : "
+                 + "76327799, 76 32 77 99, +22376327799, 0022376327799.",
+            code: "PHONE_INVALID",
+          });
+        }
+        if (identite.emailNormalise) {
+          const { rows } = await client.query(
+            `SELECT id FROM users WHERE lower(email)=$1 LIMIT 1`, [identite.emailNormalise]
+          );
+          if (rows[0]) {
+            await client.query("ROLLBACK");
+            return res.status(409).json({
+              error: "Cette adresse email est déjà utilisée par un autre compte.",
+              code: "EMAIL_TAKEN",
+            });
+          }
+        }
+        if (identite.telephone) {
+          const { rows } = await client.query(
+            `SELECT id FROM users WHERE phone_normalise=$1 LIMIT 1`, [identite.telephone]
+          );
+          if (rows[0]) {
+            await client.query("ROLLBACK");
+            return res.status(409).json({
+              error: "Ce numéro de téléphone est déjà utilisé par un autre compte.",
+              code: "PHONE_TAKEN",
+            });
+          }
+        }
+
+        /* Le rôle ne se déduit JAMAIS du poste : « Directeur » est une
+           fonction RH, pas une autorisation. Un nouveau salarié entre avec le
+           rôle le moins ouvert, et les droits se posent ensuite à l'écran. */
+        const { rows: cree } = await client.query(
+          `INSERT INTO users (fullname, email, password, role, phone, phone_normalise,
+                              company_id, is_super_admin, is_active)
+           VALUES ($1,$2,$3,'magasinier',$4,$5,$6,false,true)
+           RETURNING id, fullname, email, phone, role`,
+          [fullName, identite.email, await hashPassword(motDePasseProvisoire()),
+           telephone, identite.telephone, companyId]
+        );
+        userId = cree[0].id;
+        /* Le badge suit l'entreprise, et la séquence est incrémentée sous
+           verrou dans CETTE transaction : deux créations simultanées
+           obtiennent deux numéros distincts. */
+        const badge = await companyContext.prochainBadge(client, companyId);
+        await client.query(`UPDATE users SET badge_code=$1 WHERE id=$2`, [badge, userId]);
+        compteCree = { ...cree[0], badge_code: badge };
+      }
+
+      /* ── LE MATRICULE ──
+         `MAX+1` lu puis écrit sans verrou donne deux fois le même numéro à
+         deux créations simultanées, et c'est l'index unique qui refuse la
+         seconde — après avoir peut-être déjà créé un compte. Le verrou
+         d'avis, pris par société, sérialise la numérotation et se relâche au
+         COMMIT. Deux sociétés ne s'attendent pas l'une l'autre. */
+      await client.query(`SELECT pg_advisory_xact_lock($1, $2)`, [812_374_51, companyId]);
+      const { rows: numero } = await client.query(
+        `SELECT COALESCE(MAX(employee_number),0)+1 AS suivant
+           FROM attendance_employees WHERE company_id=$1`,
+        [companyId]
+      );
+      const employeeNumber = Number(numero[0].suivant);
+
+      const { rows: employe } = await client.query(
+        `INSERT INTO attendance_employees
+           (company_id, employee_number, full_name, user_id, site_id, schedule_id,
+            job_title, phone, active, effective_from)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,true,COALESCE($9::date, CURRENT_DATE))
+         RETURNING *`,
+        [companyId, employeeNumber, fullName, userId, siteId, scheduleId,
+         jobTitle, telephone, req.body?.effective_from || null]
+      );
+
+      /* ── LE SALAIRE INITIAL, s'il est fourni ──
+         Daté du jour d'entrée par défaut, jamais d'une date en dur : un
+         salaire posé rétroactivement sur une période déjà close rouvrirait un
+         calcul que la clôture avait arrêté. */
+      let salaire = null;
+      if (salaireMensuel !== null || salaireJournalier !== null) {
+        const { rows } = await client.query(
+          `INSERT INTO attendance_salary_settings_v2
+             (company_id, employee_id, monthly_salary, daily_rate, basis_days, effective_from, set_by)
+           VALUES ($1,$2,$3,$4,30,$5,$6)
+           ON CONFLICT (employee_id, effective_from) DO UPDATE
+             SET monthly_salary=EXCLUDED.monthly_salary, daily_rate=EXCLUDED.daily_rate,
+                 basis_days=30, set_by=EXCLUDED.set_by, updated_at=CURRENT_TIMESTAMP
+           RETURNING monthly_salary, daily_rate, effective_from`,
+          [companyId, employe[0].id, salaireMensuel, salaireJournalier,
+           employe[0].effective_from, req.user.id]
+        );
+        salaire = rows[0];
+      }
+
+      await client.query("COMMIT");
+
+      if (typeof logActivity === "function") {
+        await logActivity(req.user.fullname, req.user.role, "Ajout d'un salarié", "Paie",
+          `Matricule ${employeeNumber} — ${fullName} — entreprise ${companyId}`
+          + (compteCree ? " — compte de connexion créé" : userId ? " — compte existant rattaché" : " — sans compte")
+        ).catch(() => {});
+      }
+
+      const salaireVisible = await A.canViewAllSalaries(pool, companyId, req.user);
+      res.status(201).json({
+        employee: A.stripSalary({ ...employe[0], ...(salaire || {}) }, salaireVisible),
+        compte: compteCree,
+        message: compteCree
+          ? `${fullName} est ajouté, avec un compte de connexion. Son mot de passe doit être défini depuis la fiche du compte.`
+          : `${fullName} est ajouté à l'effectif.`,
+      });
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      /* L'index unique reste le dernier rempart : si deux créations passent
+         malgré tout, on répond la cause plutôt qu'une erreur 500 opaque. */
+      if (error?.code === "23505") {
+        return res.status(409).json({
+          error: "Ce salarié existe déjà dans cette entreprise.",
+          code: "EMPLOYEE_DUPLICATE",
+        });
+      }
+      fail(res, error, "Erreur ajout du salarié.");
+    } finally { client.release(); }
+  });
+
   router.put("/attendance-v2/employees/:id/assignment", authenticateToken, async (req, res) => {
     const companyId = requireCompany(req, res); if (!companyId) return;
     if (!A.isSuperAdmin(req.user)) return res.status(403).json({ error: "Réservé au super administrateur." });
@@ -256,6 +500,147 @@ module.exports = function createAttendanceWorkforceRouter(deps) {
       if (!rows[0]) return res.status(404).json({ error: "Employé introuvable." });
       res.json(rows[0]);
     } catch (error) { fail(res, error, "Erreur salaire journalier."); }
+  });
+
+
+  /* ══════════════════════════════════════════════════════════════════════
+     RETIRER UN SALARIÉ — une désactivation, jamais une suppression.
+
+     Le verbe DELETE décrit l'intention de l'écran, pas l'opération en base.
+     Sept des neuf clés étrangères qui visent `attendance_employees` sont en
+     ON DELETE CASCADE : une vraie suppression emporterait les pointages, le
+     badge, l'historique de salaire, les corrections et les régularisations.
+     Les deux autres — avances et lignes de paie — sont en RESTRICT, donc un
+     salarié qui a déjà une avance ou un bulletin payé RÉSISTE à la
+     suppression. C'est exactement le piège : le DELETE ne réussit que sur les
+     salariés qu'on peut détruire sans que rien ne s'y oppose, c'est-à-dire
+     les nouveaux, et il réussit en silence.
+
+     On désactive donc, et rien ne se perd. Le pointage manuel comme le scan QR
+     passent tous deux par `chargerEmployePourPointage`, qui filtre
+     `active = true` : le badge reste en base, lisible et intact, et cesse
+     d'ouvrir un pointage sans qu'on ait à y toucher.
+     ══════════════════════════════════════════════════════════════════════ */
+  router.delete("/attendance-v2/employees/:id", authenticateToken, async (req, res) => {
+    const companyId = requireCompany(req, res); if (!companyId) return;
+    if (!A.isSuperAdmin(req.user)) return res.status(403).json({ error: "Réservé au super administrateur." });
+
+    const employeeId = Number(req.params.id);
+    if (!employeeId) return res.status(400).json({ error: "Salarié obligatoire.", code: "EMPLOYEE_REQUIRED" });
+    const motif = String(req.body?.reason || "").trim();
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      /* `company_id` dans le WHERE est l'isolation elle-même : une demande de
+         Triangle portant l'identifiant d'un salarié de FAT & MAT ne trouve
+         rien et repart en 404. Aucune ligne de l'autre société n'est lue. */
+      const { rows: trouve } = await client.query(
+        `SELECT id, full_name, employee_number, user_id, active, effective_from, effective_to
+           FROM attendance_employees
+          WHERE id=$1 AND company_id=$2
+          FOR UPDATE`,
+        [employeeId, companyId]
+      );
+      if (!trouve[0]) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "Salarié introuvable dans cette entreprise.", code: "EMPLOYEE_NOT_FOUND" });
+      }
+      const employe = trouve[0];
+
+      /* Se retirer soi-même, c'est se fermer la porte depuis l'intérieur :
+         plus de compte actif pour rouvrir. */
+      if (employe.user_id && Number(employe.user_id) === Number(req.user.id)) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          error: "Vous ne pouvez pas vous retirer vous-même de l'effectif.",
+          code: "SELF_REMOVAL_FORBIDDEN",
+        });
+      }
+
+      if (employe.active === false) {
+        await client.query("ROLLBACK");
+        return res.json({
+          deja_retire: true,
+          employee: employe,
+          message: `${employe.full_name} était déjà retiré de l'effectif.`,
+        });
+      }
+
+      /* `effective_to` doit rester >= `effective_from` (contrainte de la
+         table). Pour un salarié dont l'entrée est datée du futur, aujourd'hui
+         serait antérieur à son arrivée : on ferme alors au jour d'entrée. */
+      const { rows: retire } = await client.query(
+        `UPDATE attendance_employees
+            SET active = false,
+                effective_to = GREATEST(effective_from, CURRENT_DATE),
+                updated_at = CURRENT_TIMESTAMP
+          WHERE id=$1 AND company_id=$2
+          RETURNING *`,
+        [employeeId, companyId]
+      );
+
+      /* Le compte de connexion suit, quand il y en a un : laisser une session
+         ouverte à quelqu'un qui ne fait plus partie de l'effectif serait la
+         moitié d'un retrait. Le compte est désactivé, pas supprimé — son nom
+         doit rester lisible sur les paies et les avances qu'il a signées.
+         Un compte super-administrateur n'est jamais désactivé par ce chemin :
+         il dépasse le périmètre d'une société. */
+      let compteDesactive = null;
+      if (employe.user_id) {
+        const { rows } = await client.query(
+          `UPDATE users SET is_active=false, updated_at=CURRENT_TIMESTAMP
+            WHERE id=$1 AND company_id=$2 AND is_super_admin IS NOT TRUE
+            RETURNING id, fullname, is_active`,
+          [employe.user_id, companyId]
+        );
+        compteDesactive = rows[0] || null;
+      }
+
+      /* Ce qui est conservé, compté dans la même transaction : la réponse le
+         montre plutôt que de l'affirmer, et l'écran peut le dire à qui
+         confirme le retrait. */
+      const { rows: conserve } = await client.query(
+        `SELECT
+           (SELECT count(*) FROM attendance_day_records_v2 WHERE employee_id=$1) AS pointages,
+           (SELECT count(*) FROM attendance_badges WHERE employee_id=$1) AS badges,
+           (SELECT count(*) FROM attendance_salary_settings_v2 WHERE employee_id=$1) AS salaires,
+           (SELECT count(*) FROM attendance_payroll_items_v2 WHERE employee_id=$1) AS lignes_de_paie,
+           (SELECT count(*) FROM salary_advances WHERE employee_id=$1) AS avances,
+           (SELECT count(*) FROM salary_advance_installments i
+              JOIN salary_advances a ON a.id=i.advance_id WHERE a.employee_id=$1) AS echeances,
+           (SELECT count(*) FROM salary_advance_repayments r
+              JOIN salary_advances a ON a.id=r.advance_id WHERE a.employee_id=$1) AS remboursements,
+           (SELECT COALESCE(sum(balance),0) FROM salary_advances WHERE employee_id=$1) AS solde_avances_restant`,
+        [employeeId]
+      );
+
+      await client.query("COMMIT");
+
+      if (typeof logActivity === "function") {
+        await logActivity(req.user.fullname, req.user.role, "Retrait d'un salarié", "Paie",
+          `Matricule ${employe.employee_number} — ${employe.full_name} — entreprise ${companyId}`
+          + (motif ? ` — motif : ${motif}` : "")
+          + ` — conservé : ${conserve[0].pointages} pointage(s), ${conserve[0].avances} avance(s), `
+          + `${conserve[0].lignes_de_paie} ligne(s) de paie`
+        ).catch(() => {});
+      }
+
+      const soldeDu = Number(conserve[0].solde_avances_restant) > 0;
+      res.json({
+        employee: retire[0],
+        compte_desactive: compteDesactive,
+        conserve: conserve[0],
+        message: `${employe.full_name} est retiré de l'effectif. Son historique reste consultable.`
+          + (soldeDu
+            ? ` Attention : une avance reste due (${conserve[0].solde_avances_restant} FCFA) — le dossier reste ouvert dans les avances.`
+            : ""),
+      });
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      fail(res, error, "Erreur retrait du salarié.");
+    } finally { client.release(); }
   });
 
   router.post("/attendance-v2/salary-adjustments", authenticateToken, async (req, res) => {
