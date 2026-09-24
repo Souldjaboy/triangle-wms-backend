@@ -17552,6 +17552,22 @@ app.use(
   createStockLocationsRouter({ pool, authenticateToken, getEffectiveCompanyId, requirePermission })
 );
 
+/* Paie : ajouter ou retirer un salarié depuis l'écran de paie. Le salaire lui
+   reste géré par PUT /attendance/settings/users/:id, inchangé. */
+const createPayrollEmployeesRouter = require("./routes/payroll-employees");
+app.use(
+  "/",
+  createPayrollEmployeesRouter({
+    pool,
+    authenticateToken,
+    canAccessDirectionModule,
+    hashPassword,
+    canViewAllSalaries,
+    stripSalaryFields,
+    logActivity,
+  })
+);
+
 /* Impression groupée : lecture seule, aucun document ni stock touché. */
 /* Centre Droits & permissions. Monté avant les autres routeurs pour que
    /permissions/me réponde même si un module plus bas est masqué. */
