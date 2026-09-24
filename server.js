@@ -2962,6 +2962,23 @@ app.put("/me/password", authenticateToken, async (req, res) => {
 });
 
 /* UTILISATEURS */
+/**
+ * LES COMPTES D'UNE ENTREPRISE.
+ *
+ * Cette route servait TOUTES les sociétés dès que l'appelant était super
+ * admin : la clause `WHERE` n'était ajoutée que pour les autres. Cinq écrans
+ * d'entreprise la consomment — badges, pointage, messagerie, utilisateurs,
+ * caisses — et recevaient donc les comptes de l'autre société sans le
+ * demander ni le savoir. Un filtre côté navigateur ne corrige pas cela : les
+ * données sont déjà sorties du serveur.
+ *
+ * Le défaut est désormais l'inverse : on sert l'entreprise administrée, et
+ * la vue globale se DEMANDE — `?scope=all`, réservée aux super admins. Un
+ * écran qui oublie de le demander obtient la vue sûre, pas la vue large.
+ *
+ * L'administration globale n'y perd rien : elle passe par
+ * `/super-admin/users`, sa propre route, inchangée.
+ */
 app.get("/users", authenticateToken, async (req, res) => {
   try {
     const role = normalizeRole(req.user?.role);
@@ -2969,13 +2986,32 @@ app.get("/users", authenticateToken, async (req, res) => {
       return res.status(403).json({ error: "Accès refusé aux utilisateurs internes." });
     }
 
-    const companyId = req.user.company_id;
     const isSuperAdmin = req.user.is_super_admin === true;
+    const veutToutesLesSocietes = String(req.query.scope || "") === "all";
 
+    /* Demander la vue globale sans en avoir le droit n'est pas une erreur
+       silencieuse : on refuse, plutôt que de servir discrètement une vue
+       réduite que l'appelant croirait complète. */
+    if (veutToutesLesSocietes && !isSuperAdmin) {
+      return res.status(403).json({
+        error: "La vue multi-entreprises est réservée à l'administration globale.",
+        code: "SCOPE_ALL_FORBIDDEN",
+      });
+    }
+
+    const companyId = Number(getEffectiveCompanyId(req, req.user.company_id) || 0);
     const values = [];
     let companyFilter = "";
 
-    if (!isSuperAdmin) {
+    if (veutToutesLesSocietes) {
+      companyFilter = "";
+    } else {
+      if (!companyId) {
+        return res.status(409).json({
+          error: "Aucune entreprise active. Sélectionnez l'entreprise à consulter.",
+          code: "NO_ACTIVE_COMPANY",
+        });
+      }
       values.push(companyId);
       companyFilter = "WHERE u.company_id = $1";
     }
@@ -14047,7 +14083,21 @@ app.put(
 app.put(
   "/attendance/settings/users/:id",
   authenticateToken,
-  authorizeRoles("admin", "super_admin"),
+  /* LE GARDE ET LE DROIT SALAIRE DISAIENT DEUX CHOSES DIFFÉRENTES.
+     La porte admettait « admin » et « super_admin » ; à l'intérieur, les
+     montants ne s'écrivaient que si canViewAllSalaries — super admin ou
+     direction. Résultat : la DIRECTION, seule habilitée avec le super admin à
+     connaître les rémunérations, était refusée dès la porte (403), et l'admin
+     entrait pour voir ses montants ignorés en silence. Dans les faits, seul un
+     super admin pouvait changer un salaire.
+     Le garde couvre désormais le même périmètre que les autres écrans de
+     direction ; le droit d'écrire les MONTANTS, lui, ne bouge pas : il reste
+     canViewAllSalaries. Aucun admin ne gagne le salaire, la direction cesse
+     d'être bloquée sur ce qui la regarde. */
+  (req, res, next) =>
+    canAccessDirectionModule(req.user)
+      ? next()
+      : res.status(403).json({ error: "Accès refusé : vous n'avez pas l'autorisation." }),
   async (req, res) => {
   try {
     const { id } = req.params;

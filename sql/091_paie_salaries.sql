@@ -1,4 +1,10 @@
--- 065 — PAIE : IDENTITÉ D'UN SALARIÉ
+-- 091 — PAIE : IDENTITÉ D'UN SALARIÉ
+--
+-- Numérotée 091 et non 065 : le numéro 065 est déjà pris par
+-- `065_reaffirmation_catalogue_badges.sql` sur la branche pointage/paie. Deux
+-- migrations portant le même numéro rendent l'ordre d'application ambigu et
+-- empêchent de dire, après coup, laquelle a tourné. 091 est libre au-dessus de
+-- tout ce qui existe des deux côtés (le plus haut occupé est 090).
 --
 -- Strictement ADDITIVE et IDEMPOTENTE. Deux colonnes nullables, rien d'autre :
 -- aucune table créée, aucune colonne retirée, aucune donnée réécrite, aucun

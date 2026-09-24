@@ -317,6 +317,120 @@ async function main() {
       Number(vu?.monthly_salary) === 190000, String(vu?.monthly_salary));
   }
 
+
+  console.log("\n⑦ ISOLATION /users — LA CAUSE RACINE");
+  {
+    /* Par défaut, la route sert l'entreprise administrée, même à un super
+       admin : c'est ce défaut qui empêche un écran d'entreprise de fuir. */
+    const parDefaut = await appel("GET", "/users", SUPER);
+    verifier("un super admin reçoit par défaut SA seule entreprise",
+      parDefaut.statut === 200
+      && (parDefaut.corps || []).every((u) => !/Fatemat/.test(String(u.fullname))),
+      `${(parDefaut.corps || []).length} compte(s) : ${(parDefaut.corps || []).map((u) => u.fullname).join(", ")}`);
+
+    const chezFatemat = await appel("GET", "/users", ADMIN_F);
+    verifier("Fatemat ne reçoit que les siens",
+      (chezFatemat.corps || []).every((u) => !/Triangle/.test(String(u.fullname))),
+      (chezFatemat.corps || []).map((u) => u.fullname).join(", "));
+
+    /* La vue globale existe toujours, mais elle se DEMANDE. */
+    const global = await appel("GET", "/users?scope=all", SUPER);
+    verifier("la vue globale reste possible pour un super admin",
+      global.statut === 200
+      && (global.corps || []).some((u) => /Fatemat/.test(String(u.fullname)))
+      && (global.corps || []).some((u) => /Triangle/.test(String(u.fullname))),
+      `${(global.corps || []).length} compte(s)`);
+    verifier("elle sert strictement plus que la vue par défaut",
+      (global.corps || []).length > (parDefaut.corps || []).length,
+      `${(parDefaut.corps || []).length} → ${(global.corps || []).length}`);
+
+    const refuse = await appel("GET", "/users?scope=all", ADMIN_T);
+    verifier("un compte non super admin ne peut pas la demander",
+      refuse.statut === 403 && refuse.corps.code === "SCOPE_ALL_FORBIDDEN",
+      `statut ${refuse.statut}`);
+
+    /* Un super admin bascule d'entreprise par l'en-tête dédié. */
+    const r = await fetch(`${BASE}/users`, {
+      headers: { Authorization: `Bearer ${SUPER}`, "x-active-company-id": "2" },
+    });
+    const vus = await r.json().catch(() => []);
+    verifier("il bascule d'entreprise par l'en-tête, pas par accident",
+      r.status === 200 && (vus || []).every((u) => !/Triangle/.test(String(u.fullname))),
+      (vus || []).map((u) => u.fullname).join(", "));
+  }
+
+  console.log("\n⑧ DROITS SALAIRE — UNE SEULE RÈGLE");
+  {
+    const cible = (await pool.query(
+      `SELECT id FROM users WHERE company_id=1 AND fullname='Moussa Traoré'`)).rows[0];
+
+    /* La direction voit les salaires (canViewAllSalaries) : elle doit aussi
+       pouvoir les écrire. Elle recevait un 403 dès la porte. */
+    const parDirection = await appel("PUT", `/attendance/settings/users/${cible.id}`, DIRECTION_T, {
+      salary_type: "mensuel", hourly_rate: 0, daily_rate: 0, monthly_salary: 205000,
+    });
+    verifier("LA DIRECTION PEUT MODIFIER UN SALAIRE", parDirection.statut === 200,
+      `statut ${parDirection.statut} — ${JSON.stringify(parDirection.corps).slice(0, 110)}`);
+    verifier("le montant est bien enregistré",
+      Number((await pool.query(
+        `SELECT monthly_salary FROM attendance_settings WHERE user_id=$1`, [cible.id]
+      )).rows[0].monthly_salary) === 205000);
+
+    /* Un admin n'y gagne rien : il passe la porte, les montants sont ignorés. */
+    const parAdmin = await appel("PUT", `/attendance/settings/users/${cible.id}`, ADMIN_T, {
+      salary_type: "mensuel", hourly_rate: 0, daily_rate: 0, monthly_salary: 1,
+    });
+    verifier("un admin n'obtient pas le droit salaire au passage",
+      parAdmin.statut === 200
+      && Number((await pool.query(
+        `SELECT monthly_salary FROM attendance_settings WHERE user_id=$1`, [cible.id]
+      )).rows[0].monthly_salary) === 205000,
+      "le montant aurait été écrasé");
+
+    const parMagasinier = await appel("PUT", `/attendance/settings/users/${cible.id}`, MAGASINIER, {
+      salary_type: "mensuel", monthly_salary: 1,
+    });
+    verifier("un magasinier reste refusé à la porte", parMagasinier.statut === 403,
+      `statut ${parMagasinier.statut}`);
+  }
+
+  console.log("\n⑨ UNE SEULE FICHE SALARIÉ");
+  {
+    /* Le salarié ajouté par la paie est LE compte users : pas de seconde
+       identité ailleurs. On le vérifie par ses rattachements. */
+    const { rows } = await pool.query(
+      `SELECT u.id, u.company_id, u.is_active,
+              (SELECT COUNT(*)::int FROM attendance_settings s WHERE s.user_id = u.id) AS fiches_salaire,
+              (SELECT COUNT(*)::int FROM users d
+                WHERE d.company_id = u.company_id AND d.id <> u.id
+                  AND lower(trim(d.fullname)) = lower(trim(u.fullname))) AS homonymes_internes
+         FROM users u WHERE u.company_id = 1 AND u.fullname = 'Moussa Traoré'`);
+    verifier("un seul compte porte ce salarié", rows.length === 1, `${rows.length}`);
+    verifier("une seule fiche de salaire lui est rattachée", rows[0].fiches_salaire === 1);
+    verifier("aucun doublon dans son entreprise", rows[0].homonymes_internes === 0);
+
+    const orphelines = await pool.query(
+      `SELECT COUNT(*)::int AS n FROM attendance_settings s
+        WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.id = s.user_id)`);
+    verifier("aucune fiche de salaire orpheline", orphelines.rows[0].n === 0);
+  }
+
+  console.log("\n⑩ HISTORIQUE CONSERVÉ APRÈS TOUTES CES OPÉRATIONS");
+  {
+    const paies = await pool.query(`SELECT COUNT(*)::int AS n FROM payroll_items WHERE company_id=1`);
+    verifier("les lignes de paie sont toutes là", paies.rows[0].n >= 1, `${paies.rows[0].n}`);
+    const heures = await pool.query(`SELECT COUNT(*)::int AS n FROM attendance_records`);
+    verifier("les pointages sont tous là", heures.rows[0].n >= 1, `${heures.rows[0].n}`);
+    const retires = await pool.query(
+      `SELECT COUNT(*)::int AS n FROM users WHERE is_active = FALSE`);
+    verifier("les salariés retirés existent toujours, désactivés", retires.rows[0].n >= 2,
+      `${retires.rows[0].n}`);
+    const supprimes = await pool.query(
+      `SELECT COUNT(*)::int AS n FROM payroll_items p
+        WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.id = p.user_id)`);
+    verifier("aucune ligne de paie n'a perdu son salarié", supprimes.rows[0].n === 0);
+  }
+
   await pool.end();
   console.log(`\n${reussis} réussis, ${echoues} échoués\n`);
   process.exit(echoues ? 1 : 0);
