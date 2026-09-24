@@ -479,27 +479,102 @@ module.exports = function createAttendanceWorkforceRouter(deps) {
     } catch (error) { fail(res, error, "Erreur transfert employé."); }
   });
 
+  /* ══════════════════════════════════════════════════════════════════════
+     MODIFIER LE SALAIRE
+
+     Trois règles, et chacune corrige un piège précis.
+
+     1. La date d'effet par défaut est CURRENT_DATE, décidée par le serveur.
+        Elle était figée à « 2026-09-03 » : tout salaire enregistré sans date
+        atterrissait en septembre 2026, donc rétroactivement sur des périodes
+        déjà closes, et rouvrait un calcul que la clôture avait arrêté.
+
+     2. Un champ ABSENT du corps n'est pas un champ vidé. Envoyer le seul
+        salaire mensuel effaçait le journalier, parce que `undefined` devenait
+        NULL. Ce qui n'est pas mentionné est repris tel quel depuis le salaire
+        en vigueur à cette date — lu dans la même instruction, donc sans
+        fenêtre entre la lecture et l'écriture. Pour vider une valeur, il faut
+        la dire : `null` ou chaîne vide.
+
+     3. L'historique ne se réécrit pas. Chaque date d'effet est une ligne ; les
+        lignes antérieures ne sont jamais touchées. Réenregistrer à une date
+        déjà présente corrige cette ligne-là, et elle seule.
+     ══════════════════════════════════════════════════════════════════════ */
   router.put("/attendance-v2/employees/:id/salary", authenticateToken, async (req, res) => {
     const companyId = requireCompany(req, res); if (!companyId) return;
     if (!A.isSuperAdmin(req.user)) return res.status(403).json({ error: "Réservé au super administrateur." });
-    const rate = req.body?.daily_rate === null || req.body?.daily_rate === "" ? null : Number(req.body?.daily_rate);
-    const monthly = req.body?.monthly_salary === null || req.body?.monthly_salary === "" ? null : Number(req.body?.monthly_salary);
-    if ((rate !== null && (!Number.isFinite(rate) || rate < 0)) ||
-        (monthly !== null && (!Number.isFinite(monthly) || monthly < 0))) {
-      return res.status(400).json({ error: "Salaire mensuel ou journalier invalide." });
+
+    /* Absent = « ne touche pas ». Explicitement null ou vide = « efface ». */
+    const fourni = (champ) => Object.prototype.hasOwnProperty.call(req.body || {}, champ)
+      && req.body[champ] !== undefined;
+    const lireMontant = (champ) => {
+      const brut = req.body[champ];
+      if (brut === null || brut === "") return { valide: true, valeur: null };
+      const nombre = Number(brut);
+      if (!Number.isFinite(nombre) || nombre < 0) return { valide: false };
+      return { valide: true, valeur: nombre };
+    };
+
+    const mensuelFourni = fourni("monthly_salary");
+    const journalierFourni = fourni("daily_rate");
+    if (!mensuelFourni && !journalierFourni) {
+      return res.status(400).json({
+        error: "Indiquez au moins un salaire à modifier : mensuel, journalier, ou les deux.",
+        code: "SALARY_FIELD_REQUIRED",
+      });
     }
+    const mensuel = mensuelFourni ? lireMontant("monthly_salary") : { valide: true, valeur: null };
+    const journalier = journalierFourni ? lireMontant("daily_rate") : { valide: true, valeur: null };
+    if (!mensuel.valide || !journalier.valide) {
+      return res.status(400).json({ error: "Salaire mensuel ou journalier invalide.", code: "SALARY_INVALID" });
+    }
+
+    /* Une date illisible n'est pas une date absente : la remplacer en silence
+       par aujourd'hui daterait le salaire d'un jour que personne n'a choisi. */
+    const dateDemandee = req.body?.effective_from;
+    let dateEffet = null;
+    if (dateDemandee !== undefined && dateDemandee !== null && String(dateDemandee).trim() !== "") {
+      const texte = String(dateDemandee).trim();
+      const jour = new Date(`${texte}T00:00:00Z`);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(texte) || Number.isNaN(jour.getTime())) {
+        return res.status(400).json({
+          error: "Date d'effet attendue au format AAAA-MM-JJ.", code: "EFFECTIVE_FROM_INVALID",
+        });
+      }
+      dateEffet = texte;
+    }
+
     try {
       const { rows } = await pool.query(
-        `INSERT INTO attendance_salary_settings_v2(company_id,employee_id,monthly_salary,daily_rate,basis_days,effective_from,set_by)
-         SELECT $1,e.id,$2,$3,30,$4,$5 FROM attendance_employees e WHERE e.id=$6 AND e.company_id=$1
-         ON CONFLICT(employee_id,effective_from) DO UPDATE SET monthly_salary=EXCLUDED.monthly_salary,
-           daily_rate=EXCLUDED.daily_rate,basis_days=30,set_by=EXCLUDED.set_by,updated_at=CURRENT_TIMESTAMP
+        `WITH date_effet AS (SELECT COALESCE($4::date, CURRENT_DATE) AS jour)
+         INSERT INTO attendance_salary_settings_v2
+           (company_id, employee_id, monthly_salary, daily_rate, basis_days, effective_from, set_by)
+         SELECT $1, e.id,
+                CASE WHEN $2::boolean THEN $3::numeric ELSE actuel.monthly_salary END,
+                CASE WHEN $5::boolean THEN $6::numeric ELSE actuel.daily_rate END,
+                30, d.jour, $7
+           FROM attendance_employees e
+           CROSS JOIN date_effet d
+           LEFT JOIN LATERAL (
+             SELECT s.monthly_salary, s.daily_rate
+               FROM attendance_salary_settings_v2 s
+              WHERE s.employee_id = e.id AND s.effective_from <= d.jour
+              ORDER BY s.effective_from DESC LIMIT 1
+           ) actuel ON true
+          WHERE e.id = $8 AND e.company_id = $1
+         ON CONFLICT (employee_id, effective_from) DO UPDATE
+           SET monthly_salary = EXCLUDED.monthly_salary,
+               daily_rate = EXCLUDED.daily_rate,
+               basis_days = 30,
+               set_by = EXCLUDED.set_by,
+               updated_at = CURRENT_TIMESTAMP
          RETURNING *`,
-        [companyId, monthly, rate, req.body?.effective_from || "2026-09-03", req.user.id, Number(req.params.id)]
+        [companyId, mensuelFourni, mensuel.valeur, dateEffet,
+         journalierFourni, journalier.valeur, req.user.id, Number(req.params.id)]
       );
-      if (!rows[0]) return res.status(404).json({ error: "Employé introuvable." });
+      if (!rows[0]) return res.status(404).json({ error: "Employé introuvable.", code: "EMPLOYEE_NOT_FOUND" });
       res.json(rows[0]);
-    } catch (error) { fail(res, error, "Erreur salaire journalier."); }
+    } catch (error) { fail(res, error, "Erreur enregistrement du salaire."); }
   });
 
 

@@ -109,15 +109,88 @@ const ADMIN_TRI = { id: 903, fullname: "Admin Simple", role: "admin", company_id
   ok("toujours une seule fiche pour le compte 902",
      Number((await q(`SELECT count(*) c FROM attendance_employees WHERE company_id=1 AND user_id=902`))[0].c) === 1);
 
-  /* ═══ ② LA MODIFICATION DE SALAIRE EXISTANTE N'A PAS BOUGÉ ═══ */
-  console.log("\n② modification de salaire (route existante, inchangée)");
+  /* ═══ ② LE SALAIRE : PARTIEL, TOTAL, DATÉ OU NON ═══ */
+  console.log("\n② modification de salaire");
+  const aujourdHui = (await q("SELECT CURRENT_DATE::text AS j"))[0].j;
+  const jour = (d) => String(d).slice(0, 10);
+  const salaireA = async (date) => (await q(
+    `SELECT monthly_salary, daily_rate FROM attendance_salary_settings_v2
+      WHERE employee_id=$1 AND effective_from=$2`, [idMoussa, date]))[0];
+
+  // ②a les deux montants, avec une date explicite
   r = await appel("PUT", `/attendance-v2/employees/${idMoussa}/salary`, { token: tTri, societe: 1, corps: {
     monthly_salary: 135000, daily_rate: 4500, effective_from: "2026-10-01" }});
-  ok("PUT /salary répond 200", r.status === 200, `reçu ${r.status} ${JSON.stringify(r.data)}`);
-  s = await q(`SELECT * FROM attendance_salary_settings_v2 WHERE employee_id=$1 ORDER BY effective_from`, [idMoussa]);
-  ok("historique salarial conservé : 2 lignes datées", s.length === 2, `${s.length} ligne(s)`);
-  ok("nouveau montant enregistré", Number(s[1]?.monthly_salary) === 135000);
-  ok("ancien montant toujours lisible", Number(s[0]?.monthly_salary) === 120000);
+  ok("②a les deux montants : 200", r.status === 200, `reçu ${r.status} ${JSON.stringify(r.data)}`);
+  let v = await salaireA("2026-10-01");
+  ok("②a mensuel = 135000", Number(v?.monthly_salary) === 135000, JSON.stringify(v));
+  ok("②a journalier = 4500", Number(v?.daily_rate) === 4500, JSON.stringify(v));
+
+  // ②b le mensuel SEUL : le journalier doit être repris, pas effacé
+  r = await appel("PUT", `/attendance-v2/employees/${idMoussa}/salary`, { token: tTri, societe: 1, corps: {
+    monthly_salary: 140000, effective_from: "2026-10-05" }});
+  ok("②b mensuel seul : 200 (et non 400)", r.status === 200, `reçu ${r.status} ${JSON.stringify(r.data)}`);
+  v = await salaireA("2026-10-05");
+  ok("②b nouveau mensuel = 140000", Number(v?.monthly_salary) === 140000, JSON.stringify(v));
+  ok("②b journalier REPRIS, pas effacé (4500)", Number(v?.daily_rate) === 4500, JSON.stringify(v));
+
+  // ②c le journalier SEUL : le mensuel doit être repris
+  r = await appel("PUT", `/attendance-v2/employees/${idMoussa}/salary`, { token: tTri, societe: 1, corps: {
+    daily_rate: 5000, effective_from: "2026-10-10" }});
+  ok("②c journalier seul : 200", r.status === 200, `reçu ${r.status} ${JSON.stringify(r.data)}`);
+  v = await salaireA("2026-10-10");
+  ok("②c nouveau journalier = 5000", Number(v?.daily_rate) === 5000, JSON.stringify(v));
+  ok("②c mensuel REPRIS, pas effacé (140000)", Number(v?.monthly_salary) === 140000, JSON.stringify(v));
+
+  // ②d AUCUNE date fournie : le serveur décide, c'est aujourd'hui
+  r = await appel("PUT", `/attendance-v2/employees/${idMoussa}/salary`, { token: tTri, societe: 1, corps: {
+    monthly_salary: 125000 }});
+  ok("②d sans date d'effet : 200", r.status === 200, `reçu ${r.status} ${JSON.stringify(r.data)}`);
+  ok("②d date d'effet = aujourd'hui (CURRENT_DATE serveur)",
+     jour(r.data?.effective_from) === aujourdHui, `reçu ${jour(r.data?.effective_from)} attendu ${aujourdHui}`);
+  ok("②d et surtout PAS la date en dur 2026-09-03", jour(r.data?.effective_from) !== "2026-09-03");
+  v = await salaireA(aujourdHui);
+  ok("②d journalier du jour repris (4000, celui de l'embauche)", Number(v?.daily_rate) === 4000, JSON.stringify(v));
+
+  // ②e aucun des deux montants
+  r = await appel("PUT", `/attendance-v2/employees/${idMoussa}/salary`, { token: tTri, societe: 1, corps: {
+    effective_from: "2026-11-01" }});
+  ok("②e aucun montant : 400", r.status === 400 && r.data?.code === "SALARY_FIELD_REQUIRED", JSON.stringify(r.data));
+
+  // ②f date illisible : refusée, jamais remplacée en silence
+  r = await appel("PUT", `/attendance-v2/employees/${idMoussa}/salary`, { token: tTri, societe: 1, corps: {
+    monthly_salary: 1000, effective_from: "01/10/2026" }});
+  ok("②f date illisible : 400", r.status === 400 && r.data?.code === "EFFECTIVE_FROM_INVALID", JSON.stringify(r.data));
+
+  // ②g effacement EXPLICITE : dire null, c'est vouloir vider
+  r = await appel("PUT", `/attendance-v2/employees/${idMoussa}/salary`, { token: tTri, societe: 1, corps: {
+    daily_rate: null, effective_from: "2026-10-15" }});
+  ok("②g effacement explicite : 200", r.status === 200, `reçu ${r.status}`);
+  v = await salaireA("2026-10-15");
+  ok("②g journalier vidé", v?.daily_rate === null, JSON.stringify(v));
+  ok("②g mensuel conservé (140000)", Number(v?.monthly_salary) === 140000, JSON.stringify(v));
+
+  // ②h l'historique : rien de ce qui précède n'a été réécrit
+  const historique = await q(
+    `SELECT effective_from::text AS d, monthly_salary, daily_rate FROM attendance_salary_settings_v2
+      WHERE employee_id=$1 ORDER BY effective_from`, [idMoussa]);
+  ok("②h 5 lignes datées dans l'historique", historique.length === 5,
+     historique.map((x) => `${x.d}:${x.monthly_salary}/${x.daily_rate}`).join(" "));
+  ok("②h la ligne du 2026-10-01 est intacte",
+     Number(historique.find((x) => x.d === "2026-10-01")?.monthly_salary) === 135000
+     && Number(historique.find((x) => x.d === "2026-10-01")?.daily_rate) === 4500);
+  ok("②h la ligne du 2026-10-05 est intacte",
+     Number(historique.find((x) => x.d === "2026-10-05")?.monthly_salary) === 140000);
+  ok("②h aucune ligne n'a été supprimée", historique.length >= 5);
+
+  // ②i réenregistrer à une date DÉJÀ présente corrige cette ligne, et elle seule
+  r = await appel("PUT", `/attendance-v2/employees/${idMoussa}/salary`, { token: tTri, societe: 1, corps: {
+    monthly_salary: 136000, effective_from: "2026-10-01" }});
+  ok("②i correction d'une ligne existante : 200", r.status === 200, `reçu ${r.status}`);
+  v = await salaireA("2026-10-01");
+  ok("②i mensuel corrigé = 136000", Number(v?.monthly_salary) === 136000, JSON.stringify(v));
+  ok("②i journalier de CETTE ligne conservé (4500)", Number(v?.daily_rate) === 4500, JSON.stringify(v));
+  ok("②i toujours 5 lignes, aucune créée en double",
+     (await q(`SELECT 1 FROM attendance_salary_settings_v2 WHERE employee_id=$1`, [idMoussa])).length === 5);
 
   /* ═══ ③ TRIANGLE : RETIRER LE SALARIÉ À HISTORIQUE COMPLET ═══ */
   console.log("\n③ TRIANGLE — retirer un salarié (historique complet)");
@@ -201,12 +274,16 @@ const ADMIN_TRI = { id: 903, fullname: "Admin Simple", role: "admin", company_id
   /* Les deux montants sont envoyés : la route existante valide les montants
      AVANT de regarder la société, et un seul champ suffirait à obtenir un 400
      qui ne prouverait rien sur l'isolation. */
+  const salaireAvantTentative = JSON.stringify(await q(`SELECT effective_from::text AS d, monthly_salary, daily_rate
+                                                          FROM attendance_salary_settings_v2 WHERE employee_id=$1
+                                                         ORDER BY effective_from`, [idMoussa]));
   r = await appel("PUT", `/attendance-v2/employees/${idMoussa}/salary`, { token: tFat, societe: 2, corps: {
     monthly_salary: 1, daily_rate: 1 }});
   ok("FAT & MAT ne peut pas changer le salaire d'un Triangle (404)", r.status === 404, `reçu ${r.status} ${JSON.stringify(r.data)}`);
   ok("salaire Triangle inchangé",
-     Number((await q(`SELECT monthly_salary FROM attendance_salary_settings_v2
-                       WHERE employee_id=$1 ORDER BY effective_from DESC LIMIT 1`, [idMoussa]))[0]?.monthly_salary) === 135000);
+     JSON.stringify(await q(`SELECT effective_from::text AS d, monthly_salary, daily_rate
+                               FROM attendance_salary_settings_v2 WHERE employee_id=$1
+                              ORDER BY effective_from`, [idMoussa])) === salaireAvantTentative);
 
   /* ═══ ⑥ AUCUN DOUBLON, AUCUNE IDENTITÉ PARALLÈLE ═══ */
   console.log("\n⑥ pas de doublon, pas de système parallèle");
