@@ -27,6 +27,7 @@
  */
 
 const express = require("express");
+const EL = require("../services/paie-elements");
 const P = require("../services/attendance-periodes");
 const PAIE = require("../services/attendance-payroll");
 const AV = require("../services/avances-salaire");
@@ -288,6 +289,10 @@ module.exports = function createPaieWorkflowRouter(deps) {
         }
 
         const lignes = await PAIE.calculerPaiePeriode(client, companyId, {
+          /* `code` est indispensable : c'est la clé sous laquelle les primes et
+             les heures supplémentaires sont rangées. Sans lui, elles existent en
+             base et n'atteignent jamais le bulletin. */
+          code: periode.code,
           date_debut: periode.debut, date_fin: periode.fin,
           /* L'exception d'absences porte sur CETTE période : elle est lue ici,
              avec la période, et nulle part ailleurs. */
@@ -349,13 +354,17 @@ module.exports = function createPaieWorkflowRouter(deps) {
             `INSERT INTO attendance_payroll_items_v2
                (company_id, payroll_run_id, employee_id, employee_name, monthly_salary,
                 daily_rate, expected_days, attended_days, absence_days, late_minutes,
-                absence_deduction, absence_deduction_annulee, adjustments, net_salary, status)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                absence_deduction, absence_deduction_annulee, adjustments,
+                primes_total, heures_sup_total, heures_sup_heures, retenues_autres_total,
+                non_remunere, net_salary, status)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
              RETURNING id, net_salary`,
             [companyId, paie.id, l.id, l.full_name, l.monthly_salary, l.daily_rate,
              l.expected_days, l.attended_days, l.absence_days, l.late_minutes,
-             l.absence_deduction, l.absence_deduction_annulee || 0,
-             l.adjustments, l.net_salary, l.status]
+             l.absence_deduction, l.absence_deduction_annulee || 0, l.adjustments,
+             l.primes_total || 0, l.heures_sup_total || 0, l.heures_sup_heures || 0,
+             l.retenues_autres_total || 0, l.non_remunere === true,
+             l.net_salary, l.status]
           );
           const ligne = creees[0];
 
@@ -404,8 +413,15 @@ module.exports = function createPaieWorkflowRouter(deps) {
               SET gross_amount = x.brut, deductions_amount = x.retenues,
                   adjustments_amount = x.ajustements, net_amount = x.net, updated_at = now()
              FROM (SELECT payroll_run_id,
-                          COALESCE(sum(monthly_salary), 0) AS brut,
-                          COALESCE(sum(absence_deduction), 0) + COALESCE(sum(advance_deduction), 0) AS retenues,
+                          /* Le brut inclut désormais primes et heures
+                             supplémentaires : sans elles, le total annoncé ne
+                             correspondrait plus à la somme des bulletins. */
+                          COALESCE(sum(monthly_salary), 0)
+                            + COALESCE(sum(primes_total), 0)
+                            + COALESCE(sum(heures_sup_total), 0) AS brut,
+                          COALESCE(sum(absence_deduction), 0)
+                            + COALESCE(sum(advance_deduction), 0)
+                            + COALESCE(sum(retenues_autres_total), 0) AS retenues,
                           COALESCE(sum(adjustments), 0) AS ajustements,
                           COALESCE(sum(net_salary), 0) AS net
                      FROM attendance_payroll_items_v2 WHERE payroll_run_id = $1
@@ -631,6 +647,261 @@ module.exports = function createPaieWorkflowRouter(deps) {
   // ═══════════════════════════════════════════════════════════════════════
   // AJUSTER UN MONTANT — avant/après conservé
   // ═══════════════════════════════════════════════════════════════════════
+
+  /* ══════════════════════════════════════════════════════════════════════
+     LE CATALOGUE DES TYPES D'ÉLÉMENTS
+
+     Servi depuis la base, pas écrit dans l'écran : ajouter « prime d'ancienneté »
+     demain sera une ligne de données, pas un déploiement.
+     ══════════════════════════════════════════════════════════════════════ */
+  router.get(
+    "/paie/elements/types",
+    authenticateToken,
+    requirePermission("paie", "view"),
+    async (req, res) => {
+      try {
+        res.json({ types: await EL.typesActifs(pool) });
+      } catch (e) { fail(res, e, "Erreur lecture des types d'éléments de paie."); }
+    }
+  );
+
+  /* ══════════════════════════════════════════════════════════════════════
+     LES ÉLÉMENTS D'UNE PÉRIODE
+
+     Lecture de la source métier, indépendamment de l'état de la paie. Une prime
+     existe même si la paie n'a pas encore été préparée — et elle existe encore
+     après qu'on l'a recalculée.
+     ══════════════════════════════════════════════════════════════════════ */
+  router.get(
+    "/paie/periodes/:code/elements",
+    authenticateToken,
+    requirePermission("paie", "view"),
+    async (req, res) => {
+      const companyId = requireCompany(req, res); if (!companyId) return;
+      try {
+        const { rows } = await pool.query(
+          `SELECT e.*, t.kind, t.label AS type_label, t.sign, t.uses_quantity,
+                  emp.full_name AS salarie, emp.employee_number AS matricule
+             FROM payroll_elements e
+             JOIN payroll_element_types t ON t.type_key = e.type_key
+             JOIN attendance_employees emp ON emp.id = e.employee_id
+            WHERE e.company_id = $1 AND e.period_code = $2
+            ORDER BY emp.employee_number, t.sort_order, e.id`,
+          [companyId, String(req.params.code)]
+        );
+        res.json({ elements: rows });
+      } catch (e) { fail(res, e, "Erreur lecture des éléments de paie."); }
+    }
+  );
+
+  /* ══════════════════════════════════════════════════════════════════════
+     AJOUTER UN ÉLÉMENT DE PAIE
+
+     Prime, heures supplémentaires ou retenue autorisée. Le montant d'heures
+     supplémentaires est CALCULÉ par le serveur : accepter un troisième chiffre
+     à côté de la quantité et du taux permettrait au bulletin d'afficher
+     « 8 h × 1 500 = 15 000 » sans que personne ne sache lequel croire.
+
+     L'élément est rattaché à la période, jamais à la ligne de paie : c'est ce
+     qui le fait survivre au recalcul. Préparer la paie ensuite le fera
+     apparaître ; la préparer dix fois ne le comptera pas dix fois.
+     ══════════════════════════════════════════════════════════════════════ */
+  router.post(
+    "/paie/periodes/:code/elements",
+    authenticateToken,
+    requirePermission("paie", "adjust"),
+    async (req, res) => {
+      const companyId = requireCompany(req, res); if (!companyId) return;
+      const periodCode = String(req.params.code);
+      if (!/^\d{4}-\d{2}$/.test(periodCode)) {
+        return res.status(400).json({ error: "Période attendue au format AAAA-MM.", code: "PERIOD_INVALID" });
+      }
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+
+        const type = await EL.typeDe(client, String(req.body?.type_key || ""));
+        if (!type) throw P.erreur("Type d'élément de paie inconnu.", "TYPE_UNKNOWN", 400);
+
+        /* Le salarié doit appartenir à l'entreprise active : sans ce contrôle,
+           une prime de Triangle pourrait atterrir sur un salarié de FAT & MAT. */
+        const { rows: emp } = await client.query(
+          `SELECT id, full_name FROM attendance_employees
+            WHERE id = $1 AND company_id = $2`,
+          [Number(req.body?.employee_id), companyId]
+        );
+        if (!emp[0]) throw P.erreur("Salarié introuvable dans l'entreprise active.", "EMPLOYEE_NOT_IN_COMPANY", 400);
+
+        const motif = String(req.body?.reason || "").trim();
+        if (motif.length < 5) {
+          throw P.erreur("Motif obligatoire (5 caractères minimum).", "REASON_REQUIRED", 400);
+        }
+        const libelle = String(req.body?.label || "").trim();
+        if (type.requires_label && libelle.length < 3) {
+          throw P.erreur(
+            `« ${type.label} » exige une description : sans elle, la ligne ne dit rien à qui la relit.`,
+            "LABEL_REQUIRED", 400);
+        }
+
+        const montantForce = req.body?.montant_force === true;
+        if (montantForce && motif.length < 10) {
+          throw P.erreur(
+            "Corriger un montant calculé exige un motif détaillé (10 caractères minimum).",
+            "REASON_TOO_SHORT", 400);
+        }
+        const calcul = EL.calculerMontant({
+          type, quantity: req.body?.quantity, unitAmount: req.body?.unit_amount,
+          amount: req.body?.amount, montantForce,
+        });
+
+        const { rows } = await client.query(
+          `INSERT INTO payroll_elements
+             (company_id, employee_id, period_code, type_key, quantity, unit_amount,
+              amount, label, reason, created_by, created_by_name)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+           RETURNING *`,
+          [companyId, emp[0].id, periodCode, type.type_key,
+           type.uses_quantity ? EL.francs(req.body?.quantity) : null,
+           type.uses_quantity ? EL.francs(req.body?.unit_amount) : null,
+           calcul.montant, libelle,
+           calcul.corrige
+             ? `${motif} [montant calculé ${calcul.produit} corrigé à ${calcul.montant}]`
+             : motif,
+           req.user?.id || null, nomDe(req)]
+        );
+
+        await client.query("COMMIT");
+        if (typeof logActivity === "function") {
+          await logActivity(nomDe(req), req.user?.role, "Élément de paie ajouté", "Paie",
+            `${type.label} — ${emp[0].full_name} — ${periodCode} — ${calcul.montant} FCFA`
+            + (type.uses_quantity ? ` (${req.body?.quantity} × ${req.body?.unit_amount})` : "")
+            + ` — ${motif}`).catch(() => {});
+        }
+        res.status(201).json({
+          element: rows[0], type,
+          montant_calcule: calcul.produit, montant_corrige: calcul.corrige,
+          message: `${type.label} de ${calcul.montant} FCFA enregistrée pour ${emp[0].full_name}. `
+            + "Recalculez la paie de la période pour la faire apparaître sur le bulletin.",
+        });
+      } catch (e) {
+        await client.query("ROLLBACK").catch(() => {});
+        fail(res, e, "Erreur ajout d'un élément de paie.");
+      } finally { client.release(); }
+    }
+  );
+
+  /* ══════════════════════════════════════════════════════════════════════
+     ANNULER UN ÉLÉMENT DE PAIE — sans l'effacer
+
+     Une prime accordée puis retirée est un fait à conserver : la ligne passe à
+     ANNULE, avec son motif et son auteur. La supprimer laisserait un bulletin
+     changer de montant sans que rien n'explique pourquoi.
+     ══════════════════════════════════════════════════════════════════════ */
+  router.post(
+    "/paie/elements/:id/annuler",
+    authenticateToken,
+    requirePermission("paie", "adjust"),
+    async (req, res) => {
+      const companyId = requireCompany(req, res); if (!companyId) return;
+      const motif = String(req.body?.reason || "").trim();
+      if (motif.length < 5) {
+        return res.status(400).json({
+          error: "Motif d'annulation obligatoire (5 caractères minimum).", code: "REASON_REQUIRED" });
+      }
+      try {
+        const { rows } = await pool.query(
+          `UPDATE payroll_elements
+              SET status = 'ANNULE', cancelled_by = $1, cancelled_by_name = $2,
+                  cancelled_at = now(), cancel_reason = $3, updated_at = now()
+            WHERE id = $4 AND company_id = $5 AND status = 'ACTIF'
+            RETURNING *`,
+          [req.user?.id || null, nomDe(req), motif, Number(req.params.id), companyId]
+        );
+        if (!rows[0]) {
+          return res.status(404).json({
+            error: "Élément introuvable dans cette entreprise, ou déjà annulé.",
+            code: "ELEMENT_NOT_ACTIVE" });
+        }
+        if (typeof logActivity === "function") {
+          await logActivity(nomDe(req), req.user?.role, "Élément de paie annulé", "Paie",
+            `Élément ${rows[0].id} — ${rows[0].period_code} — ${rows[0].amount} FCFA — ${motif}`).catch(() => {});
+        }
+        res.json({
+          element: rows[0],
+          message: "Élément annulé. Il reste visible dans l'historique. "
+            + "Recalculez la paie de la période pour le retirer du bulletin.",
+        });
+      } catch (e) { fail(res, e, "Erreur annulation d'un élément de paie."); }
+    }
+  );
+
+  /* ══════════════════════════════════════════════════════════════════════
+     NON RÉMUNÉRÉ VOLONTAIREMENT
+
+     Un directeur qui ne se verse pas de salaire n'est pas une fiche incomplète.
+     Le système distinguait mal les deux, et l'on s'en sortait en corrigeant le
+     net à la main — ce qui faisait passer un salaire oublié pour une décision.
+
+     Ce drapeau est POSÉ, jamais déduit. Réservé au super administrateur, relu en
+     base : décider qu'une personne ne sera pas payée n'est pas une saisie.
+     ══════════════════════════════════════════════════════════════════════ */
+  router.post(
+    "/paie/salaries/:id/non-remunere",
+    authenticateToken,
+    requirePermission("paie", "prepare"),
+    async (req, res) => {
+      const companyId = requireCompany(req, res); if (!companyId) return;
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const { rows: compte } = await client.query(
+          `SELECT is_super_admin FROM users WHERE id = $1`, [req.user?.id || 0]
+        );
+        if (compte[0]?.is_super_admin !== true) {
+          throw P.erreur(
+            "Déclarer un salarié non rémunéré est réservé au super administrateur.",
+            "NON_REMUNERE_FORBIDDEN", 403);
+        }
+        const actif = req.body?.actif !== false;
+        const motif = String(req.body?.reason || "").trim();
+        if (actif && motif.length < 15) {
+          throw P.erreur(
+            "Motif obligatoire (15 caractères minimum) : un salaire absent par erreur ne doit "
+            + "jamais pouvoir se confondre avec un salaire volontairement nul.",
+            "REASON_REQUIRED", 400);
+        }
+        const { rows } = await client.query(
+          `UPDATE attendance_employees
+              SET non_remunere = $1,
+                  non_remunere_motif = CASE WHEN $1 THEN $2 ELSE '' END,
+                  non_remunere_par   = CASE WHEN $1 THEN $3::int ELSE NULL END,
+                  non_remunere_le    = CASE WHEN $1 THEN now() ELSE NULL END,
+                  updated_at = CURRENT_TIMESTAMP
+            WHERE id = $4 AND company_id = $5
+            RETURNING id, full_name, non_remunere, non_remunere_motif, non_remunere_le`,
+          [actif, motif, req.user?.id || null, Number(req.params.id), companyId]
+        );
+        if (!rows[0]) throw P.erreur("Salarié introuvable dans cette entreprise.", "EMPLOYEE_NOT_FOUND", 404);
+
+        await client.query("COMMIT");
+        if (typeof logActivity === "function") {
+          await logActivity(nomDe(req), req.user?.role,
+            actif ? "Salarié déclaré non rémunéré" : "Salarié redevenu rémunéré", "Paie",
+            `${rows[0].full_name} — entreprise ${companyId}` + (motif ? ` — ${motif}` : "")).catch(() => {});
+        }
+        res.json({
+          salarie: rows[0],
+          message: actif
+            ? `${rows[0].full_name} est déclaré non rémunéré : sa paie sera de 0 FCFA et ne bloquera plus la préparation. Recalculez la période pour appliquer la décision.`
+            : `${rows[0].full_name} redevient rémunéré : configurez son salaire, sinon sa ligne de paie sera bloquée.`,
+        });
+      } catch (e) {
+        await client.query("ROLLBACK").catch(() => {});
+        fail(res, e, "Erreur déclaration non rémunéré.");
+      } finally { client.release(); }
+    }
+  );
+
   router.post(
     "/paie/lignes/:id/ajuster",
     authenticateToken,
@@ -639,7 +910,18 @@ module.exports = function createPaieWorkflowRouter(deps) {
       const companyId = requireCompany(req, res); if (!companyId) return;
       const client = await pool.connect();
       try {
-        const motif = motifDe(req, 5);
+        /* CE CHEMIN N'EST PLUS LA MÉTHODE NORMALE.
+           Il a servi à porter un vrai salaire, deux retenues et une prime — et
+           les quatre ont disparu au premier recalcul, parce que
+           `payroll_item_adjustments` est rattachée à la ligne de paie en
+           ON DELETE CASCADE. Un salaire se corrige sur la fiche, une prime et
+           des heures supplémentaires passent par les éléments de paie : ceux-là
+           survivent.
+           La route reste, parce qu'une correction exceptionnelle existe. Mais
+           elle exige un motif plus long, elle marque la ligne comme corrigée à
+           la main, et elle laisse une trace dans le journal d'activité — qui,
+           lui, survit au recalcul. */
+        const motif = motifDe(req, 15);
         const nouveau = Number(req.body?.net_salary);
         if (!Number.isFinite(nouveau) || nouveau < 0) {
           throw P.erreur("Montant invalide.", "AMOUNT_INVALID", 400);
@@ -671,7 +953,12 @@ module.exports = function createPaieWorkflowRouter(deps) {
 
         const { rows: majs } = await client.query(
           `UPDATE attendance_payroll_items_v2
-              SET net_salary = $1, status = CASE WHEN status = 'BLOCKED' THEN 'TO_PAY' ELSE status END,
+              SET net_salary = $1,
+                  /* La ligne DIT qu'elle a été corrigée à la main : un net sans
+                     explication sur un bulletin est précisément ce qu'on veut
+                     rendre impossible. */
+                  net_corrige_manuellement = TRUE,
+                  status = CASE WHEN status = 'BLOCKED' THEN 'TO_PAY' ELSE status END,
                   updated_at = now()
             WHERE id = $2 RETURNING *`,
           [nouveau, ligne.id]
@@ -690,11 +977,26 @@ module.exports = function createPaieWorkflowRouter(deps) {
         );
 
         await client.query("COMMIT");
+
+        /* Le journal d'activité survit au recalcul, contrairement à
+           payroll_item_adjustments. C'est donc là que la trace doit aussi
+           vivre, sinon la correction disparaîtrait sans laisser de mémoire. */
+        if (typeof logActivity === "function") {
+          await logActivity(nomDe(req), req.user?.role,
+            "Correction manuelle d'un net de paie", "Paie",
+            `${ligne.employee_name} — ligne ${ligne.id} — ${ligne.net_salary ?? "NULL"} -> ${nouveau} FCFA — ${motif}`
+          ).catch(() => {});
+        }
+
         res.json({
           ligne: majs[0],
           ancien: ligne.net_salary,
           nouveau,
-          message: "Montant corrigé. L'ancien montant, le motif et l'auteur sont conservés.",
+          message: "Montant corrigé. ATTENTION : une correction manuelle du net NE SURVIT PAS "
+            + "à un recalcul de la paie. Pour un salaire réel, corrigez la fiche du salarié ; "
+            + "pour une prime ou des heures supplémentaires, utilisez les éléments de paie — "
+            + "ceux-là sont relus à chaque recalcul.",
+          avertissement: "NON_DURABLE",
         });
       } catch (e) {
         await client.query("ROLLBACK").catch(() => {});
@@ -741,6 +1043,19 @@ module.exports = function createPaieWorkflowRouter(deps) {
 
         const { rows: existants } = await client.query(
           `SELECT * FROM payroll_vouchers WHERE payroll_item_id = $1`, [ligne.id]);
+
+        /* Les éléments sont lus depuis la source métier, par période et par
+           salarié : le bulletin les nomme un par un, avec leur motif. */
+        const { rows: elementsDuBulletin } = await client.query(
+          `SELECT e.type_key, t.label AS type_label, t.kind, t.sign, t.uses_quantity,
+                  e.label, e.quantity, e.unit_amount, e.amount, e.reason,
+                  e.created_by_name, e.created_at
+             FROM payroll_elements e
+             JOIN payroll_element_types t ON t.type_key = e.type_key
+            WHERE e.company_id = $1 AND e.employee_id = $2
+              AND e.period_code = to_char($3::date, 'YYYY-MM') AND e.status = 'ACTIF'
+            ORDER BY t.sort_order, e.id`,
+          [companyId, ligne.employee_id, ligne.mois]);
         if (existants[0]) {
           await client.query("COMMIT");
           return res.json({ bon: existants[0], deja_emis: true });
@@ -765,7 +1080,22 @@ module.exports = function createPaieWorkflowRouter(deps) {
           jours_absence: ligne.absence_days,
           minutes_retard: ligne.late_minutes,
           retenue_absence: ligne.absence_deduction,
+          /* Ce que l'exception de la période a épargné : un bulletin où trois
+             jours manquent sans rien retenir doit le dire, sinon il se lit comme
+             une erreur de calcul. */
+          retenue_absence_annulee: ligne.absence_deduction_annulee,
           ajustements: ligne.adjustments,
+          /* Chaque composante séparément : « ne jamais afficher uniquement un
+             net inexpliqué ». Le détail des primes est joint ligne par ligne. */
+          primes_total: ligne.primes_total,
+          heures_supplementaires_total: ligne.heures_sup_total,
+          heures_supplementaires_heures: ligne.heures_sup_heures,
+          autres_retenues_total: ligne.retenues_autres_total,
+          retenue_avance: ligne.advance_deduction,
+          retenue_avance_hors_paie: ligne.advance_deduction_externe,
+          non_remunere: ligne.non_remunere === true,
+          net_corrige_manuellement: ligne.net_corrige_manuellement === true,
+          elements: elementsDuBulletin,
           net_paye: ligne.net_salary,
           mode: ligne.payment_method,
           reference: ligne.payment_reference,
@@ -929,9 +1259,9 @@ module.exports = function createPaieWorkflowRouter(deps) {
 
         const actif = req.body?.actif !== false;
         const motif = String(req.body?.reason || "").trim();
-        if (actif && motif.length < 10) {
+        if (actif && motif.length < 15) {
           throw P.erreur(
-            "Motif obligatoire (10 caractères minimum) : une exception se relit des mois plus tard.",
+            "Motif obligatoire (15 caractères minimum) : une exception se relit des mois plus tard.",
             "REASON_REQUIRED", 400);
         }
 

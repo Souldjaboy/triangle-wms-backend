@@ -86,13 +86,16 @@ const ligneDe = async (nom) => (await q(
   v("l'échéance de septembre est passée à RETENUE",
     (await q(`SELECT status FROM salary_advance_installments WHERE id=811`))[0]?.status === "RETENUE");
 
-  console.log("\n④ ZERBO — échéance en octobre : rien ne doit être retenu en septembre");
+  console.log("\n④ ZERBO — retenue de septembre déjà enregistrée hors paie : affichée, pas recréée");
   l = await ligneDe("Amary Zerbo");
-  v("avance retenue = 0", Number(l?.advance_deduction) === 0, `reçu ${l?.advance_deduction}`);
-  v("net = salaire moins absences, aucune avance déduite",
-    Number(l?.net_salary) === netAttendu(l) && Number(l?.advance_deduction) === 0,
-    `net=${l?.net_salary} attendu=${netAttendu(l)}`);
-  v("solde intact (25 000)", Number((await q(`SELECT balance FROM salary_advances WHERE id=803`))[0]?.balance) === 25000);
+  v("avance retenue = 25 000 (reprise du journal)", Number(l?.advance_deduction) === 25000, `reçu ${l?.advance_deduction}`);
+  v("identifiée comme enregistrée hors paie", Number(l?.advance_deduction_externe) === 25000, `reçu ${l?.advance_deduction_externe}`);
+  v("net conforme à l'invariant, avance reprise du journal",
+    Number(l?.net_salary) === netAttendu(l) && Number(l?.advance_deduction) === 25000,
+    `net=${l?.net_salary} attendu=${netAttendu(l)} avance=${l?.advance_deduction}`);
+  v("solde inchangé (25 000), aucun remboursement créé",
+    Number((await q(`SELECT balance FROM salary_advances WHERE id=803`))[0]?.balance) === 25000
+    && Number((await q(`SELECT count(*) c FROM salary_advance_repayments WHERE advance_id=803`))[0].c) === 1);
 
   console.log("\n⑤ SANS AVANCE — la ligne reste intacte");
   l = await ligneDe("Sans Avance");

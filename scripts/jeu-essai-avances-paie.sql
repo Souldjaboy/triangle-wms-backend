@@ -81,13 +81,19 @@ INSERT INTO salary_advance_installments(id,company_id,advance_id,rank,period_cod
  (812,1,802,2,'2026-10',15000,0,'A_VENIR'),
  (813,1,802,3,'2026-11',15000,0,'A_VENIR') ON CONFLICT (id) DO NOTHING;
 
--- ── ZERBO : échéance uniquement en octobre, rien à retenir en septembre
+-- ── ZERBO : retenue de 25 000 DÉJÀ enregistrée pour septembre, hors paie —
+--    comme en production. Elle doit être affichée, jamais recréée.
 INSERT INTO salary_advances(id,company_id,employee_id,reference,amount_requested,amount_authorized,
        amount_paid,balance,status,installment_amount,first_period_code)
-VALUES (803,1,803,'AV-2026-AZ',25000,25000,25000,25000,'VERSEE',25000,'2026-10')
+VALUES (803,1,803,'AVA-HIST-2026-AZ',50000,50000,50000,25000,'EN_REMBOURSEMENT',25000,'2026-09')
 ON CONFLICT (id) DO NOTHING;
-INSERT INTO salary_advance_installments(id,company_id,advance_id,rank,period_code,amount_due,amount_taken,status)
-VALUES (821,1,803,1,'2026-10',25000,0,'A_VENIR') ON CONFLICT (id) DO NOTHING;
+INSERT INTO salary_advance_installments(id,company_id,advance_id,rank,period_code,amount_due,amount_taken,status) VALUES
+ (821,1,803,1,'2026-09',25000,25000,'RETENUE'),
+ (822,1,803,2,'2026-10',25000,0,'A_VENIR') ON CONFLICT (id) DO NOTHING;
+INSERT INTO salary_advance_repayments(id,company_id,advance_id,installment_id,payroll_item_id,amount,origin,
+       balance_before,balance_after,performed_by_name)
+VALUES (9021,1,803,821,NULL,25000,'RETENUE_PAIE',50000,25000,'Import historique')
+ON CONFLICT (id) DO NOTHING;
 
 -- ── FAT & MAT : avance avec remboursement orphelin, pour vérifier l'isolation
 INSERT INTO salary_advances(id,company_id,employee_id,reference,amount_requested,amount_authorized,
@@ -116,10 +122,11 @@ INSERT INTO salary_advance_repayments(id,company_id,advance_id,installment_id,pa
  (9011,1,806,861,NULL,40000,'RETENUE_PAIE',200000,160000,'Import historique'),
  (9012,1,806,862,NULL,40000,'RETENUE_PAIE',160000,120000,'Import historique')
 ON CONFLICT (id) DO NOTHING;
--- l'ajustement positif qui explique « 75 000 de base, 100 000 de net »
-INSERT INTO attendance_salary_adjustments_v2(id,company_id,employee_id,work_date,amount,reason,created_by)
-VALUES (9001,1,806,'2026-09-10',25000,'Prime exceptionnelle de rendement — decision direction',900)
-ON CONFLICT (id) DO NOTHING;
+-- PAS d'ajustement de pointage pour Hawa : la Phase A de production n'en a
+-- trouvé aucun. L'écart de 25 000 venait d'une correction manuelle du net, et la
+-- décision de la direction a établi qu'il s'agissait de son VRAI salaire
+-- (100 000), pas d'une prime. Le jeu d'essai reflète donc la production : salaire
+-- configuré à 75 000, à corriger, et aucune prime.
 SELECT setval(pg_get_serial_sequence('attendance_salary_adjustments_v2','id'), 10000, true);
 
 -- présence complète pour tout le monde, pour que le net ne dépende pas des absences

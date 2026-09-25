@@ -36,6 +36,15 @@ const run = async (periode = "2026-09") => (await q(
   const MOTIF = "Régularisation exceptionnelle septembre 2026 — incidents du système de pointage — décision direction";
 
   console.log("\n① ÉTAT DE DÉPART : paie préparée puis soumise par le super admin");
+  /* Le directeur ne perçoit volontairement aucun salaire. Sans cette
+     déclaration sa ligne reste BLOCKED et la soumission refuse — ce qui est le
+     comportement voulu : un salaire oublié doit bloquer la paie. On pose donc la
+     décision métier d'abord, comme en production. */
+  const directeur = (await q(`SELECT id FROM attendance_employees WHERE full_name='Mohamedou Diallo'`))[0]?.id;
+  if (directeur) {
+    await appel("POST", `/paie/salaries/${directeur}/non-remunere`, { token: tS, societe: 1, corps: {
+      reason: "Directeur : ne percoit volontairement aucun salaire. Decision direction." }});
+  }
   let r = await appel("POST", "/paie/periodes/2026-09/preparer", { token: tS, societe: 1, corps: {} });
   v("préparation", r.status === 200 || r.status === 201, `${r.status} ${JSON.stringify(r.data)}`);
   const paie = await run();
@@ -69,7 +78,7 @@ const run = async (periode = "2026-09") => (await q(
   r = await appel("POST", "/paie/periodes/2026-09/exception-absences", { token: tC, societe: 1, corps: { reason: MOTIF } });
   v("un comptable ne peut pas poser l'exception", r.status === 403, `${r.status} ${JSON.stringify(r.data)}`);
   r = await appel("POST", "/paie/periodes/2026-09/exception-absences", { token: tS, societe: 1, corps: { reason: "court" } });
-  v("un motif trop court est refusé", r.status === 400 && r.data?.code === "REASON_REQUIRED", `${r.status}`);
+  v("un motif trop court est refusé (15 caractères exigés)", r.status === 400 && r.data?.code === "REASON_REQUIRED", `${r.status}`);
   r = await appel("POST", "/paie/periodes/2026-09/exception-absences", { token: tS, societe: 1, corps: { reason: MOTIF } });
   v("le super admin pose l'exception", r.status === 200, `${r.status} ${JSON.stringify(r.data)}`);
   const per = (await q(`SELECT * FROM attendance_periods WHERE company_id=1 AND code='2026-09'`))[0];
@@ -110,7 +119,7 @@ const run = async (periode = "2026-09") => (await q(
   l = await ligne("Malamine NDiaye");
   v("Malamine : échéancier cohérent, 15 000 retenus", Number(l?.advance_deduction) === 15000, `${l?.advance_deduction}`);
   l = await ligne("Amary Zerbo");
-  v("Zerbo : rien retenu en septembre (échéance en octobre)", Number(l?.advance_deduction) === 0, `${l?.advance_deduction}`);
+  v("Zerbo : retenue de 25 000 reprise du journal, non recréée", Number(l?.advance_deduction) === 25000, `${l?.advance_deduction}`);
   v("Zerbo : solde intact", Number((await q(`SELECT balance FROM salary_advances WHERE id=803`))[0]?.balance) === 25000);
 
   console.log("\n⑦ LA PÉRIODE SUIVANTE RESTE NORMALE");

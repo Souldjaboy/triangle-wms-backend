@@ -1,5 +1,7 @@
 "use strict";
 
+const ELEMENTS = require("./paie-elements");
+
 function money(value) {
   return Math.round(Number(value || 0) * 100) / 100;
 }
@@ -9,8 +11,40 @@ function calculatePayrollLine(input) {
   const daily = input.daily_rate == null ? null : money(input.daily_rate);
   const absenceDays = Math.max(0, Number(input.absence_days || 0));
   const adjustments = money(input.adjustments);
+
+  /* Les éléments de la période : primes, heures supplémentaires, retenues
+     autorisées. Ils vivent hors de la ligne de paie et sont relus à chaque
+     recalcul — c'est ce qui les fait survivre. */
+  const primes = money(input.primes_total);
+  const heuresSup = money(input.heures_sup_total);
+  const heuresSupHeures = money(input.heures_sup_heures);
+  const retenuesAutres = money(input.retenues_autres_total);
+  const composantes = { primes_total: primes, heures_sup_total: heuresSup,
+                        heures_sup_heures: heuresSupHeures,
+                        retenues_autres_total: retenuesAutres };
+
+  /* NON RÉMUNÉRÉ VOLONTAIREMENT — un directeur qui ne se verse pas de salaire.
+     Sa base est zéro, et c'est un fait, pas une omission : la ligne est payable
+     et ne bloque pas la paie. Ce cas ne se DÉDUIT jamais d'un salaire manquant ;
+     il est posé explicitement sur la fiche du salarié. Les primes, elles,
+     s'appliquent quand même : rien n'interdit d'indemniser quelqu'un qui n'a
+     pas de salaire fixe. */
+  if (input.non_remunere === true) {
+    return {
+      ...input, ...composantes,
+      monthly_salary: monthly ?? 0, daily_rate: daily ?? 0,
+      absence_deduction: 0, absence_deduction_annulee: 0, adjustments,
+      non_remunere: true,
+      net_salary: Math.max(0, money(primes + heuresSup + adjustments - retenuesAutres)),
+      status: "TO_PAY",
+    };
+  }
+
+  /* Salaire non configuré : c'est une ANOMALIE, et elle doit se voir. La ligne
+     reste BLOCKED et la soumission refuse. Traiter ce cas comme « non
+     rémunéré » ferait passer un oubli pour une décision. */
   if (monthly == null || daily == null) {
-    return { ...input, absence_deduction: 0, absence_deduction_annulee: 0,
+    return { ...input, ...composantes, absence_deduction: 0, absence_deduction_annulee: 0,
              adjustments, net_salary: null, status: "BLOCKED" };
   }
   /* Ce qu'une absence aurait retiré. La période peut décider de ne pas le
@@ -24,6 +58,7 @@ function calculatePayrollLine(input) {
   const absenceDeduction = exception ? 0 : retenueTheorique;
   return {
     ...input,
+    ...composantes,
     monthly_salary: monthly,
     daily_rate: daily,
     absence_deduction: absenceDeduction,
@@ -31,7 +66,17 @@ function calculatePayrollLine(input) {
        dire six mois plus tard ce que ce mois-là a représenté. */
     absence_deduction_annulee: exception ? retenueTheorique : 0,
     adjustments,
-    net_salary: Math.max(0, money(monthly - absenceDeduction + adjustments)),
+    /*   salaire de base
+         + primes
+         + heures supplémentaires
+         + ajustements de pointage
+         − retenue d'absence applicable
+         − autres retenues autorisées
+         = NET AVANT AVANCES
+       La retenue d'avance est appliquée ensuite, par la préparation, parce
+       qu'elle est plafonnée par ce net disponible. */
+    net_salary: Math.max(0, money(monthly + primes + heuresSup + adjustments
+                                  - absenceDeduction - retenuesAutres)),
     status: "TO_PAY",
   };
 }
@@ -77,14 +122,15 @@ async function calculerPaiePeriode(client, companyId, periode) {
         ) d
      ),
      employes AS (
-       SELECT e.id, e.employee_number, e.full_name, e.schedule_id
+       SELECT e.id, e.employee_number, e.full_name, e.schedule_id, e.non_remunere
          FROM attendance_employees e
         WHERE e.company_id = $1 AND e.active
           AND e.effective_from <= $3::date
           AND (e.effective_to IS NULL OR e.effective_to >= $2::date)
      ),
      detail AS (
-       SELECT e.id AS employee_id, e.employee_number, e.full_name, j.jour,
+       SELECT e.id AS employee_id, e.employee_number, e.full_name,
+              e.non_remunere, j.jour,
               /* La journée est-elle DUE ? */
               (d.id IS NOT NULL
                AND j.isodow <> 7
@@ -121,7 +167,7 @@ async function calculerPaiePeriode(client, companyId, periode) {
            ON g.company_id = $1 AND g.employee_id = e.id AND g.work_date = j.jour
      ),
      totaux AS (
-       SELECT employee_id, employee_number, full_name,
+       SELECT employee_id, employee_number, full_name, bool_or(non_remunere) AS non_remunere,
               count(*) FILTER (WHERE due)::int AS expected_days,
               count(*) FILTER (WHERE due AND presente)::int AS attended_days,
               count(*) FILTER (WHERE due AND NOT presente)::int AS absence_days,
@@ -129,7 +175,7 @@ async function calculerPaiePeriode(client, companyId, periode) {
          FROM detail
         GROUP BY employee_id, employee_number, full_name
      )
-     SELECT t.employee_id AS id, t.employee_number, t.full_name,
+     SELECT t.employee_id AS id, t.employee_number, t.full_name, t.non_remunere,
             t.expected_days, t.attended_days, t.absence_days, t.late_minutes,
             s.monthly_salary, s.daily_rate,
             COALESCE((SELECT sum(a.amount) FROM attendance_salary_adjustments_v2 a
@@ -150,7 +196,26 @@ async function calculerPaiePeriode(client, companyId, periode) {
      suivante repart au comportement normal sans qu'on ait à défaire quoi que
      ce soit. */
   const exception = periode.absences_non_retenues === true;
-  return rows.map((r) => calculatePayrollLine({ ...r, absences_non_retenues: exception }));
+
+  /* Les éléments de paie de la période, relus à chaque préparation. Une prime
+     saisie avant un recalcul reste donc sur le bulletin après. */
+  const elements = await ELEMENTS.elementsDeLaPeriode(client, {
+    companyId, periodCode: periode.code,
+  });
+  const parSalarie = ELEMENTS.totauxParSalarie(elements);
+
+  return rows.map((r) => {
+    const t = ELEMENTS.totauxDe(parSalarie, r.id);
+    return calculatePayrollLine({
+      ...r,
+      absences_non_retenues: exception,
+      primes_total: t.primes_total,
+      heures_sup_total: t.heures_sup_total,
+      heures_sup_heures: t.heures_sup_heures,
+      retenues_autres_total: t.retenues_autres_total,
+      elements: t.details,
+    });
+  });
 }
 
 function assertPaymentMethod(value) {
