@@ -142,7 +142,73 @@ module.exports = function createStockLocationsRouter(deps) {
           status: Number(r.quantity) > 0 ? "OCCUPIED" : "EMPTY",
         });
       }
-      res.json({ tree: arbre, bins: rows.length });
+      /* ── LES RAYONS QUI N'ONT AUCUN BAC SÉLECTIONNABLE ──
+         Un rayon n'apparaissait que s'il possédait au moins un bac exploitable.
+         Les rayons dont tous les bacs sont des FULLBIN hérités, des plages
+         « BIN1-2 » ou des bins non précisés disparaissaient donc entièrement
+         du sélecteur : l'utilisateur voyait la liste commencer à F et en
+         concluait que A à E avaient été perdus. Ils existent, leur stock
+         existe, et c'est justement parce qu'on ne sait pas DE QUEL BAC ils
+         parlent qu'ils ne peuvent pas être des destinations.
+
+         On les renvoie donc, avec leur motif et le stock concerné, pour que
+         l'écran les montre — désactivés, et expliqués. Ils ne rejoignent pas
+         `tree` : y entrer les rendrait sélectionnables, et un transfert
+         partirait vers une destination que personne ne peut retrouver. */
+      const { rows: ecartes } = await pool.query(
+        `WITH classe AS (
+           SELECT l.warehouse_code,
+                  COALESCE(NULLIF(l.rayon_code,''), l.zone) AS rayon,
+                  l.id,
+                  (${BAC_REEL}) AS retenu,
+                  CASE
+                    WHEN COALESCE(TRIM(l.bin_code),'') = '' THEN 'BIN_ABSENT'
+                    WHEN TRIM(l.bin_code) ~* '${rules.SQL.FULLBIN}' THEN 'FULLBIN'
+                    WHEN TRIM(l.bin_code) ~* '${rules.SQL.RANGE}' THEN 'PLAGE'
+                    WHEN l.bin_code ~* '${rules.SQL.NON_PRECISE}' THEN 'NON_PRECISE'
+                    WHEN l.bin_code ~* '${rules.SQL.WRITE_OFF}'
+                      OR COALESCE(l.warehouse_code,'') ~* '${rules.SQL.WRITE_OFF}'
+                      OR COALESCE(l.emplacement_code,'') ~* '${rules.SQL.WRITE_OFF}' THEN 'REBUT'
+                    ELSE 'AUTRE'
+                  END AS motif
+             FROM locations l
+            WHERE l.company_id = $1 AND ${VIVANT}
+              AND ($2::int IS NULL OR l.warehouse_id = $2)
+         )
+         SELECT c.warehouse_code, c.rayon,
+                count(*) FILTER (WHERE NOT c.retenu)::int AS bacs_ecartes,
+                mode() WITHIN GROUP (ORDER BY c.motif) FILTER (WHERE NOT c.retenu) AS motif,
+                COALESCE(sum(b.quantity) FILTER (WHERE NOT c.retenu), 0)::numeric AS quantite
+           FROM classe c
+           LEFT JOIN stock_location_balances b ON b.location_id = c.id AND b.company_id = $1
+          GROUP BY c.warehouse_code, c.rayon
+         HAVING count(*) FILTER (WHERE c.retenu) = 0
+            AND count(*) FILTER (WHERE NOT c.retenu) > 0
+          ORDER BY c.warehouse_code, c.rayon`,
+        [companyOf(req), imposePourArbre]
+      );
+
+      const MOTIFS = {
+        FULLBIN: "emplacement précis requis : « FULLBIN » dit qu'un bac est plein, pas lequel",
+        PLAGE: "emplacement précis requis : « BIN1-2 » désigne peut-être deux bacs",
+        BIN_ABSENT: "emplacement précis requis : aucun bac n'est indiqué",
+        NON_PRECISE: "emplacement précis requis : le bac n'est pas précisé",
+        REBUT: "mise au rebut : un état du produit, pas une destination",
+        AUTRE: "emplacement précis requis",
+      };
+      const indisponibles = {};
+      for (const r of ecartes) {
+        const w = r.warehouse_code || "—", ro = r.rayon || "—";
+        indisponibles[w] ??= {};
+        indisponibles[w][ro] = {
+          motif: r.motif || "AUTRE",
+          explication: MOTIFS[r.motif] || MOTIFS.AUTRE,
+          bacs: Number(r.bacs_ecartes),
+          quantite: Number(r.quantite),
+        };
+      }
+
+      res.json({ tree: arbre, bins: rows.length, rayonsIndisponibles: indisponibles });
     } catch (e) { fail(res, e, "Erreur chargement des emplacements."); }
   });
 

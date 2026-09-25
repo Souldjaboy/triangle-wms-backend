@@ -107,4 +107,15 @@ SELECT e.company_id, e.id, d::date, (d::date + time '08:00')
  WHERE e.id BETWEEN 801 AND 805 AND extract(isodow FROM d) BETWEEN 1 AND 5
 ON CONFLICT DO NOTHING;
 
+-- Droits : les migrations de peuplement tournent AVANT la création de ces
+-- sociétés de test, donc role_permissions est vide. On accorde explicitement
+-- « entrepot.view » au magasinier pour que le test de périmètre soit réel :
+-- sans droit du tout, le garde RBAC masque le module (404) et l'on ne
+-- testerait plus rien du périmètre lui-même.
+INSERT INTO role_permissions(company_id, role, module_key, action, allowed)
+SELECT c.id, 'magasinier', 'entrepot', a.action, true
+  FROM companies c CROSS JOIN (VALUES ('visible'), ('view')) AS a(action)
+ WHERE c.id IN (1,2)
+ON CONFLICT (company_id, role, module_key, action) DO UPDATE SET allowed = true;
+
 COMMIT;

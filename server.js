@@ -13731,23 +13731,50 @@ async function synchroniserRayonsEntrepot(runner, warehouse, nombreDemande) {
 
 app.get("/warehouses", authenticateToken, requirePermission("entrepot", "view"), async (req, res) => {
   try {
-    const companyId = getEffectiveCompanyId(req, req.user.company_id);
+    /* L'ENTREPRISE ACTIVE, PAS « TOUTES LES ENTREPRISES ».
+       La règle était inversée : le filtre par société ne s'appliquait qu'aux
+       non-super-admins. Un super administrateur voyait donc les entrepôts de
+       Triangle ET de FAT & MAT mélangés, sans pouvoir distinguer les uns des
+       autres — et le sélecteur d'une réception Triangle proposait des entrepôts
+       de l'autre société. La vue globale reste possible, mais elle se demande
+       explicitement, et elle reste réservée à l'administration globale. */
     const isSuperAdmin = req.user.is_super_admin === true;
+    const veutToutesLesSocietes = String(req.query.scope || "") === "all";
 
-    let query = `
-      SELECT * FROM warehouses
-    `;
-
-    let values = [];
-
-    if (!isSuperAdmin) {
-      query += ` WHERE company_id = $1 `;
-      values.push(companyId);
+    if (veutToutesLesSocietes && !isSuperAdmin) {
+      return res.status(403).json({
+        error: "La vue multi-entreprises est réservée à l'administration globale.",
+        code: "SCOPE_ALL_FORBIDDEN",
+      });
     }
 
-    query += ` ORDER BY id DESC`;
+    const companyId = Number(getEffectiveCompanyId(req, req.user.company_id) || 0);
+    const values = [];
+    let filtre = "";
 
-    const result = await pool.query(query, values);
+    if (veutToutesLesSocietes) {
+      filtre = "";
+    } else {
+      if (!companyId) {
+        return res.status(409).json({
+          error: "Aucune entreprise active. Sélectionnez l'entreprise à consulter.",
+          code: "NO_ACTIVE_COMPANY",
+        });
+      }
+      values.push(companyId);
+      filtre = "WHERE company_id = $1";
+    }
+
+    /* `actifs_seulement=1` sert les sélecteurs de destination : un entrepôt
+       archivé ne doit pas pouvoir recevoir une réception. Les écrans
+       d'administration, eux, ont besoin de voir aussi les inactifs. */
+    if (String(req.query.actifs_seulement || "") === "1") {
+      filtre += `${filtre ? " AND" : "WHERE"} LOWER(BTRIM(COALESCE(status,'active'))) IN ('active','actif')`;
+    }
+
+    const result = await pool.query(
+      `SELECT * FROM warehouses ${filtre} ORDER BY code, id DESC`, values
+    );
 
     res.json(result.rows);
   } catch (error) {
