@@ -159,3 +159,35 @@ SELECT c.id, 'magasinier', 'entrepot', a.action, true
 ON CONFLICT (company_id, role, module_key, action) DO UPDATE SET allowed = true;
 
 COMMIT;
+
+-- ── Reproduction des quatre écarts constatés en production ──────────────────
+-- Mohamedou Diallo : aucune ligne de salaire du tout.
+-- Mohamed Sangaré et Oumar Sangaré : 100 000 configurés.
+-- (Les corrections manuelles du net sont posées par le TEST, via la vraie
+--  route /paie/lignes/:id/ajuster — jamais par SQL : c'est ce chemin qu'on veut
+--  prouver.)
+BEGIN;
+INSERT INTO attendance_employees(id,company_id,employee_number,full_name,site_id,schedule_id,active,effective_from) VALUES
+ (807,1,6,'Mohamedou Diallo',1,1,true,'2026-01-01'),
+ (808,1,7,'Mohamed Sangare',1,1,true,'2026-01-01'),
+ (809,1,8,'Oumar Sangare',1,1,true,'2026-01-01')
+ON CONFLICT (id) DO NOTHING;
+-- Mohamedou : PAS de salaire. Les deux Sangaré : 100 000.
+INSERT INTO attendance_salary_settings_v2(company_id,employee_id,monthly_salary,daily_rate,basis_days,effective_from) VALUES
+ (1,808,100000,3333,30,'2026-01-01'),
+ (1,809,100000,3333,30,'2026-01-01')
+ON CONFLICT DO NOTHING;
+-- présence complète pour ces trois-là (aucune absence, comme en production)
+INSERT INTO attendance_day_records_v2(company_id,employee_id,work_date,check_in)
+SELECT 1, e.id, d::date, (d::date + time '08:00')
+  FROM attendance_employees e,
+       generate_series('2026-08-25'::date, '2026-09-24'::date, interval '1 day') d
+ WHERE e.id IN (807,808,809) AND extract(isodow FROM d) BETWEEN 1 AND 5
+ON CONFLICT DO NOTHING;
+-- droit d'ajuster, pour que la vraie route soit atteignable
+INSERT INTO role_permissions(company_id, role, module_key, action, allowed)
+SELECT c.id, r.role, 'paie', 'adjust', true
+  FROM companies c CROSS JOIN (VALUES ('super_admin'),('comptable')) AS r(role)
+ WHERE c.id IN (1,2)
+ON CONFLICT (company_id, role, module_key, action) DO UPDATE SET allowed = true;
+COMMIT;
