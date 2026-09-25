@@ -94,9 +94,16 @@ const run = async (periode = "2026-09") => (await q(
   v("AUCUNE retenue d'absence sur toute la paie",
     toutes.every((l) => Number(l.absence_deduction) === 0),
     toutes.map((l)=>`${l.employee_name}:${l.absence_deduction}`).join(" "));
+  /* Depuis la migration 101, `absence_days` porte l'OFFICIEL — zéro sous
+     exception — et le compte réel vit dans `absence_days_brut`. Les absences
+     restent donc comptées et visibles : elles ont changé de colonne, pas
+     disparu. C'est le brut qu'on interroge ici. */
   v("les absences restent COMPTÉES et visibles",
-    toutes.some((l) => Number(l.absence_days) > 0),
-    toutes.map((l)=>`${l.employee_name}:${l.absence_days}j`).join(" "));
+    toutes.some((l) => Number(l.absence_days_brut) > 0),
+    toutes.map((l)=>`${l.employee_name}:${l.absence_days_brut}j brut / ${l.absence_days}j officiel`).join(" "));
+  v("et l'officiel est bien à zéro pour tous",
+    toutes.every((l) => Number(l.absence_days_officiel) === 0),
+    toutes.map((l)=>`${l.employee_name}:${l.absence_days_officiel}`).join(" "));
   v("ce que l'exception a coûté est chiffré",
     toutes.some((l) => Number(l.absence_deduction_annulee) > 0),
     toutes.map((l)=>`${l.employee_name}:${l.absence_deduction_annulee}`).join(" "));

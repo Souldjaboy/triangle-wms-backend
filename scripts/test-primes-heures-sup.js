@@ -38,7 +38,12 @@ const empId = async (nom) => (await q(`SELECT id FROM attendance_employees WHERE
   let r = await appel("GET", "/paie/elements/types", { token: tS, societe: 1 });
   v("réponse 200", r.status === 200, `${r.status}`);
   const types = (r.data?.types || []).map((t) => t.type_key);
-  v("les 8 primes et la retenue sont servies", types.length === 9, types.join(", "));
+  /* Onze types depuis la migration 100 : les deux compensations de travail un
+     jour chômé viennent s'ajouter au catalogue, servies de la base comme les
+     autres — ajouter un type reste une ligne de données. */
+  v("le catalogue est servi de la base", types.length === 11, types.join(", "));
+  v("les compensations de jour chômé y figurent",
+    types.includes("TRAVAIL_JOUR_CHOME") && types.includes("MAJORATION_JOUR_CHOME"), types.join(", "));
   v("heures supplémentaires utilise une quantité",
     r.data.types.find((t) => t.type_key === "HEURES_SUP")?.uses_quantity === true);
   v("« autre prime » exige une description",

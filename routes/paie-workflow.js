@@ -356,15 +356,32 @@ module.exports = function createPaieWorkflowRouter(deps) {
                 daily_rate, expected_days, attended_days, absence_days, late_minutes,
                 absence_deduction, absence_deduction_annulee, adjustments,
                 primes_total, heures_sup_total, heures_sup_heures, retenues_autres_total,
-                non_remunere, net_salary, status)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+                non_remunere, net_salary, status,
+                /* BRUT et OFFICIEL côte à côte : le bulletin et le rapport
+                   lisent l'officiel, l'audit lit le brut, et le brut n'est
+                   jamais remis à zéro. */
+                absence_days_brut, absence_days_officiel, absences_neutralisees,
+                late_minutes_brut, late_minutes_officiel, retards_neutralises,
+                /* Les journées du calendrier administratif, chacune dans sa
+                   catégorie — une retenue de jour chômé n'est pas une absence. */
+                jours_feries, jours_chomes_payes, jours_chomes_non_payes,
+                retenue_jour_chome, travail_jour_chome_jours, repos_compensateur_jours)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+                     $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32)
              RETURNING id, net_salary`,
             [companyId, paie.id, l.id, l.full_name, l.monthly_salary, l.daily_rate,
              l.expected_days, l.attended_days, l.absence_days, l.late_minutes,
              l.absence_deduction, l.absence_deduction_annulee || 0, l.adjustments,
              l.primes_total || 0, l.heures_sup_total || 0, l.heures_sup_heures || 0,
              l.retenues_autres_total || 0, l.non_remunere === true,
-             l.net_salary, l.status]
+             l.net_salary, l.status,
+             l.absence_days_brut ?? l.absence_days, l.absence_days_officiel ?? l.absence_days,
+             l.absences_neutralisees || 0,
+             l.late_minutes_brut ?? l.late_minutes, l.late_minutes_officiel ?? l.late_minutes,
+             l.retards_neutralises || 0,
+             l.jours_feries || 0, l.jours_chomes_payes || 0, l.jours_chomes_non_payes || 0,
+             l.retenue_jour_chome || 0, l.travail_jour_chome_jours || 0,
+             l.repos_compensateur_jours || 0]
           );
           const ligne = creees[0];
 
@@ -421,6 +438,10 @@ module.exports = function createPaieWorkflowRouter(deps) {
                             + COALESCE(sum(heures_sup_total), 0) AS brut,
                           COALESCE(sum(absence_deduction), 0)
                             + COALESCE(sum(advance_deduction), 0)
+                            /* La retenue d'un jour chômé non payé compte dans
+                               les retenues du mois, à sa place — jamais fondue
+                               dans les absences. */
+                            + COALESCE(sum(retenue_jour_chome), 0)
                             + COALESCE(sum(retenues_autres_total), 0) AS retenues,
                           COALESCE(sum(adjustments), 0) AS ajustements,
                           COALESCE(sum(net_salary), 0) AS net
@@ -1287,6 +1308,23 @@ module.exports = function createPaieWorkflowRouter(deps) {
         );
         if (!rows[0]) throw P.erreur("Période introuvable dans cette entreprise.", "PERIOD_NOT_FOUND", 404);
 
+        /* Les retards SUIVENT SI ON LE DEMANDE, jamais d'office. Neutraliser
+           des absences et neutraliser des retards sont deux décisions : un mois
+           peut très bien ne pas retenir les absences et garder ses retards. Le
+           faire en silence serait décider à la place de la Direction. */
+        if (req.body?.retards_aussi === true) {
+          await client.query(
+            `UPDATE attendance_periods
+                SET retards_non_retenus = $1,
+                    retards_non_retenus_motif = CASE WHEN $1 THEN $2 ELSE '' END,
+                    retards_non_retenus_par  = CASE WHEN $1 THEN $3::int ELSE NULL END,
+                    retards_non_retenus_le   = CASE WHEN $1 THEN now() ELSE NULL END,
+                    updated_at = now()
+              WHERE company_id = $4 AND code = $5`,
+            [actif, motif, req.user?.id || null, companyId, String(req.params.code)]
+          );
+        }
+
         await client.query("COMMIT");
         if (typeof logActivity === "function") {
           await logActivity(nomDe(req), req.user?.role,
@@ -1328,6 +1366,74 @@ module.exports = function createPaieWorkflowRouter(deps) {
       } catch (e) {
         await client.query("ROLLBACK").catch(() => {});
         fail(res, e, "Lecture du bon impossible.");
+      } finally { client.release(); }
+    }
+  );
+
+  /* ══════════════════════════════════════════════════════════════════════
+     LES RETARDS D'UNE PÉRIODE NE SONT PLUS OPPOSABLES
+
+     Une décision DISTINCTE de l'exception d'absences, et volontairement : le
+     pointage d'un mois peut être défaillant sur les présences sans que les
+     heures d'arrivée enregistrées soient fausses, et l'inverse est vrai aussi.
+     Les deux ont donc leur propre drapeau, leur propre motif et leur propre
+     auteur.
+
+     Ce qui n'est PAS fait : effacer les minutes de retard. Elles restent
+     enregistrées, et la ligne de paie porte les deux valeurs — le brut, pour
+     l'audit, et l'officiel, qui est ce que l'entreprise retient.
+     ══════════════════════════════════════════════════════════════════════ */
+  router.post(
+    "/paie/periodes/:code/exception-retards",
+    authenticateToken,
+    requirePermission("paie", "prepare"),
+    async (req, res) => {
+      const companyId = requireCompany(req, res); if (!companyId) return;
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const { rows: compte } = await client.query(
+          `SELECT is_super_admin FROM users WHERE id = $1`, [req.user?.id || 0]);
+        if (compte[0]?.is_super_admin !== true) {
+          throw P.erreur(
+            "Rendre les retards d'une période non opposables est réservé au super administrateur.",
+            "EXCEPTION_FORBIDDEN", 403);
+        }
+        const actif = req.body?.actif !== false;
+        const motif = String(req.body?.reason || "").trim();
+        if (actif && motif.length < 15) {
+          throw P.erreur(
+            "Motif obligatoire (15 caractères minimum) : une exception se relit des mois plus tard.",
+            "REASON_REQUIRED", 400);
+        }
+        const { rows } = await client.query(
+          `UPDATE attendance_periods
+              SET retards_non_retenus = $1,
+                  retards_non_retenus_motif = CASE WHEN $1 THEN $2 ELSE '' END,
+                  retards_non_retenus_par  = CASE WHEN $1 THEN $3::int ELSE NULL END,
+                  retards_non_retenus_le   = CASE WHEN $1 THEN now() ELSE NULL END,
+                  updated_at = now()
+            WHERE company_id = $4 AND code = $5
+            RETURNING *`,
+          [actif, motif, req.user?.id || null, companyId, String(req.params.code)]
+        );
+        if (!rows[0]) throw P.erreur("Période introuvable dans cette entreprise.", "PERIOD_NOT_FOUND", 404);
+        await client.query("COMMIT");
+        if (typeof logActivity === "function") {
+          await logActivity(nomDe(req), req.user?.role,
+            actif ? "Retards rendus non opposables" : "Retards à nouveau opposables", "Paie",
+            `Période ${req.params.code} — entreprise ${companyId}` + (motif ? ` — ${motif}` : "")
+          ).catch(() => {});
+        }
+        res.json({
+          periode: rows[0],
+          message: actif
+            ? `Les retards de la période ${req.params.code} ne sont plus opposables. Les minutes enregistrées restent lisibles pour l'audit.`
+            : `Les retards de la période ${req.params.code} sont à nouveau opposables.`,
+        });
+      } catch (e) {
+        await client.query("ROLLBACK").catch(() => {});
+        fail(res, e, "Erreur exception de retards.");
       } finally { client.release(); }
     }
   );

@@ -19470,6 +19470,19 @@ app.use(
   })
 );
 
+/* Le calendrier administratif : jours fériés, jours chômés, journées
+   exceptionnelles. Le moteur de paie LIT ce calendrier avant de décider ce
+   qu'est une absence — aucune interprétation juridique n'est écrite dans le
+   code : une journée chômée peut être payée ou non, exiger un pointage ou non,
+   et ne concerner qu'un site. C'est la décision enregistrée qui fait la règle. */
+const createPointageCalendrierRouter = require("./routes/pointage-calendrier");
+app.use(
+  "/",
+  createPointageCalendrierRouter({
+    pool, authenticateToken, getEffectiveCompanyId, requirePermission, logActivity,
+  })
+);
+
 /* Rapports de pointage. Ils lisent la valeur EFFECTIVE — une journée
    régularisée, une absence marquée par-dessus — et disent d'où vient chaque
    chiffre, pour qu'un total contesté puisse être remonté jusqu'à son origine. */

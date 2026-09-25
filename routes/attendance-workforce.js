@@ -58,7 +58,8 @@ module.exports = function createAttendanceWorkforceRouter(deps) {
                 (timezone(COALESCE((SELECT timezone FROM cfg),'Africa/Bamako'),
                   (SELECT official_start_at FROM cfg)))::date AS official_day
        ), employees AS (
-         SELECT e.id,e.employee_number,e.full_name,e.schedule_id
+         SELECT e.id,e.employee_number,e.full_name,e.schedule_id,
+                e.site_id,e.service,e.categorie
            FROM attendance_employees e,bounds b
           WHERE e.company_id=$1 AND e.active=true
             AND e.effective_from <= b.last_day
@@ -69,6 +70,22 @@ module.exports = function createAttendanceWorkforceRouter(deps) {
            CROSS JOIN LATERAL generate_series(GREATEST(b.first_day,b.official_day),b.last_day,interval '1 day') g(day)
            JOIN attendance_schedule_days d ON d.schedule_id=e.schedule_id
              AND d.iso_weekday=extract(isodow FROM g.day) AND d.is_working_day=true
+          /* Une journée que le calendrier administratif a déclarée chômée sans
+             exiger de pointage n'est pas attendue — donc son absence de pointage
+             n'est pas une absence. Sans ce filtre, cet aperçu annonçait des
+             absences que la paie de la période ne retenait pas : deux chiffres
+             contradictoires sur le même mois, dans le même écran. */
+          WHERE NOT EXISTS (
+            SELECT 1 FROM attendance_special_days s
+             WHERE s.company_id=$1 AND s.status='ACTIF' AND s.day_date=g.day::date
+               AND s.impact_absence='AUCUNE'
+               AND (s.portee='ENTREPRISE' OR EXISTS (
+                     SELECT 1 FROM attendance_special_day_targets c
+                      WHERE c.special_day_id=s.id
+                        AND (c.employee_id=e.id OR c.site_id=e.site_id
+                             OR NULLIF(BTRIM(c.service),'')=NULLIF(BTRIM(e.service),'')
+                             OR NULLIF(BTRIM(c.categorie),'')=NULLIF(BTRIM(e.categorie),''))))
+          )
        ), totals AS (
          SELECT e.id,e.employee_number,e.full_name,
                 count(x.work_date)::int AS expected_days,

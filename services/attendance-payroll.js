@@ -1,6 +1,7 @@
 "use strict";
 
 const ELEMENTS = require("./paie-elements");
+const JS = require("./jours-speciaux");
 
 function money(value) {
   return Math.round(Number(value || 0) * 100) / 100;
@@ -9,8 +10,45 @@ function money(value) {
 function calculatePayrollLine(input) {
   const monthly = input.monthly_salary == null ? null : money(input.monthly_salary);
   const daily = input.daily_rate == null ? null : money(input.daily_rate);
-  const absenceDays = Math.max(0, Number(input.absence_days || 0));
+  /* BRUT et OFFICIEL. Le brut est ce que les pointages disent ; l'officiel est
+     ce que l'entreprise retient après décision administrative. La paie se
+     calcule sur l'officiel, l'audit se lit sur le brut, et le brut n'est jamais
+     remis à zéro. */
+  const absenceBrut = Math.max(0, Number(
+    input.absence_days_brut != null ? input.absence_days_brut : input.absence_days || 0));
+  /* Ce qui resterait retenu si la période ne posait AUCUNE exception : les
+     journées déjà neutralisées par le calendrier administratif en sont sorties,
+     celles que l'exception de période couvre y sont encore. C'est cette valeur
+     qui chiffre ce que l'exception a coûté. */
+  const absenceHorsException = Math.max(0, Number(
+    input.absence_days_hors_exception != null ? input.absence_days_hors_exception : absenceBrut));
   const adjustments = money(input.adjustments);
+
+  /* JOUR CHÔMÉ NON PAYÉ — une retenue, mais PAS une absence. Elle a sa propre
+     colonne et sa propre ligne sur le bulletin : présenter ces francs comme une
+     absence accuserait le salarié d'un manquement là où il n'y a qu'une journée
+     que l'entreprise ne paie pas. */
+  const retenueJourChome = money(input.retenue_jour_chome);
+  /* LES RETARDS SUIVENT LA MÊME SÉPARATION, et se décident SÉPARÉMENT. Une
+     période peut neutraliser ses absences et garder ses retards : ce sont deux
+     décisions, chacune avec son motif et son auteur. Le brut reste lisible. */
+  const lateBrut = Math.max(0, Number(
+    input.late_minutes_brut != null ? input.late_minutes_brut : input.late_minutes || 0));
+  const lateOfficiel = input.retards_non_retenus === true ? 0 : lateBrut;
+  const retards = {
+    late_minutes: lateOfficiel,
+    late_minutes_brut: lateBrut,
+    late_minutes_officiel: lateOfficiel,
+    retards_neutralises: lateBrut - lateOfficiel,
+  };
+  const joursChomes = {
+    jours_feries: Number(input.jours_feries || 0),
+    jours_chomes_payes: Number(input.jours_chomes_payes || 0),
+    jours_chomes_non_payes: Number(input.jours_chomes_non_payes || 0),
+    travail_jour_chome_jours: Number(input.travail_jour_chome_jours || 0),
+    repos_compensateur_jours: Number(input.repos_compensateur_jours || 0),
+    retenue_jour_chome: retenueJourChome,
+  };
 
   /* Les éléments de la période : primes, heures supplémentaires, retenues
      autorisées. Ils vivent hors de la ligne de paie et sont relus à chaque
@@ -31,9 +69,19 @@ function calculatePayrollLine(input) {
      pas de salaire fixe. */
   if (input.non_remunere === true) {
     return {
-      ...input, ...composantes,
+      ...input, ...composantes, ...joursChomes, ...retards,
       monthly_salary: monthly ?? 0, daily_rate: daily ?? 0,
       absence_deduction: 0, absence_deduction_annulee: 0, adjustments,
+      /* Rien à retenir sur un salaire qui n'existe pas : une journée chômée non
+         payée ne peut pas coûter à qui ne perçoit rien. */
+      retenue_jour_chome: 0,
+      /* Les trois chemins de retour posent TOUS les trois valeurs. La colonne
+         `absence_days` est NOT NULL : l'oublier sur un seul chemin — celui du
+         directeur non rémunéré, par exemple — fait échouer toute la préparation
+         avec une erreur qui ne nomme pas le cas. */
+      absence_days: 0,
+      absence_days_brut: absenceBrut, absence_days_officiel: 0,
+      absences_neutralisees: absenceBrut,
       non_remunere: true,
       net_salary: Math.max(0, money(primes + heuresSup + adjustments - retenuesAutres)),
       status: "TO_PAY",
@@ -44,7 +92,11 @@ function calculatePayrollLine(input) {
      reste BLOCKED et la soumission refuse. Traiter ce cas comme « non
      rémunéré » ferait passer un oubli pour une décision. */
   if (monthly == null || daily == null) {
-    return { ...input, ...composantes, absence_deduction: 0, absence_deduction_annulee: 0,
+    return { ...input, ...composantes, ...joursChomes, ...retards,
+             absence_deduction: 0, absence_deduction_annulee: 0,
+             absence_days: absenceBrut,
+             absence_days_brut: absenceBrut, absence_days_officiel: absenceBrut,
+             absences_neutralisees: 0,
              adjustments, net_salary: null, status: "BLOCKED" };
   }
   /* Ce qu'une absence aurait retiré. La période peut décider de ne pas le
@@ -53,14 +105,24 @@ function calculatePayrollLine(input) {
      change, c'est qu'ils ne coûtent rien. Affirmer à la place que la personne
      était présente serait écrire dans l'historique un fait que personne n'a
      constaté. */
-  const retenueTheorique = money(absenceDays * daily);
+  const retenueTheorique = money(absenceHorsException * daily);
   const exception = input.absences_non_retenues === true;
   const absenceDeduction = exception ? 0 : retenueTheorique;
+  /* Le nombre d'absences OFFICIEL : zéro quand la période pose l'exception.
+     Ce n'est pas une présence affirmée — les journées manquantes restent
+     comptées dans le brut, et visibles. */
+  const absenceOfficiel = exception ? 0 : absenceHorsException;
   return {
     ...input,
     ...composantes,
+    ...joursChomes,
+    ...retards,
     monthly_salary: monthly,
     daily_rate: daily,
+    absence_days: absenceOfficiel,
+    absence_days_brut: absenceBrut,
+    absence_days_officiel: absenceOfficiel,
+    absences_neutralisees: Math.max(0, absenceBrut - absenceOfficiel),
     absence_deduction: absenceDeduction,
     /* Ce que l'exception a coûté, chiffré. Sans cela, personne ne pourrait
        dire six mois plus tard ce que ce mois-là a représenté. */
@@ -75,8 +137,16 @@ function calculatePayrollLine(input) {
          = NET AVANT AVANCES
        La retenue d'avance est appliquée ensuite, par la préparation, parce
        qu'elle est plafonnée par ce net disponible. */
+    /*   salaire de base
+         + primes                     (dont compensation d'un jour chômé travaillé)
+         + heures supplémentaires
+         + ajustements de pointage
+         − retenue d'absence applicable
+         − retenue de jour chômé non payé   ← distincte de l'absence
+         − autres retenues autorisées
+         = NET AVANT AVANCES                                                */
     net_salary: Math.max(0, money(monthly + primes + heuresSup + adjustments
-                                  - absenceDeduction - retenuesAutres)),
+                                  - absenceDeduction - retenueJourChome - retenuesAutres)),
     status: "TO_PAY",
   };
 }
@@ -104,11 +174,44 @@ function calculatePayrollLine(input) {
  * compte ni comme attendu ni comme absence.
  */
 async function calculerPaiePeriode(client, companyId, periode) {
+  /* Le calendrier administratif d'abord : le moteur doit savoir ce qui est
+     chômé AVANT de décider ce qui est une absence. Dans l'autre ordre, il
+     faudrait défaire des absences déjà comptées — et chaque endroit qui les
+     lit devrait refaire la soustraction. */
+  const resolution = await JS.resolutionParSalarie(client, {
+    companyId, debut: periode.date_debut, fin: periode.date_fin,
+  });
+  const pourLeMoteur = JS.pourLeMoteur(resolution);
+
+  /* Les compensations de ceux qui ont travaillé un jour chômé deviennent des
+     éléments de paie AVANT la lecture des éléments : elles sont ensuite lues
+     comme n'importe quelle prime, et survivent donc au recalcul par le même
+     mécanisme. L'index unique d'origine interdit le doublon. */
+  await JS.genererCompensations(client, { companyId, periode, resolution });
+
   const { rows } = await client.query(
     `WITH cfg AS (
        SELECT COALESCE(saturday_mode, 'NORMAL') AS samedi,
               COALESCE(timezone, 'Africa/Bamako') AS tz
          FROM attendance_company_configuration WHERE company_id = $1
+     ),
+     /* LE CALENDRIER ADMINISTRATIF, déjà résolu par société, par salarié et par
+        date. La portée — entreprise, site, entrepôt, service, catégorie,
+        sélection nominative — est développée hors SQL : six sortes de portées
+        dans cette requête l'auraient rendue illisible, et c'est cette requête
+        qui décide de ce qu'on retient sur un salaire. */
+     speciaux AS (
+       SELECT (x->>'employee_id')::int  AS employee_id,
+              (x->>'jour')::date        AS jour,
+              (x->>'special_day_id')::bigint AS special_day_id,
+              (x->>'est_chome')::boolean     AS est_chome,
+              (x->>'est_paye')::boolean      AS est_paye,
+              (x->>'pointage_requis')::boolean AS pointage_requis,
+              x->>'impact_absence'  AS impact_absence,
+              x->>'impact_salaire'  AS impact_salaire,
+              x->>'type_key'        AS sp_type,
+              x->>'traitement'      AS traitement
+         FROM jsonb_array_elements(COALESCE($4::jsonb, '[]'::jsonb)) x
      ),
      jours AS (
        SELECT d::date AS jour, extract(isodow FROM d)::int AS isodow
@@ -131,11 +234,20 @@ async function calculerPaiePeriode(client, companyId, periode) {
      detail AS (
        SELECT e.id AS employee_id, e.employee_number, e.full_name,
               e.non_remunere, j.jour,
-              /* La journée est-elle DUE ? */
+              /* PROGRAMMÉE : l'horaire du salarié prévoyait de travailler ce
+                 jour-là. C'est la vue de la machine, celle du brut. */
               (d.id IS NOT NULL
                AND j.isodow <> 7
                AND ((SELECT samedi FROM cfg) = 'NORMAL' OR j.isodow <> 6)
-               AND h.id IS NULL) AS due,
+               AND h.id IS NULL) AS programme,
+              /* NEUTRALISÉE : une journée du calendrier administratif dont
+                 l'absence de pointage ne vaut pas absence. C'est le cœur du
+                 « pas de pointage + jour chômé payé ≠ absence » : la journée
+                 sort des jours attendus AVANT qu'on compte les absences, et non
+                 après, par une soustraction qu'il faudrait refaire partout. */
+              (sp.special_day_id IS NOT NULL AND sp.impact_absence = 'AUCUNE') AS neutralisee,
+              sp.special_day_id, sp.est_chome, sp.est_paye, sp.pointage_requis,
+              sp.impact_salaire, sp.sp_type, sp.traitement,
               /* La personne était-elle là, au sens de la valeur retenue ? */
               CASE
                 WHEN NULLIF(g.overridden_status, '') IS NOT NULL
@@ -165,18 +277,48 @@ async function calculerPaiePeriode(client, companyId, periode) {
            ON r.company_id = $1 AND r.employee_id = e.id AND r.work_date = j.jour
          LEFT JOIN attendance_regularizations g
            ON g.company_id = $1 AND g.employee_id = e.id AND g.work_date = j.jour
+         LEFT JOIN speciaux sp
+           ON sp.employee_id = e.id AND sp.jour = j.jour
      ),
      totaux AS (
        SELECT employee_id, employee_number, full_name, bool_or(non_remunere) AS non_remunere,
-              count(*) FILTER (WHERE due)::int AS expected_days,
-              count(*) FILTER (WHERE due AND presente)::int AS attended_days,
-              count(*) FILTER (WHERE due AND NOT presente)::int AS absence_days,
-              COALESCE(sum(retard) FILTER (WHERE presente), 0)::int AS late_minutes
+              /* Attendus : les journées programmées que le calendrier n'a pas
+                 neutralisées. Une journée chômée ne gonfle donc ni les jours
+                 attendus ni les absences. */
+              count(*) FILTER (WHERE programme AND NOT neutralisee)::int AS expected_days,
+              count(*) FILTER (WHERE programme AND NOT neutralisee AND presente)::int AS attended_days,
+              /* BRUT : ce que les pointages disent, calendrier et exception de
+                 période mis de côté. Jamais remis à zéro. */
+              count(*) FILTER (WHERE programme AND NOT presente)::int AS absence_days_brut,
+              /* HORS EXCEPTION : ce qui resterait retenu sans l'exception de la
+                 période — le calendrier administratif ayant déjà joué. */
+              count(*) FILTER (WHERE programme AND NOT presente AND NOT neutralisee)::int
+                AS absence_days_hors_exception,
+              COALESCE(sum(retard) FILTER (WHERE presente), 0)::int AS late_minutes_brut,
+              /* LES CATÉGORIES DE JOURNÉES, chacune comptée une seule fois.
+                 Un férié n'est pas recompté en « jour chômé payé » : ce sont
+                 deux lignes du résumé, pas deux fois la même journée. */
+              count(*) FILTER (WHERE programme AND NOT presente
+                               AND sp_type = 'JOUR_FERIE')::int AS jours_feries,
+              count(*) FILTER (WHERE programme AND NOT presente AND est_chome AND est_paye
+                               AND sp_type <> 'JOUR_FERIE')::int AS jours_chomes_payes,
+              count(*) FILTER (WHERE programme AND NOT presente AND est_chome
+                               AND NOT est_paye)::int AS jours_chomes_non_payes,
+              /* Celui qui a réellement travaillé un jour chômé : son pointage
+                 est conservé tel quel, et la journée est comptée à part — pas
+                 dans les jours travaillés ordinaires. */
+              count(*) FILTER (WHERE est_chome AND presente)::int AS travail_jour_chome_jours,
+              count(*) FILTER (WHERE est_chome AND presente
+                               AND traitement = 'REPOS_COMPENSATEUR')::int AS repos_compensateur_jours
          FROM detail
         GROUP BY employee_id, employee_number, full_name
      )
      SELECT t.employee_id AS id, t.employee_number, t.full_name, t.non_remunere,
-            t.expected_days, t.attended_days, t.absence_days, t.late_minutes,
+            t.expected_days, t.attended_days,
+            t.absence_days_brut, t.absence_days_hors_exception,
+            t.late_minutes_brut,
+            t.jours_feries, t.jours_chomes_payes, t.jours_chomes_non_payes,
+            t.travail_jour_chome_jours, t.repos_compensateur_jours,
             s.monthly_salary, s.daily_rate,
             COALESCE((SELECT sum(a.amount) FROM attendance_salary_adjustments_v2 a
                        WHERE a.company_id = $1 AND a.employee_id = t.employee_id
@@ -190,7 +332,7 @@ async function calculerPaiePeriode(client, companyId, periode) {
           ORDER BY v.effective_from DESC LIMIT 1
        ) s ON true
       ORDER BY t.employee_number`,
-    [companyId, periode.date_debut, periode.date_fin]
+    [companyId, periode.date_debut, periode.date_fin, JSON.stringify(pourLeMoteur)]
   );
   /* L'exception appartient à la PÉRIODE, pas à l'entreprise : la période
      suivante repart au comportement normal sans qu'on ait à défaire quoi que
@@ -206,9 +348,15 @@ async function calculerPaiePeriode(client, companyId, periode) {
 
   return rows.map((r) => {
     const t = ELEMENTS.totauxDe(parSalarie, r.id);
+    /* Une journée chômée NON PAYÉE se retient, mais ce n'est pas une absence :
+       la retenue est calculée ici, sur le taux journalier, et portée par sa
+       propre colonne jusqu'au bulletin. */
+    const retenueJourChome = Number(r.jours_chomes_non_payes || 0) * Number(r.daily_rate || 0);
     return calculatePayrollLine({
       ...r,
+      retenue_jour_chome: retenueJourChome,
       absences_non_retenues: exception,
+      retards_non_retenus: periode.retards_non_retenus === true,
       primes_total: t.primes_total,
       heures_sup_total: t.heures_sup_total,
       heures_sup_heures: t.heures_sup_heures,
