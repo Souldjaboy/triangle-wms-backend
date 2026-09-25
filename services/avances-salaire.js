@@ -164,6 +164,50 @@ async function rembourser(client, {
  * rendre un salaire négatif. Ce qui n'a pas pu être retenu reste dû, et sera
  * repris à la période suivante.
  */
+/**
+ * LES RETENUES DE CETTE PÉRIODE QUI N'APPARTIENNENT À AUCUNE LIGNE DE PAIE.
+ *
+ * Un remboursement de type RETENUE_PAIE devrait toujours désigner la ligne de
+ * paie qui l'a produit. Certains ne désignent rien : les avances historiques
+ * reprises par script n'avaient pas de ligne de paie à pointer au moment de
+ * l'import, et leur `payroll_item_id` est resté NULL.
+ *
+ * Ces retenues existent, le solde de l'avance en tient compte, l'échéance est
+ * marquée RETENUE — mais `retenueDue()` ne les voit pas, puisqu'elle ne
+ * cherche que des échéances À VENIR. La préparation ne retenait donc rien, et
+ * le bulletin annonçait un net complet pour un salarié dont l'avance avait
+ * bien été prélevée. Le journal et la paie décrivaient le même argent
+ * différemment.
+ *
+ * Cette fonction les rapporte pour que la paie les AFFICHE. Elle ne crée rien,
+ * ne modifie rien, ne rattache rien : le journal reste la source, la paie n'en
+ * est que la projection. C'est aussi pourquoi on ne pose pas `payroll_item_id`
+ * au passage — une régénération « rendrait » alors un solde qu'elle n'a jamais
+ * prélevé.
+ */
+async function retenuesHorsPaie(client, { companyId, employeeId, periodCode }) {
+  const { rows } = await client.query(
+    `SELECT rp.id, rp.amount, rp.advance_id, rp.installment_id, a.reference
+       FROM salary_advance_repayments rp
+       JOIN salary_advances a ON a.id = rp.advance_id
+       JOIN salary_advance_installments i ON i.id = rp.installment_id
+      WHERE rp.company_id = $1
+        AND a.employee_id = $2
+        AND rp.origin = 'RETENUE_PAIE'
+        AND i.period_code = $3
+        AND rp.payroll_item_id IS NULL
+        /* Disjoint de retenueDue() PAR CONSTRUCTION : celle-la ne considere
+           que les échéances À VENIR, celle-ci que les autres. Sans cette
+           borne, une échéance restée À VENIR alors qu'un remboursement existe
+           déjà pour elle serait comptée deux fois — une fois lue ici, une fois
+           recalculée là — et le salarié paierait le double. */
+        AND i.status <> 'A_VENIR'
+      ORDER BY rp.id`,
+    [companyId, employeeId, periodCode]
+  );
+  return rows.map((r) => ({ ...r, montant: francs(r.amount) }));
+}
+
 async function retenueDue(client, { companyId, employeeId, periodCode, netDisponible }) {
   const { rows } = await client.query(
     `SELECT i.id AS installment_id, i.advance_id, i.amount_due, i.amount_taken,
@@ -197,6 +241,6 @@ async function retenueDue(client, { companyId, employeeId, periodCode, netDispon
 }
 
 module.exports = {
-  francs, erreur, planifier, periodeDecalee, poserEcheancier,
+  francs, erreur, planifier, periodeDecalee, poserEcheancier, retenuesHorsPaie,
   statutSelonSolde, rembourser, retenueDue,
 };

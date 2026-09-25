@@ -851,9 +851,18 @@ module.exports = function createAttendanceWorkforceRouter(deps) {
            jamais rendre un salaire négatif ; ce qui n'a pas pu être pris reste
            dû et repassera à la période suivante. */
         if (ligne.net_salary != null) {
+          /* Même règle que la préparation par période : une retenue déjà
+             enregistrée hors paie compte, et elle plafonne ce qui reste
+             prélevable. Deux générateurs qui compteraient différemment
+             donneraient deux nets pour le même mois. */
+          const externes = await AV.retenuesHorsPaie(client, {
+            companyId, employeeId: line.id, periodCode: month,
+          });
+          const totalExterne = externes.reduce((somme, r) => somme + r.montant, 0);
+
           const retenues = await AV.retenueDue(client, {
             companyId, employeeId: line.id, periodCode: month,
-            netDisponible: Number(ligne.net_salary),
+            netDisponible: Math.max(0, Number(ligne.net_salary) - totalExterne),
           });
           let total = 0;
           for (const r of retenues) {
@@ -865,11 +874,13 @@ module.exports = function createAttendanceWorkforceRouter(deps) {
             });
             total += r.montant;
           }
-          if (total > 0) {
+          const totalRetenu = total + totalExterne;
+          if (totalRetenu > 0) {
             await client.query(
               `UPDATE attendance_payroll_items_v2
-                  SET advance_deduction = $1, net_salary = GREATEST(0, net_salary - $1), updated_at = now()
-                WHERE id = $2`, [total, ligne.id]);
+                  SET advance_deduction = $1, advance_deduction_externe = $2,
+                      net_salary = GREATEST(0, net_salary - $1), updated_at = now()
+                WHERE id = $3`, [totalRetenu, totalExterne, ligne.id]);
           }
         }
       }

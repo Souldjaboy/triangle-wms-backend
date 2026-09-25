@@ -356,9 +356,19 @@ module.exports = function createPaieWorkflowRouter(deps) {
           const ligne = creees[0];
 
           if (ligne.net_salary != null) {
+            /* Une retenue de cette période a pu être enregistrée AILLEURS que
+               par la paie — c'est le cas des avances historiques reprises par
+               script. Elle a déjà réduit le solde ; on la lit d'abord pour ne
+               pas la reprendre une seconde fois, et pour que le net disponible
+               qui plafonne la nouvelle retenue soit le vrai. */
+            const externes = await AV.retenuesHorsPaie(client, {
+              companyId, employeeId: l.id, periodCode: periode.code,
+            });
+            const totalExterne = externes.reduce((somme, r) => somme + r.montant, 0);
+
             const dues = await AV.retenueDue(client, {
               companyId, employeeId: l.id, periodCode: periode.code,
-              netDisponible: Number(ligne.net_salary),
+              netDisponible: Math.max(0, Number(ligne.net_salary) - totalExterne),
             });
             let total = 0;
             for (const d of dues) {
@@ -370,11 +380,17 @@ module.exports = function createPaieWorkflowRouter(deps) {
               });
               total += d.montant;
             }
-            if (total > 0) {
+            /* Le total porté sur la ligne est celui de la PÉRIODE, d'où qu'il
+               vienne : la paie projette le journal, elle ne le concurrence pas.
+               La part externe reste identifiée, pour que personne ne la prenne
+               un jour pour une retenue à contrepasser. */
+            const totalRetenu = total + totalExterne;
+            if (totalRetenu > 0) {
               await client.query(
                 `UPDATE attendance_payroll_items_v2
-                    SET advance_deduction = $1, net_salary = GREATEST(0, net_salary - $1), updated_at = now()
-                  WHERE id = $2`, [total, ligne.id]);
+                    SET advance_deduction = $1, advance_deduction_externe = $2,
+                        net_salary = GREATEST(0, net_salary - $1), updated_at = now()
+                  WHERE id = $3`, [totalRetenu, totalExterne, ligne.id]);
             }
           }
         }
