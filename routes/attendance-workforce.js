@@ -7,6 +7,7 @@ const identifiants = require("../services/identifiants");
 const companyContext = require("../services/company-context");
 const AV = require("../services/avances-salaire");
 const P = require("../services/attendance-payroll");
+const PERM = require("../services/permissions");
 
 module.exports = function createAttendanceWorkforceRouter(deps) {
   const { pool, authenticateToken, getEffectiveCompanyId, requirePermission,
@@ -762,24 +763,91 @@ module.exports = function createAttendanceWorkforceRouter(deps) {
           ORDER BY submitted_at DESC LIMIT 1`, [run.id]
       )).rows[0] || null : null;
 
-      /* Le droit de lever la séparation est relu en base, jamais déduit du
-         jeton côté écran : le bouton suit exactement la règle du serveur. */
+      /* Une paie « en attente de la Direction » SANS demande en attente est une
+         INCOHÉRENCE, pas une règle métier. L'écran doit la nommer, et non en
+         déduire que la validation revient à quelqu'un d'autre. On relit donc la
+         dernière demande quel que soit son statut, pour pouvoir dire ce qui
+         s'est réellement passé. */
+      const derniereDemande = run ? (await client.query(
+        `SELECT id, status, submitted_by, submitted_by_name, submitted_at,
+                decided_at, decision_reason
+           FROM payroll_requests WHERE payroll_run_id = $1
+          ORDER BY submitted_at DESC LIMIT 1`, [run.id]
+      )).rows[0] || null : null;
+
+      /* Le droit de lever la séparation est relu EN BASE, jamais déduit du
+         jeton : un jeton émis avant un retrait de privilège continuerait sinon
+         d'ouvrir ce passage — et c'est précisément le passage qui lève un
+         contrôle. */
       const { rows: compte } = await client.query(
         `SELECT is_super_admin FROM users WHERE id = $1`, [req.user?.id || 0]
       );
       const estSuperAdmin = compte[0]?.is_super_admin === true;
-      const estAuteurDeLaDemande = Boolean(demande)
+
+      /* Les droits RBAC sont évalués ici avec LE MÊME moteur que les gardes des
+         routes d'action, et non re-déduits à l'écran depuis un autre endpoint.
+         Sans cela l'écran proposait un bouton que la route refusait : « Retirer
+         ma soumission » appelle une route gardée par `paie.submit`, que le rôle
+         `direction` n'a justement pas.
+
+         Si le moteur est indisponible, le droit est INCONNU — pas « non ». La
+         différence compte : c'est en confondant les deux que la page affirmait
+         une règle métier là où il n'y avait qu'une absence de données. */
+      let ctxDroits = null;
+      try { ctxDroits = await PERM.chargerContexte(pool, req.user, companyId); }
+      catch (e) { console.error("droits paie indisponibles:", e.message || e); }
+      const aLeDroit = (action) =>
+        ctxDroits ? PERM.decider(ctxDroits, "paie", action).autorise : null;
+      const peutSoumettre = aLeDroit("submit");
+      const peutValiderRbac = aLeDroit("validate");
+
+      const enAttente = Boolean(demande);
+      const estAuteurDeLaDemande = enAttente
         && Number(demande.submitted_by) === Number(req.user?.id);
+
+      /* POURQUOI une action manque est dit par le serveur. L'écran ne le devine
+         plus par la négation d'un autre droit : c'est cette déduction qui
+         faisait annoncer « la validation revient à quelqu'un d'autre » alors
+         que les droits n'étaient, en réalité, pas connus du tout. */
+      const sansSoumission = !enAttente
+        ? (run && run.status === "EN_ATTENTE_DIRECTION" ? "DEMANDE_INTROUVABLE" : "AUCUNE_SOUMISSION")
+        : null;
+      const motifSansDecision =
+        sansSoumission ? sansSoumission
+        : peutValiderRbac === null ? "DROITS_INDISPONIBLES"
+        : peutValiderRbac === false ? "DROIT_VALIDATE_MANQUANT"
+        : (estAuteurDeLaDemande && !estSuperAdmin) ? "AUTEUR_DE_LA_SOUMISSION"
+        : null;
+      const motifSansRetrait =
+        sansSoumission ? sansSoumission
+        : !(estAuteurDeLaDemande || estSuperAdmin) ? "NI_AUTEUR_NI_SUPER_ADMIN"
+        : peutSoumettre === null ? "DROITS_INDISPONIBLES"
+        : peutSoumettre === false ? "DROIT_SUBMIT_MANQUANT"
+        : null;
 
       res.json({
         month, employees, run, items, demande,
         droits: {
           est_super_admin: estSuperAdmin,
           est_auteur_de_la_soumission: estAuteurDeLaDemande,
-          peut_retirer_sa_soumission: Boolean(demande) && (estAuteurDeLaDemande || estSuperAdmin),
-          /* La règle du backend, telle quelle : l'auteur ne décide pas, sauf
-             s'il est super administrateur. */
-          peut_decider: Boolean(demande) && (!estAuteurDeLaDemande || estSuperAdmin),
+          soumission_en_attente: enAttente,
+          peut_valider: peutValiderRbac === true,
+          peut_soumettre: peutSoumettre === true,
+          /* La règle du serveur, telle quelle : l'auteur ne décide pas, sauf
+             s'il est super administrateur — et dans tous les cas il faut le
+             droit que la route exigera. */
+          peut_decider: motifSansDecision === null,
+          peut_retirer_sa_soumission: motifSansRetrait === null,
+          motif_sans_decision: motifSansDecision,
+          motif_sans_retrait: motifSansRetrait,
+          incoherence: (run && run.status === "EN_ATTENTE_DIRECTION" && !enAttente)
+            ? {
+                code: "DEMANDE_INTROUVABLE",
+                derniere_demande_statut: derniereDemande?.status || null,
+                derniere_demande_le: derniereDemande?.decided_at || derniereDemande?.submitted_at || null,
+                derniere_demande_motif: derniereDemande?.decision_reason || "",
+              }
+            : null,
         },
       });
     } catch (error) { fail(res, error, "Erreur calcul de la paie."); }
@@ -1032,12 +1100,33 @@ module.exports = function createAttendanceWorkforceRouter(deps) {
 
         /* Le décideur doit être quelqu'un d'AUTRE. La route de décision le
            refuse déjà, mais une demande validée est ce qui autorise à sortir
-           de l'argent : on ne s'en remet pas à un contrôle fait ailleurs. */
-        if (demande.decided_by === null
-            || Number(demande.decided_by) === Number(demande.submitted_by)) {
+           de l'argent : on ne s'en remet pas à un contrôle fait ailleurs.
+
+           MÊME EXCEPTION QU'À LA VALIDATION, ET RELUE EN BASE DE LA MÊME
+           FAÇON : le super administrateur. Sans elle, les deux règles se
+           contredisaient — la Direction autorisait l'auto-validation d'un
+           super administrateur, puis ce contrôle-ci refusait éternellement de
+           payer la paie ainsi autorisée. Une paie autorisée qu'on ne peut pas
+           payer n'est pas un contrôle, c'est une impasse. Le privilège est
+           relu dans `users`, jamais pris du jeton, et la trace reste dans le
+           motif de la décision. */
+        const autoValidee = demande.decided_by !== null
+          && Number(demande.decided_by) === Number(demande.submitted_by);
+        if (autoValidee) {
+          const { rows: decideur } = await client.query(
+            `SELECT is_super_admin FROM users WHERE id = $1`, [demande.decided_by]
+          );
+          if (decideur[0]?.is_super_admin !== true) {
+            await client.query("ROLLBACK");
+            return res.status(409).json({
+              error: "Cette paie a été validée par la personne qui l'a soumise : elle n'est pas valablement autorisée.",
+              code: "SELF_APPROVED_REQUEST",
+            });
+          }
+        } else if (demande.decided_by === null) {
           await client.query("ROLLBACK");
           return res.status(409).json({
-            error: "Cette paie a été validée par la personne qui l'a soumise : elle n'est pas valablement autorisée.",
+            error: "Cette paie ne porte pas de décideur : elle n'est pas valablement autorisée.",
             code: "SELF_APPROVED_REQUEST",
           });
         }

@@ -1175,7 +1175,16 @@ module.exports = function createPaieWorkflowRouter(deps) {
           }
         }
 
+        /* Un retrait se relit des mois plus tard : « pourquoi cette paie
+           est-elle repartie en brouillon ? ». Le motif est donc exigé, et
+           APRÈS le contrôle d'auteur — sans quoi un tiers apprendrait, par un
+           400 plutôt qu'un 403, qu'il s'est trompé de motif et non de droit. */
         const motif = String(req.body?.reason || "").trim();
+        if (motif.length < 10) {
+          throw P.erreur(
+            "Motif du retrait obligatoire (10 caractères minimum) : il restera attaché à la demande.",
+            "REASON_REQUIRED", 400);
+        }
         await client.query(
           `UPDATE payroll_requests
               SET status = 'ANNULEE', decided_by = $1, decided_by_name = $2,
