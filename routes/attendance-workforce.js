@@ -123,6 +123,7 @@ module.exports = function createAttendanceWorkforceRouter(deps) {
         const unrestricted = sites === null || salaryAll;
         const { rows } = await client.query(
           `SELECT e.id, e.employee_number, e.full_name, e.user_id, e.job_title,
+                  e.service, e.categorie,
                   e.active, e.effective_from, s.id AS site_id, s.code AS site_code,
                   s.name AS site_name, w.id AS schedule_id, w.code AS schedule_code,
                   w.name AS schedule_name, sal.monthly_salary, sal.daily_rate

@@ -223,6 +223,36 @@ module.exports = function createPointageCalendrierRouter(deps) {
     finally { client.release(); }
   });
 
+  /* LES CIBLES POSSIBLES D'UNE PORTÉE, servies par ce module et gardées par SA
+     permission. L'écran n'a pas à passer par un endpoint d'organisation réservé
+     au super administrateur pour savoir quels sites existent : qui peut
+     déclarer une journée doit pouvoir en désigner le périmètre.
+
+     Les services et les catégories viennent des fiches existantes : on ne
+     demande pas de retaper un libellé qui doit correspondre au caractère près. */
+  router.get("/pointage/calendrier/cibles", authenticateToken, garde("view"), async (req, res) => {
+    const companyId = requireCompany(req, res); if (!companyId) return;
+    const client = await pool.connect();
+    try {
+      const [sites, salaries] = await Promise.all([
+        client.query(
+          `SELECT id, code, name, site_type FROM attendance_work_sites
+            WHERE company_id = $1 AND active ORDER BY site_type, name`, [companyId]),
+        client.query(
+          `SELECT id, employee_number, full_name, site_id, service, categorie
+             FROM attendance_employees
+            WHERE company_id = $1 AND active ORDER BY employee_number`, [companyId]),
+      ]);
+      const distinct = (champ) => [...new Set(
+        salaries.rows.map((e) => String(e[champ] || "").trim()).filter(Boolean))].sort();
+      res.json({
+        sites: sites.rows, salaries: salaries.rows,
+        services: distinct("service"), categories: distinct("categorie"),
+      });
+    } catch (e) { fail(res, e, "Lecture des cibles impossible."); }
+    finally { client.release(); }
+  });
+
   router.get("/pointage/calendrier", authenticateToken, garde("view"), async (req, res) => {
     const companyId = requireCompany(req, res); if (!companyId) return;
     const debut = jourValide(req.query.debut) ? String(req.query.debut) : null;
