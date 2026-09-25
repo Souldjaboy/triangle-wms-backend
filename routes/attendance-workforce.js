@@ -749,7 +749,39 @@ module.exports = function createAttendanceWorkforceRouter(deps) {
       const items = run ? (await client.query(
         `SELECT * FROM attendance_payroll_items_v2 WHERE payroll_run_id=$1 ORDER BY employee_id`,[run.id]
       )).rows : [];
-      res.json({ month, employees, run, items });
+
+      /* La demande en attente, et qui l'a soumise. L'écran en a besoin pour
+         savoir s'il doit proposer « retirer ma soumission » plutôt que des
+         boutons de décision que le serveur refusera. Sans cette information, la
+         page affichait les trois boutons de la Direction à l'auteur lui-même,
+         qui découvrait le refus après avoir cliqué. */
+      const demande = run ? (await client.query(
+        `SELECT id, status, amount_submitted, submitted_by, submitted_by_name, submitted_at
+           FROM payroll_requests
+          WHERE payroll_run_id = $1 AND status = 'EN_ATTENTE_DIRECTION'
+          ORDER BY submitted_at DESC LIMIT 1`, [run.id]
+      )).rows[0] || null : null;
+
+      /* Le droit de lever la séparation est relu en base, jamais déduit du
+         jeton côté écran : le bouton suit exactement la règle du serveur. */
+      const { rows: compte } = await client.query(
+        `SELECT is_super_admin FROM users WHERE id = $1`, [req.user?.id || 0]
+      );
+      const estSuperAdmin = compte[0]?.is_super_admin === true;
+      const estAuteurDeLaDemande = Boolean(demande)
+        && Number(demande.submitted_by) === Number(req.user?.id);
+
+      res.json({
+        month, employees, run, items, demande,
+        droits: {
+          est_super_admin: estSuperAdmin,
+          est_auteur_de_la_soumission: estAuteurDeLaDemande,
+          peut_retirer_sa_soumission: Boolean(demande) && (estAuteurDeLaDemande || estSuperAdmin),
+          /* La règle du backend, telle quelle : l'auteur ne décide pas, sauf
+             s'il est super administrateur. */
+          peut_decider: Boolean(demande) && (!estAuteurDeLaDemande || estSuperAdmin),
+        },
+      });
     } catch (error) { fail(res, error, "Erreur calcul de la paie."); }
     finally { client.release(); }
   });

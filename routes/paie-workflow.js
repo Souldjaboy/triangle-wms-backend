@@ -32,7 +32,7 @@ const PAIE = require("../services/attendance-payroll");
 const AV = require("../services/avances-salaire");
 
 module.exports = function createPaieWorkflowRouter(deps) {
-  const { pool, authenticateToken, getEffectiveCompanyId, requirePermission, nextAccountingNumber } = deps;
+  const { pool, authenticateToken, getEffectiveCompanyId, requirePermission, nextAccountingNumber, logActivity } = deps;
   const router = express.Router();
 
   const companyOf = (req) => Number(getEffectiveCompanyId(req, req.user?.company_id) || 0);
@@ -289,6 +289,9 @@ module.exports = function createPaieWorkflowRouter(deps) {
 
         const lignes = await PAIE.calculerPaiePeriode(client, companyId, {
           date_debut: periode.debut, date_fin: periode.fin,
+          /* L'exception d'absences porte sur CETTE période : elle est lue ici,
+             avec la période, et nulle part ailleurs. */
+          absences_non_retenues: periode.absences_non_retenues === true,
         });
         if (!lignes.length) {
           throw P.erreur("Aucun employé actif sur cette période.", "NO_EMPLOYEE", 409);
@@ -346,12 +349,13 @@ module.exports = function createPaieWorkflowRouter(deps) {
             `INSERT INTO attendance_payroll_items_v2
                (company_id, payroll_run_id, employee_id, employee_name, monthly_salary,
                 daily_rate, expected_days, attended_days, absence_days, late_minutes,
-                absence_deduction, adjustments, net_salary, status)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                absence_deduction, absence_deduction_annulee, adjustments, net_salary, status)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
              RETURNING id, net_salary`,
             [companyId, paie.id, l.id, l.full_name, l.monthly_salary, l.daily_rate,
              l.expected_days, l.attended_days, l.absence_days, l.late_minutes,
-             l.absence_deduction, l.adjustments, l.net_salary, l.status]
+             l.absence_deduction, l.absence_deduction_annulee || 0,
+             l.adjustments, l.net_salary, l.status]
           );
           const ligne = creees[0];
 
@@ -546,20 +550,45 @@ module.exports = function createPaieWorkflowRouter(deps) {
 
         /* LA règle : celui qui a soumis ne décide pas. Elle ne dépend pas du
            rôle — un comptable à qui l'on accorderait par erreur le droit de
-           valider resterait bloqué ici, sur sa PROPRE demande. */
-        if (Number(demande.submitted_by) === Number(req.user?.id)) {
-          throw P.erreur(
-            "Vous avez soumis cette paie : vous ne pouvez pas la valider vous-même.",
-            "SELF_APPROVAL_FORBIDDEN", 403
+           valider resterait bloqué ici, sur sa PROPRE demande.
+
+           UNE SEULE EXCEPTION : le super administrateur. Dans une petite
+           structure, il est parfois seul à pouvoir préparer ET autoriser ; le
+           lui interdire bloquerait la paie plutôt que de la contrôler. La
+           séparation reste entière pour tous les autres rôles.
+
+           Le jeton porte `is_super_admin`, mais on ne s'en contente pas : le
+           droit est relu en base, dans cette transaction. Un jeton émis avant
+           un retrait de privilège continuerait sinon d'ouvrir ce passage
+           jusqu'à son expiration — et c'est précisément le passage qui lève un
+           contrôle. */
+        const estAuteur = Number(demande.submitted_by) === Number(req.user?.id);
+        let superAdminConfirme = false;
+        if (estAuteur) {
+          const { rows: compte } = await client.query(
+            `SELECT is_super_admin FROM users WHERE id = $1`, [req.user?.id || 0]
           );
+          superAdminConfirme = compte[0]?.is_super_admin === true;
+          if (!superAdminConfirme) {
+            throw P.erreur(
+              "Vous avez soumis cette paie : vous ne pouvez pas la valider vous-même.",
+              "SELF_APPROVAL_FORBIDDEN", 403
+            );
+          }
         }
+
+        /* Une auto-validation laisse une trace explicite : relue plus tard,
+           elle doit se distinguer d'une validation par un tiers. */
+        const motifFinal = estAuteur && superAdminConfirme
+          ? `[Auto-validation super administrateur] ${motif}`.trim()
+          : motif;
 
         await client.query(
           `UPDATE payroll_requests
               SET status = $1, decided_by = $2, decided_by_name = $3,
                   decided_at = now(), decision_reason = $4, updated_at = now()
             WHERE id = $5`,
-          [decision, req.user?.id || null, nomDe(req), motif, demande.id]
+          [decision, req.user?.id || null, nomDe(req), motifFinal, demande.id]
         );
 
         const statutPaie = decision === "VALIDEE" ? "AUTORISEE_AU_PAIEMENT"
@@ -760,6 +789,184 @@ module.exports = function createPaieWorkflowRouter(deps) {
     }
   );
 
+
+  /* ══════════════════════════════════════════════════════════════════════
+     RETIRER SA PROPRE SOUMISSION
+
+     Soumettre et décider sont deux actes séparés, et c'est bien ainsi. Mais
+     RETIRER sa demande n'est pas décider : c'est renoncer. Interdire à l'auteur
+     de reprendre sa propre soumission ne protège rien — cela le laisse
+     seulement bloqué, avec une paie en attente d'une Direction qui ne peut pas
+     trancher parce que l'auteur est le seul habilité.
+
+     La paie redevient un brouillon, la période revient à « paie préparée », et
+     la demande passe à ANNULEE — elle n'est pas supprimée : la trace de ce qui
+     a été soumis, par qui, pour quel montant, et retiré par qui, reste lisible.
+
+     Rien d'autre ne bouge : ni les lignes de paie, ni les avances, ni les
+     remboursements, ni les pointages. Aucun paiement n'est possible depuis cet
+     état.
+     ══════════════════════════════════════════════════════════════════════ */
+  router.post(
+    "/paie/runs/:id/retirer-soumission",
+    authenticateToken,
+    requirePermission("paie", "submit"),
+    async (req, res) => {
+      const companyId = requireCompany(req, res); if (!companyId) return;
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const { rows: demandes } = await client.query(
+          `SELECT * FROM payroll_requests
+            WHERE payroll_run_id = $1 AND company_id = $2 AND status = 'EN_ATTENTE_DIRECTION'
+            FOR UPDATE`,
+          [Number(req.params.id), companyId]
+        );
+        const demande = demandes[0];
+        if (!demande) {
+          throw P.erreur(
+            "Aucune soumission en attente pour cette paie : il n'y a rien à retirer.",
+            "REQUEST_NOT_PENDING", 404);
+        }
+
+        /* Retirer la demande de quelqu'un d'autre, c'est décider à sa place.
+           Seul l'auteur le fait — ou le super administrateur, relu en base. */
+        const estAuteur = Number(demande.submitted_by) === Number(req.user?.id);
+        let superAdminConfirme = false;
+        if (!estAuteur) {
+          const { rows: compte } = await client.query(
+            `SELECT is_super_admin FROM users WHERE id = $1`, [req.user?.id || 0]
+          );
+          superAdminConfirme = compte[0]?.is_super_admin === true;
+          if (!superAdminConfirme) {
+            throw P.erreur(
+              `Cette paie a été soumise par ${demande.submitted_by_name || "un autre utilisateur"} : seul son auteur peut la retirer.`,
+              "WITHDRAW_NOT_AUTHOR", 403);
+          }
+        }
+
+        const motif = String(req.body?.reason || "").trim();
+        await client.query(
+          `UPDATE payroll_requests
+              SET status = 'ANNULEE', decided_by = $1, decided_by_name = $2,
+                  decided_at = now(),
+                  decision_reason = $3, updated_at = now()
+            WHERE id = $4`,
+          [req.user?.id || null, nomDe(req),
+           (estAuteur ? "Soumission retirée par son auteur." : "Soumission retirée par le super administrateur.")
+             + (motif ? ` Motif : ${motif}` : ""),
+           demande.id]
+        );
+
+        /* DRAFT, et non « l'état d'avant » deviné : c'est l'état depuis lequel
+           on prépare et l'on soumet à nouveau. */
+        await client.query(
+          `UPDATE attendance_payroll_runs_v2 SET status = 'DRAFT', updated_at = now()
+            WHERE id = $1 AND company_id = $2`,
+          [demande.payroll_run_id, companyId]
+        );
+        if (demande.period_id) {
+          await client.query(
+            `UPDATE attendance_periods SET status = 'PAIE_PREPAREE', updated_at = now()
+              WHERE id = $1 AND status = 'EN_ATTENTE_DIRECTION'`,
+            [demande.period_id]
+          );
+        }
+
+        await client.query("COMMIT");
+        if (typeof logActivity === "function") {
+          await logActivity(nomDe(req), req.user?.role, "Retrait d'une soumission de paie", "Paie",
+            `Paie ${demande.payroll_run_id} — montant soumis ${demande.amount_submitted} — entreprise ${companyId}`
+            + (motif ? ` — motif : ${motif}` : "")).catch(() => {});
+        }
+        res.json({
+          retiree: true,
+          message: "Soumission retirée. La paie est revenue en brouillon : elle peut être préparée puis soumise à nouveau. Aucun paiement n'a été effectué.",
+        });
+      } catch (e) {
+        await client.query("ROLLBACK").catch(() => {});
+        fail(res, e, "Erreur retrait de la soumission.");
+      } finally { client.release(); }
+    }
+  );
+
+  /* ══════════════════════════════════════════════════════════════════════
+     EXCEPTION D'ABSENCES SUR UNE PÉRIODE
+
+     Un mois où le pointage a été défaillant ne doit pas coûter aux salariés ce
+     qu'ils n'ont pas manqué. La Direction peut décider que, pour CETTE période,
+     les absences ne réduisent pas le salaire.
+
+     Ce qui n'est PAS fait, volontairement : écrire « présent » sur chaque jour
+     manquant. Ce serait affirmer un fait que personne n'a constaté, et effacer
+     à jamais la trace de ce que le pointage avait ou n'avait pas enregistré.
+     Les absences restent donc comptées et visibles ; elles ne sont plus
+     retenues, et la ligne de paie chiffre ce que l'exception a coûté.
+
+     La portée est la période, et rien d'autre. La suivante repart au
+     comportement normal sans qu'on ait à défaire quoi que ce soit.
+
+     Réservé au super administrateur, relu en base : lever une règle de calcul
+     de la paie n'est pas une opération de saisie.
+     ══════════════════════════════════════════════════════════════════════ */
+  router.post(
+    "/paie/periodes/:code/exception-absences",
+    authenticateToken,
+    requirePermission("paie", "prepare"),
+    async (req, res) => {
+      const companyId = requireCompany(req, res); if (!companyId) return;
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const { rows: compte } = await client.query(
+          `SELECT is_super_admin FROM users WHERE id = $1`, [req.user?.id || 0]
+        );
+        if (compte[0]?.is_super_admin !== true) {
+          throw P.erreur(
+            "Lever la retenue des absences sur une période est réservé au super administrateur.",
+            "EXCEPTION_FORBIDDEN", 403);
+        }
+
+        const actif = req.body?.actif !== false;
+        const motif = String(req.body?.reason || "").trim();
+        if (actif && motif.length < 10) {
+          throw P.erreur(
+            "Motif obligatoire (10 caractères minimum) : une exception se relit des mois plus tard.",
+            "REASON_REQUIRED", 400);
+        }
+
+        const { rows } = await client.query(
+          `UPDATE attendance_periods
+              SET absences_non_retenues = $1,
+                  absences_non_retenues_motif = CASE WHEN $1 THEN $2 ELSE '' END,
+                  absences_non_retenues_par  = CASE WHEN $1 THEN $3::int ELSE NULL END,
+                  absences_non_retenues_le   = CASE WHEN $1 THEN now() ELSE NULL END,
+                  updated_at = now()
+            WHERE company_id = $4 AND code = $5
+            RETURNING *`,
+          [actif, motif, req.user?.id || null, companyId, String(req.params.code)]
+        );
+        if (!rows[0]) throw P.erreur("Période introuvable dans cette entreprise.", "PERIOD_NOT_FOUND", 404);
+
+        await client.query("COMMIT");
+        if (typeof logActivity === "function") {
+          await logActivity(nomDe(req), req.user?.role,
+            actif ? "Exception d'absences posée" : "Exception d'absences levée", "Paie",
+            `Période ${req.params.code} — entreprise ${companyId}` + (motif ? ` — ${motif}` : "")
+          ).catch(() => {});
+        }
+        res.json({
+          periode: rows[0],
+          message: actif
+            ? `Les absences de la période ${req.params.code} ne réduiront plus le salaire. Préparez la paie à nouveau pour appliquer la décision. Les absences restent enregistrées et visibles.`
+            : `La période ${req.params.code} retient à nouveau ses absences. Préparez la paie à nouveau pour appliquer le changement.`,
+        });
+      } catch (e) {
+        await client.query("ROLLBACK").catch(() => {});
+        fail(res, e, "Erreur exception d'absences.");
+      } finally { client.release(); }
+    }
+  );
   router.get(
     "/paie/lignes/:id/bon",
     authenticateToken,

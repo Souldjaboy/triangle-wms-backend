@@ -19430,6 +19430,7 @@ app.use(
   "/",
   createPaieWorkflowRouter({
     pool, authenticateToken, getEffectiveCompanyId, requirePermission, nextAccountingNumber,
+    logActivity,
   })
 );
 

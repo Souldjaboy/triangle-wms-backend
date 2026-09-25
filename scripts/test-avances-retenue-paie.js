@@ -55,7 +55,14 @@ const ligneDe = async (nom) => (await q(
   v("avance retenue = 40 000 (et non 0)", Number(l?.advance_deduction) === 40000, `reçu ${l?.advance_deduction}`);
   v("dont 40 000 identifiés comme enregistrés hors paie",
     Number(l?.advance_deduction_externe) === 40000, `reçu ${l?.advance_deduction_externe}`);
-  v("net = 150 000 − 40 000 = 110 000", Number(l?.net_salary) === 110000, `reçu ${l?.net_salary}`);
+  /* L'invariant plutôt qu'un nombre : le net est le salaire, moins les
+     absences retenues, plus les ajustements, moins l'avance. Un jeu d'essai qui
+     change d'absences ne doit pas faire échouer un test sur les avances. */
+  const netAttendu = (x) => Math.max(0, Number(x.monthly_salary) - Number(x.absence_deduction)
+    + Number(x.adjustments) - Number(x.advance_deduction));
+  v(`net = ${netAttendu(l)} (salaire − absences + ajustements − avance)`,
+    Number(l?.net_salary) === netAttendu(l),
+    `net=${l?.net_salary} salaire=${l?.monthly_salary} absence=${l?.absence_deduction} ajust=${l?.adjustments} avance=${l?.advance_deduction}`);
   let av = (await q(`SELECT balance, status FROM salary_advances WHERE id=801`))[0];
   v("solde de l'avance INCHANGÉ (165 000)", Number(av?.balance) === 165000, `reçu ${av?.balance}`);
   v("AUCUN remboursement créé pour Diallo",
@@ -70,7 +77,8 @@ const ligneDe = async (nom) => (await q(
   l = await ligneDe("Malamine NDiaye");
   v("avance retenue = 15 000", Number(l?.advance_deduction) === 15000, `reçu ${l?.advance_deduction}`);
   v("part externe = 0", Number(l?.advance_deduction_externe) === 0, `reçu ${l?.advance_deduction_externe}`);
-  v("net = 120 000 − 15 000 = 105 000", Number(l?.net_salary) === 105000, `reçu ${l?.net_salary}`);
+  v(`net = ${netAttendu(l)} (invariant)`, Number(l?.net_salary) === netAttendu(l),
+    `net=${l?.net_salary} salaire=${l?.monthly_salary} absence=${l?.absence_deduction} avance=${l?.advance_deduction}`);
   av = (await q(`SELECT balance FROM salary_advances WHERE id=802`))[0];
   v("solde passé de 45 000 à 30 000", Number(av?.balance) === 30000, `reçu ${av?.balance}`);
   v("le remboursement créé EST rattaché à la ligne de paie",
@@ -81,13 +89,15 @@ const ligneDe = async (nom) => (await q(
   console.log("\n④ ZERBO — échéance en octobre : rien ne doit être retenu en septembre");
   l = await ligneDe("Amary Zerbo");
   v("avance retenue = 0", Number(l?.advance_deduction) === 0, `reçu ${l?.advance_deduction}`);
-  v("net = salaire complet (100 000)", Number(l?.net_salary) === 100000, `reçu ${l?.net_salary}`);
+  v("net = salaire moins absences, aucune avance déduite",
+    Number(l?.net_salary) === netAttendu(l) && Number(l?.advance_deduction) === 0,
+    `net=${l?.net_salary} attendu=${netAttendu(l)}`);
   v("solde intact (25 000)", Number((await q(`SELECT balance FROM salary_advances WHERE id=803`))[0]?.balance) === 25000);
 
   console.log("\n⑤ SANS AVANCE — la ligne reste intacte");
   l = await ligneDe("Sans Avance");
   v("avance retenue = 0", Number(l?.advance_deduction) === 0);
-  v("net = 90 000", Number(l?.net_salary) === 90000, `reçu ${l?.net_salary}`);
+  v("net conforme à l'invariant", Number(l?.net_salary) === netAttendu(l), `net=${l?.net_salary} attendu=${netAttendu(l)}`);
 
   console.log("\n⑥ ANTI-DOUBLE-RETENUE — préparer deux fois de suite");
   const avantSoldes = await q(`SELECT id, balance FROM salary_advances ORDER BY id`);
@@ -102,7 +112,8 @@ const ligneDe = async (nom) => (await q(
     `avant ${avantRembours}`);
   l = await ligneDe("Souleymane Diallo");
   v("Diallo affiche toujours 40 000, pas 80 000", Number(l?.advance_deduction) === 40000, `reçu ${l?.advance_deduction}`);
-  v("net de Diallo toujours 110 000", Number(l?.net_salary) === 110000, `reçu ${l?.net_salary}`);
+  v("le net de Diallo respecte toujours l'invariant", Number(l?.net_salary) === netAttendu(l),
+    `net=${l?.net_salary} attendu=${netAttendu(l)}`);
   l = await ligneDe("Malamine NDiaye");
   v("Malamine affiche toujours 15 000, pas 30 000", Number(l?.advance_deduction) === 15000, `reçu ${l?.advance_deduction}`);
   v("solde de Malamine toujours 30 000, pas 15 000",
@@ -122,7 +133,7 @@ const ligneDe = async (nom) => (await q(
   l = await ligneDe("Salarie Fatemat");
   v("FAT & MAT : avance retenue = 30 000", Number(l?.advance_deduction) === 30000, `reçu ${l?.advance_deduction}`);
   v("FAT & MAT : part externe = 30 000", Number(l?.advance_deduction_externe) === 30000);
-  v("FAT & MAT : net = 130 000 − 30 000 = 100 000", Number(l?.net_salary) === 100000, `reçu ${l?.net_salary}`);
+  v("FAT & MAT : net conforme à l'invariant", Number(l?.net_salary) === netAttendu(l), `net=${l?.net_salary} attendu=${netAttendu(l)}`);
   v("les soldes de Triangle n'ont pas bougé",
     JSON.stringify(await q(`SELECT id, balance FROM salary_advances WHERE company_id=1 ORDER BY id`)) === JSON.stringify(soldeTriangleAvant));
   v("aucune ligne de paie Triangle dans la paie FAT & MAT",

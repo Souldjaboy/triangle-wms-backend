@@ -10,14 +10,26 @@ function calculatePayrollLine(input) {
   const absenceDays = Math.max(0, Number(input.absence_days || 0));
   const adjustments = money(input.adjustments);
   if (monthly == null || daily == null) {
-    return { ...input, absence_deduction: 0, adjustments, net_salary: null, status: "BLOCKED" };
+    return { ...input, absence_deduction: 0, absence_deduction_annulee: 0,
+             adjustments, net_salary: null, status: "BLOCKED" };
   }
-  const absenceDeduction = money(absenceDays * daily);
+  /* Ce qu'une absence aurait retiré. La période peut décider de ne pas le
+     retirer — un mois où le pointage a été défaillant, par exemple. Les jours
+     manquants restent alors comptés et VISIBLES sur le bulletin : ce qui
+     change, c'est qu'ils ne coûtent rien. Affirmer à la place que la personne
+     était présente serait écrire dans l'historique un fait que personne n'a
+     constaté. */
+  const retenueTheorique = money(absenceDays * daily);
+  const exception = input.absences_non_retenues === true;
+  const absenceDeduction = exception ? 0 : retenueTheorique;
   return {
     ...input,
     monthly_salary: monthly,
     daily_rate: daily,
     absence_deduction: absenceDeduction,
+    /* Ce que l'exception a coûté, chiffré. Sans cela, personne ne pourrait
+       dire six mois plus tard ce que ce mois-là a représenté. */
+    absence_deduction_annulee: exception ? retenueTheorique : 0,
     adjustments,
     net_salary: Math.max(0, money(monthly - absenceDeduction + adjustments)),
     status: "TO_PAY",
@@ -134,7 +146,11 @@ async function calculerPaiePeriode(client, companyId, periode) {
       ORDER BY t.employee_number`,
     [companyId, periode.date_debut, periode.date_fin]
   );
-  return rows.map(calculatePayrollLine);
+  /* L'exception appartient à la PÉRIODE, pas à l'entreprise : la période
+     suivante repart au comportement normal sans qu'on ait à défaire quoi que
+     ce soit. */
+  const exception = periode.absences_non_retenues === true;
+  return rows.map((r) => calculatePayrollLine({ ...r, absences_non_retenues: exception }));
 }
 
 function assertPaymentMethod(value) {
