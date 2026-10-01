@@ -244,6 +244,176 @@ function lireFeuilleReception(classeur, nomFeuille, entrepot) {
  * physique : le conteneur a été dépoté une fois, ses articles rangés dans
  * deux entrepôts. En créer deux inventerait un conteneur.
  */
+/* ══════════════════════════════════════════════════════════════════════════
+   LA SECONDE DISPOSITION — « CONTENEUR RECEPTIONNER »
+
+   Le classeur EM2S délimite ses blocs par un en-tête « CONTAINER NUMBER » et
+   place la désignation en colonne E, la quantité en colonne I. Un second
+   classeur réel, « CONTENEUR RECEPTIONNER », ne suit aucune de ces
+   conventions : ses blocs commencent par « DATE: … » en colonne A, la
+   désignation est en colonne C — et ses DEUX feuilles ne s'accordent même pas
+   entre elles, la quantité étant en colonne H dans WAREHOUSE-E et en colonne G
+   dans WAREHOUSE-C.
+
+   Coder ces positions en dur deux fois aurait produit un lecteur qui casse au
+   premier classeur qui déplace une colonne. On lit donc les colonnes que le
+   classeur ANNONCE : les cellules « QUANTITI » et « UNITI » disent où elles
+   sont, et « ITEMS DESCRIPTION » où est la désignation.
+
+   DEUX RÈGLES QUI COMPTENT
+
+   1. La désignation d'origine n'est JAMAIS écrasée. Une forme normalisée est
+      calculée à côté, pour le rapprochement — « TRX600 » doit rester
+      « TRX600 », et le pliage ne doit pas détruire une référence technique.
+
+   2. Une ligne SANS quantité est conservée, avec `quantite: null`. La laisser
+      tomber en silence ferait disparaître un article réel du document ; elle
+      doit remonter en anomalie pour qu'une personne donne le chiffre.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+const DEBUT_BLOC_DATE = /^date\s*:?\s*\d/i;
+const ENTETE_ARTICLE = /items?\s*description|received\s*items|items\s*received/i;
+const LIGNE_VEHICULE = /^n\s*°?\s*v\s*:?\s*(.*)$/i;
+
+/** Un numéro de conteneur trouvé N'IMPORTE OÙ dans un texte. */
+function extraireConteneur(brut) {
+  const t = String(brut ?? "").toUpperCase();
+  if (LIGNE_VEHICULE.test(t.trim()) && !/[A-Z]{4}\s*\d{6}/.test(t)) return null;
+  const m = t.match(/([A-Z]{4})\s*[-—]?\s*(\d{6})\s*\/?\s*(\d)?/);
+  if (!m) return null;
+  return m[3] ? `${m[1]} ${m[2]}/${m[3]}` : `${m[1]} ${m[2]}`;
+}
+
+/** La date d'un « DATE: 08/09/2026 », sans passer par le fuseau de la machine. */
+function dateDeBloc(brut) {
+  const m = String(brut ?? "").trim().match(/^date\s*:?\s*(\d{1,2})\s*[/.-]\s*(\d{1,2})\s*[/.-]\s*(\d{2,4})/i);
+  if (!m) return null;
+  const [, j, mo, a] = m;
+  const annee = a.length === 2 ? `20${a}` : a;
+  const iso = `${annee}-${String(mo).padStart(2, "0")}-${String(j).padStart(2, "0")}`;
+  const d = new Date(`${iso}T00:00:00Z`);
+  return Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== iso ? null : iso;
+}
+
+/**
+ * La forme normalisée d'une désignation, pour le RAPPROCHEMENT seulement.
+ *
+ * Le séparateur de dimensions s'unifie — 1800X2000, 1800*2000, 1800 × 2000 —
+ * mais uniquement ENTRE DEUX CHIFFRES. Sans cette borne, « TRX600 SCREW JACK »
+ * devenait « TR*600 » : on abîmait un nom de modèle au lieu de le rapprocher.
+ */
+function libelleNormalise(brut) {
+  return String(brut || "").toUpperCase()
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/(\d)\s*[*×X]\s*(?=\d)/g, "$1*")
+    .replace(/[()]/g, " ")
+    .replace(/[^A-Z0-9*+.-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** Quelle disposition cette feuille suit-elle ? On regarde, on ne suppose pas. */
+function detecterDisposition(classeur, nomFeuille) {
+  const feuille = classeur.Sheets[nomFeuille];
+  if (!feuille || !feuille["!ref"]) return null;
+  const plage = XLSX.utils.decode_range(feuille["!ref"]);
+  let em2s = 0, datee = 0;
+  for (let r = plage.s.r; r <= plage.e.r; r += 1) {
+    const a = texte(AA(feuille, r, COL_A));
+    if (DEBUT_BLOC.test(a)) em2s += 1;
+    else if (DEBUT_BLOC_DATE.test(a)) datee += 1;
+  }
+  if (em2s > 0 && em2s >= datee) return "EM2S";
+  if (datee > 0) return "DATEE";
+  return null;
+}
+
+function lireFeuilleReceptionDatee(classeur, nomFeuille, entrepot) {
+  const feuille = classeur.Sheets[nomFeuille];
+  if (!feuille || !feuille["!ref"]) return [];
+  const plage = XLSX.utils.decode_range(feuille["!ref"]);
+
+  /* Les colonnes annoncées, au niveau de la FEUILLE : un bloc qui ne les
+     réannonce pas hérite des dernières vues. */
+  let colQte = null, colUnite = null, colDesc = null;
+  const lireAnnonces = (r) => {
+    for (let c = plage.s.c; c <= plage.e.c; c += 1) {
+      const t = texte(AA(feuille, r, c)).toUpperCase();
+      if (!t) continue;
+      if (/^QUANTIT/.test(t)) colQte = c;
+      else if (/^UNIT/.test(t)) colUnite = c;
+      else if (ENTETE_ARTICLE.test(t) && colDesc === null) colDesc = c;
+    }
+  };
+
+  const debuts = [];
+  for (let r = plage.s.r; r <= plage.e.r; r += 1) {
+    if (dateDeBloc(texte(AA(feuille, r, COL_A)))) debuts.push(r);
+  }
+
+  return debuts.map((debut, i) => {
+    const fin = i + 1 < debuts.length ? debuts[i + 1] - 1 : plage.e.r;
+    for (let r = debut; r <= fin; r += 1) lireAnnonces(r);
+
+    const celluleDate = AA(feuille, debut, COL_A);
+    const date = dateDeBloc(texte(celluleDate));
+
+    /* Le véhicule : déclaré mais vide se distingue d'absent. Le premier dit
+       « le document prévoyait une plaque et ne l'a pas renseignée », le second
+       « le document n'en parle pas ». On ne confond pas les deux. */
+    let vehicule = null, vehiculeDeclare = false, celluleVehicule = null;
+    for (let r = debut; r <= fin && !vehiculeDeclare; r += 1) {
+      const t = texte(AA(feuille, r, COL_A));
+      const m = t.match(LIGNE_VEHICULE);
+      if (m && !extraireConteneur(t)) {
+        vehiculeDeclare = true;
+        vehicule = m[1].trim() || null;
+        celluleVehicule = XLSX.utils.encode_cell({ r, c: COL_A });
+      }
+    }
+
+    /* Le conteneur, où qu'il soit dans le bloc : il arrive parfois APRÈS les
+       articles, parfois sur la ligne de date. */
+    let conteneur = null, celluleConteneur = null;
+    for (let r = debut; r <= fin && !conteneur; r += 1) {
+      const c = extraireConteneur(texte(AA(feuille, r, COL_A)));
+      if (c) { conteneur = c; celluleConteneur = XLSX.utils.encode_cell({ r, c: COL_A }); }
+    }
+
+    const cd = colDesc == null ? COL_C : colDesc;
+    const lignes = [];
+    for (let r = debut; r <= fin; r += 1) {
+      const libelle = texte(AA(feuille, r, cd));
+      if (!libelle || ENTETE_ARTICLE.test(libelle) || extraireConteneur(libelle)) continue;
+      const q = colQte == null ? null : nombre(AA(feuille, r, colQte));
+      const unite = colUnite == null ? "" : texte(AA(feuille, r, colUnite)).toUpperCase();
+      lignes.push({
+        /* La désignation EXACTE du document, jamais réécrite. */
+        libelle,
+        libelleNorm: libelleNormalise(libelle),
+        unite: unite && !/^UNIT/.test(unite) ? unite : "",
+        quantite: q,
+        entrepot,
+        provenance: { feuille: nomFeuille, ligne: r + 1,
+                      cellule: XLSX.utils.encode_cell({ r, c: cd }) },
+      });
+    }
+
+    return {
+      entrepot, conteneur, date,
+      dateBrute: texte(celluleDate),
+      vehicule, vehiculeDeclare,
+      lignes,
+      disposition: "DATEE",
+      provenance: {
+        feuille: nomFeuille, ligneDebut: debut + 1, ligneFin: fin + 1,
+        celluleDate: XLSX.utils.encode_cell({ r: debut, c: COL_A }),
+        celluleConteneur, celluleVehicule,
+      },
+    };
+  });
+}
+
 function fusionnerReceptions(blocs) {
   const parConteneur = new Map();
 
@@ -252,6 +422,9 @@ function fusionnerReceptions(blocs) {
     if (!parConteneur.has(cle)) {
       parConteneur.set(cle, {
         conteneur: bloc.conteneur, date: bloc.date,
+        /* La plaque voyage avec la réception : sans elle, un litige sur une
+           livraison ne peut plus être remonté jusqu'au camion. */
+        vehicule: null, vehiculeDeclare: false,
         entrepots: [], lignes: [], blocs: [], anomalies: [],
       });
     }
@@ -270,6 +443,20 @@ function fusionnerReceptions(blocs) {
       fusion.date = bloc.date;
     }
 
+    /* Deux plaques pour un même conteneur : on garde la première et on le
+       signale. Un conteneur dépoté en deux fois a pu arriver sur deux camions —
+       c'est un fait, pas une erreur, mais personne ne doit le découvrir après
+       coup. */
+    if (bloc.vehiculeDeclare) fusion.vehiculeDeclare = true;
+    if (bloc.vehicule && !fusion.vehicule) fusion.vehicule = bloc.vehicule;
+    else if (bloc.vehicule && fusion.vehicule && bloc.vehicule !== fusion.vehicule) {
+      fusion.anomalies.push({
+        type: "RECEPTION_DIVERGENTE",
+        message: `Le conteneur ${cle} porte deux véhicules : « ${fusion.vehicule} » et « ${bloc.vehicule} ».`,
+        provenance: bloc.provenance,
+      });
+    }
+
     if (!fusion.entrepots.includes(bloc.entrepot)) fusion.entrepots.push(bloc.entrepot);
     fusion.lignes.push(...bloc.lignes);
     fusion.blocs.push(bloc.provenance);
@@ -280,11 +467,16 @@ function fusionnerReceptions(blocs) {
     entrepots: r.entrepots.sort(),
     fusionne: r.entrepots.length > 1,
     totalLignes: r.lignes.length,
-    totalQuantite: r.lignes.reduce((s, l) => s + l.quantite, 0),
+    /* Une quantité absente vaut zéro dans un TOTAL, jamais NaN : un total
+       illisible masquerait la ligne qui lui manque. Le compte des lignes sans
+       quantité est donné à côté, pour qu'on sache que le total est partiel. */
+    totalQuantite: r.lignes.reduce((s, l) => s + (Number(l.quantite) || 0), 0),
+    lignesSansQuantite: r.lignes.filter((l) => l.quantite == null).length,
     parEntrepot: r.entrepots.map((e) => ({
       entrepot: e,
       lignes: r.lignes.filter((l) => l.entrepot === e).length,
-      quantite: r.lignes.filter((l) => l.entrepot === e).reduce((s, l) => s + l.quantite, 0),
+      quantite: r.lignes.filter((l) => l.entrepot === e)
+        .reduce((s, l) => s + (Number(l.quantite) || 0), 0),
     })),
   }));
 }
@@ -451,23 +643,55 @@ function totauxCouleurs(lignes) {
  * calculée ici et accompagne chaque donnée produite, pour qu'on sache
  * toujours de quelle version du classeur vient une ligne.
  */
-function lireClasseur(buffer, { nomFichier = "classeur.xlsx" } = {}) {
+/**
+ * LE CLASSEUR, QUELLE QUE SOIT SA DISPOSITION.
+ *
+ * `plan` associe un nom de feuille à l'entrepôt de destination. Sans `plan`, on
+ * garde EXACTEMENT le comportement historique : W-EM2S-A → « A », W-EM2S-C →
+ * « C », lues avec le lecteur EM2S. Rien de ce qui marchait ne change.
+ *
+ * Avec un plan — par exemple { "WAREHOUSE-E": "W-EM2S-E" } — la disposition de
+ * chaque feuille est DÉTECTÉE, pas supposée : on compte ses marqueurs de bloc
+ * et on choisit le lecteur qui correspond. Un classeur mêlant les deux
+ * dispositions est donc lisible, et une feuille qu'aucun lecteur ne reconnaît
+ * est signalée au lieu d'être lue de travers.
+ *
+ * L'entrepôt vient du PLAN, jamais du nom de la feuille : c'est ce qui empêche
+ * « WAREHOUSE-E » de devenir un entrepôt. Le nom de la feuille est une
+ * indication de provenance, pas une destination.
+ */
+function lireClasseur(buffer, { nomFichier = "classeur.xlsx", plan = null } = {}) {
   const sha256 = crypto.createHash("sha256").update(buffer).digest("hex");
   /* `cellDates` est volontairement désactivé : on veut les numéros de série
      bruts, que `dateSimple` convertit sans passer par le fuseau de la machine. */
   const classeur = XLSX.read(buffer, { cellStyles: true, cellDates: false, type: "buffer" });
 
-  const blocsA = lireFeuilleReception(classeur, "W-EM2S-A", "A");
-  const blocsC = lireFeuilleReception(classeur, "W-EM2S-C", "C");
-  const receptions = fusionnerReceptions([...blocsA, ...blocsC]);
+  const planEffectif = plan || { "W-EM2S-A": "A", "W-EM2S-C": "C" };
+  const blocs = {}, dispositions = {}, feuillesIgnorees = [];
+  const tous = [];
+  for (const [nomFeuille, entrepot] of Object.entries(planEffectif)) {
+    if (!classeur.Sheets[nomFeuille]) { feuillesIgnorees.push({ feuille: nomFeuille, raison: "ABSENTE" }); continue; }
+    const disposition = detecterDisposition(classeur, nomFeuille);
+    dispositions[nomFeuille] = disposition;
+    if (!disposition) { feuillesIgnorees.push({ feuille: nomFeuille, raison: "DISPOSITION_INCONNUE" }); continue; }
+    const lus = disposition === "DATEE"
+      ? lireFeuilleReceptionDatee(classeur, nomFeuille, entrepot)
+      : lireFeuilleReception(classeur, nomFeuille, entrepot);
+    blocs[entrepot] = (blocs[entrepot] || 0) + lus.length;
+    tous.push(...lus);
+  }
+  const receptions = fusionnerReceptions(tous);
 
   const stock = lireFeuilleStock(classeur);
 
   return {
     fichier: { nom: nomFichier, sha256, taille: buffer.length },
     feuilles: classeur.SheetNames,
+    plan: planEffectif,
+    dispositions,
+    feuillesIgnorees,
     receptions: {
-      blocs: { A: blocsA.length, C: blocsC.length, total: blocsA.length + blocsC.length },
+      blocs: { ...blocs, total: tous.length },
       physiques: receptions.length,
       fusionnees: receptions.filter((r) => r.fusionne).length,
       liste: receptions,
@@ -486,6 +710,7 @@ module.exports = {
   COULEURS, ZONES_SANS_RACK, NIVEAUX_VALIDES,
   remplissage, compacter, estZoneSansRack, ligneEstZone, niveauNormalise,
   numeroConteneur, dateSimple, datesMultiples,
-  lireFeuilleReception, fusionnerReceptions, lireFeuilleStock,
+  extraireConteneur, dateDeBloc, libelleNormalise, detecterDisposition,
+  lireFeuilleReception, lireFeuilleReceptionDatee, fusionnerReceptions, lireFeuilleStock,
   totauxCouleurs, lireClasseur,
 };

@@ -65,14 +65,16 @@ function normaliserLibelle(libelle) {
  * cents fois pour un seul classeur.
  */
 async function chargerIndexProduits(client, companyId) {
-  const [{ rows: produits }, { rows: alias }] = await Promise.all([
-    client.query(`SELECT id, name FROM products WHERE company_id = $1`, [companyId]),
-    client.query(
-      `SELECT a.alias_norm, a.product_id, p.name
-         FROM product_import_aliases a
-         JOIN products p ON p.id = a.product_id AND p.company_id = a.company_id
-        WHERE a.company_id = $1`, [companyId]),
-  ]);
+  /* SÉQUENTIEL : un même client PostgreSQL n'exécute qu'une requête à la fois.
+     `Promise.all` sur un seul client les sérialise de toute façon, par un chemin
+     déprécié qui disparaîtra en pg@9 — et l'import casserait ce jour-là. */
+  const { rows: produits } = await client.query(
+    `SELECT id, name FROM products WHERE company_id = $1`, [companyId]);
+  const { rows: alias } = await client.query(
+    `SELECT a.alias_norm, a.product_id, p.name
+       FROM product_import_aliases a
+       JOIN products p ON p.id = a.product_id AND p.company_id = a.company_id
+      WHERE a.company_id = $1`, [companyId]);
 
   const parNom = new Map();
   for (const p of produits) {

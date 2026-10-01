@@ -46,77 +46,128 @@ class ReceptionError extends Error {
 }
 
 /* Entrepôt créé seulement s'il manque — jamais de doublon, aucun impact stock. */
-async function ensureWarehouse(client, companyId, code, name = null) {
-  const normalizedCompanyId =
-    Number(companyId || 0);
+/**
+ * La forme normalisée d'une désignation reçue, pour le RAPPROCHEMENT seulement.
+ *
+ * Le séparateur de dimensions s'unifie — 1800X2000, 1800*2000 — mais uniquement
+ * ENTRE DEUX CHIFFRES : sans cette borne, « TRX600 » devenait « TR*600 », et le
+ * pliage détruisait une référence technique au lieu de la rapprocher.
+ */
+function normaliserLibelleRecu(libelle) {
+  return String(libelle || "").toUpperCase()
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/(\d)\s*[*×X]\s*(?=\d)/g, "$1*")
+    .replace(/[()]/g, " ")
+    .replace(/[^A-Z0-9*+.-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim() || null;
+}
 
-  const normalizedCode =
-    String(code || "").trim();
+/** Le code d'un entrepôt, plié pour la comparaison. Le brut n'est jamais écrasé. */
+function normaliserCodeEntrepot(code) {
+  return String(code || "").toUpperCase()
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^A-Z0-9]+/g, "")
+    .trim();
+}
 
-  const normalizedName =
-    String(name || normalizedCode).trim();
+/**
+ * L'ENTREPÔT D'UNE RÉCEPTION — RÉSOLU, JAMAIS INVENTÉ.
+ *
+ * CE QUI A CHANGÉ, ET POURQUOI
+ *
+ * Cette fonction CRÉAIT un entrepôt quand le code n'était pas trouvé. Sur un
+ * import, cela produisait exactement le doublon qu'on cherche à éviter : une
+ * feuille nommée « WAREHOUSE-E » faisait naître un entrepôt « WAREHOUSE-E » à
+ * côté du vrai « W-EM2S-E », avec son propre stock, invisible à qui regarde la
+ * liste des entrepôts. Personne ne l'avait demandé, et rien ne le signalait.
+ *
+ * Créer un entrepôt est une décision d'organisation — on ouvre un bâtiment —
+ * et non la conséquence d'une faute de frappe dans un classeur. Le défaut est
+ * donc inversé : `createIfMissing` vaut FALSE par défaut. Un appelant qui a une
+ * raison légitime de créer passe `{ createIfMissing: true }` explicitement ;
+ * aucun appelant actuel n'en a.
+ *
+ * L'ORDRE DE RÉSOLUTION
+ *
+ *   1. le code exact, à la casse et aux espaces près ;
+ *   2. un ALIAS confirmé par une personne (`warehouse_import_aliases`), le
+ *      pendant exact de `product_import_aliases` pour les articles ;
+ *   3. sinon : on s'arrête, et l'erreur NOMME les entrepôts proches. Proposer
+ *      des candidats aide à trancher ; en choisir un à sa place fausserait un
+ *      stock réel.
+ */
+async function ensureWarehouse(client, companyId, code, name = null, options = {}) {
+  const { createIfMissing = false } = options;
+  const normalizedCompanyId = Number(companyId || 0);
+  const normalizedCode = String(code || "").trim();
+  const normalizedName = String(name || normalizedCode).trim();
 
   if (!normalizedCompanyId) {
-    throw new ReceptionError(
-      "Entreprise requise pour l'entrepôt",
-      "WAREHOUSE_COMPANY_REQUIRED",
-      400
-    );
+    throw new ReceptionError("Entreprise requise pour l'entrepôt",
+      "WAREHOUSE_COMPANY_REQUIRED", 400);
   }
-
   if (!normalizedCode) {
+    throw new ReceptionError("Code entrepôt obligatoire", "WAREHOUSE_CODE_REQUIRED", 400);
+  }
+
+  // 1. Le code, tel qu'il est écrit.
+  const found = (await client.query(
+    `SELECT * FROM warehouses
+      WHERE company_id = $1 AND UPPER(BTRIM(code)) = UPPER(BTRIM($2)) LIMIT 1`,
+    [normalizedCompanyId, normalizedCode]
+  )).rows[0];
+  if (found) return { warehouse: found, created: false, source: "code" };
+
+  // 2. Un alias confirmé par une personne.
+  const parAlias = (await client.query(
+    `SELECT w.*, a.alias, a.confirmed_by_name
+       FROM warehouse_import_aliases a
+       JOIN warehouses w ON w.id = a.warehouse_id AND w.company_id = a.company_id
+      WHERE a.company_id = $1 AND a.alias_norm = $2 LIMIT 1`,
+    [normalizedCompanyId, normaliserCodeEntrepot(normalizedCode)]
+  ).catch(() => ({ rows: [] }))).rows[0];
+  if (parAlias) {
+    return { warehouse: parAlias, created: false, source: "alias",
+             alias: parAlias.alias, confirmePar: parAlias.confirmed_by_name || null };
+  }
+
+  // 3. Rien trouvé. On nomme les candidats et on s'arrête.
+  if (!createIfMissing) {
+    const k = normaliserCodeEntrepot(normalizedCode);
+    const lettre = (normalizedCode.match(/([A-Z])\s*$/i) || [])[1];
+    const { rows: tous } = await client.query(
+      `SELECT id, code, name, location, status FROM warehouses
+        WHERE company_id = $1 ORDER BY code`, [normalizedCompanyId]);
+    /* « Proche » se mesure sur le code plié, et la lettre finale compte :
+       WAREHOUSE-E et W-EM2S-E se terminent tous deux par E. */
+    const proches = tous.filter((w) => {
+      const kw = normaliserCodeEntrepot(w.code);
+      if (!kw) return false;
+      if (kw.includes(k) || k.includes(kw)) return true;
+      return Boolean(lettre) && kw.endsWith(String(lettre).toUpperCase());
+    }).slice(0, 6);
     throw new ReceptionError(
-      "Code entrepôt obligatoire",
-      "WAREHOUSE_CODE_REQUIRED",
-      400
+      `Entrepôt « ${normalizedCode} » introuvable dans l'entreprise ${normalizedCompanyId}. `
+      + `Aucun entrepôt n'est créé automatiquement : enregistrez un alias vers un entrepôt `
+      + `existant, ou créez l'entrepôt volontairement.`
+      + (proches.length
+        ? ` Entrepôts proches : ${proches.map((w) => `#${w.id} ${w.code}`).join(", ")}.`
+        : ` Aucun entrepôt proche.`),
+      "WAREHOUSE_NOT_FOUND", 409,
+      { code: normalizedCode, candidats: proches }
     );
   }
 
-  const found = (
-    await client.query(
-      `SELECT *
-         FROM warehouses
-        WHERE company_id = $1
-          AND UPPER(BTRIM(code)) = UPPER($2)
-        LIMIT 1`,
-      [
-        normalizedCompanyId,
-        normalizedCode
-      ]
-    )
-  ).rows[0];
-
-  if (found) {
-    return {
-      warehouse: found,
-      created: false
-    };
-  }
-
-  const { rows } =
-    await client.query(
-      `INSERT INTO warehouses
-       (
-         code,
-         name,
-         status,
-         company_id,
-         created_at,
-         updated_at
-       )
-       VALUES ($1,$2,'active',$3,NOW(),NOW())
-       RETURNING *`,
-      [
-        normalizedCode,
-        normalizedName,
-        normalizedCompanyId
-      ]
-    );
-
-  return {
-    warehouse: rows[0],
-    created: true
-  };
+  /* Création volontaire, demandée explicitement par l'appelant. `status` suit
+     la convention de la table (« Actif »), et non « active » : un entrepôt créé
+     avec l'autre orthographe se serait rangé différemment dans les filtres. */
+  const { rows } = await client.query(
+    `INSERT INTO warehouses (code, name, status, company_id, created_at, updated_at)
+     VALUES ($1,$2,'Actif',$3,NOW(),NOW()) RETURNING *`,
+    [normalizedCode, normalizedName, normalizedCompanyId]
+  );
+  return { warehouse: rows[0], created: true, source: "creation" };
 }
 
 
@@ -200,11 +251,16 @@ async function createReception(pool, {
       const lw = await ensureWarehouse(client, companyId, l.warehouseCode || warehouseCode);
       await client.query(
         `INSERT INTO stock_reception_lines
-           (company_id, reception_id, line_no, received_label, product_id, match_status,
+           (company_id, reception_id, line_no, received_label, received_label_norm,
+            product_id, match_status,
             unit, quantity_received, excel_sheet, excel_row, notes,
             warehouse_id, warehouse_code)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
-        [companyId, reception.id, n, l.label, l.productId || null,
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+        /* `received_label` garde le texte EXACT du document ; la forme
+           normalisée vit à côté, pour pouvoir rejouer un rapprochement des mois
+           plus tard et voir pourquoi un libellé a été rapproché d'un produit. */
+        [companyId, reception.id, n, l.label, normaliserLibelleRecu(l.label),
+         l.productId || null,
          l.matchStatus || (l.productId ? MATCH_STATUS.MATCHED : MATCH_STATUS.REVIEW),
          l.unit || "EACH", l.quantity, l.sheet || null, l.excelRow || null, l.notes || null,
          lw.warehouse.id, lw.warehouse.code]
@@ -472,11 +528,13 @@ async function addReceptionLines(pool, { companyId, receptionId, lines = [], use
       const lw = await ensureWarehouse(client, companyId, l.warehouseCode || reception.warehouse_code);
       const row = (await client.query(
         `INSERT INTO stock_reception_lines
-           (company_id, reception_id, line_no, received_label, product_id, match_status,
+           (company_id, reception_id, line_no, received_label, received_label_norm,
+            product_id, match_status,
             unit, quantity_received, supplier_reference, notes, warehouse_id, warehouse_code,
             updated_by)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
-        [companyId, receptionId, n, String(l.label).trim(), l.productId || null,
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
+        [companyId, receptionId, n, String(l.label).trim(),
+         normaliserLibelleRecu(l.label), l.productId || null,
          l.productId ? MATCH_STATUS.MATCHED : MATCH_STATUS.REVIEW,
          l.unit || "EACH", qty, l.supplierReference || null, l.notes || null,
          lw.warehouse.id, lw.warehouse.code, user?.id || null]
@@ -873,7 +931,8 @@ async function receptionDashboard(runner, companyId) {
 
 module.exports = {
   RECEPTION_STATUS, STATUS_FR, MATCH_STATUS, SOURCE, SOURCE_FR, ReceptionError,
-  ensureWarehouse, createReception, putaway, receptionTotals, nextReceptionNumber,
+  ensureWarehouse, normaliserCodeEntrepot, normaliserLibelleRecu,
+  createReception, putaway, receptionTotals, nextReceptionNumber,
   suggestProducts, confirmLineProduct, createProductForLine, productReferenceFor,
   warehouseSummary, receptionDashboard,
   updateReception, addReceptionLines, updateReceptionLine, deleteReceptionLine,

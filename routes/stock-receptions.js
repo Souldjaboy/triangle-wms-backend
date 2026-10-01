@@ -31,6 +31,7 @@
 const express = require("express");
 const parser = require("../import-inventory/excel-inventory-parser");
 const R = require("../services/receptions");
+const IMP = require("../services/import-receptions-conteneurs");
 
 module.exports = function createStockReceptionsRouter(deps) {
   const { pool, authenticateToken, getEffectiveCompanyId, requirePermission, upload } = deps;
@@ -40,6 +41,29 @@ module.exports = function createStockReceptionsRouter(deps) {
   const canCreate = requirePermission("stock", "create");
   const canApply = requirePermission("stock", "validate");
   const userOf = (req) => ({ id: req.user.id, name: req.user.fullname || req.user.email, role: req.user.role });
+
+  /**
+   * Le plan feuille → entrepôt, s'il est fourni.
+   *
+   * Un plan vide ou illisible vaut ABSENCE de plan : on ne devine pas une
+   * destination à partir d'un JSON cassé, et le chemin historique reprend.
+   */
+  function lirePlan(req) {
+    const brut = req.body?.plan;
+    if (!brut) return null;
+    let objet = brut;
+    if (typeof brut === "string") {
+      try { objet = JSON.parse(brut); } catch { return null; }
+    }
+    if (!objet || typeof objet !== "object" || Array.isArray(objet)) return null;
+    const plan = {};
+    for (const [feuille, code] of Object.entries(objet)) {
+      const f = String(feuille || "").trim();
+      const c = String(code || "").trim();
+      if (f && c) plan[f] = c;
+    }
+    return Object.keys(plan).length ? plan : null;
+  }
 
   /* Regroupe les lignes Excel par (conteneur, date) : un conteneur déchargé sur
      plusieurs entrepôts reste UNE seule réception, ses lignes portant chacune
@@ -276,6 +300,25 @@ module.exports = function createStockReceptionsRouter(deps) {
       try {
         if (!req.file) return res.status(400).json({ error: "Aucun fichier reçu." });
         const companyId = companyOf(req);
+
+        /* UN PLAN DE FEUILLES change de lecteur, sans rien casser.
+           `{"WAREHOUSE-E":"W-EM2S-E"}` dit quelle feuille va dans quel entrepôt.
+           Sans plan, on garde exactement le chemin historique — le classeur EM2S
+           et ses colonnes. C'est le plan qui porte la destination : ainsi le nom
+           d'une feuille ne peut jamais devenir un entrepôt. */
+        const planFeuilles = lirePlan(req);
+        if (planFeuilles) {
+          const client = await pool.connect();
+          try {
+            const plan = await IMP.planifier(client, {
+              companyId, buffer: req.file.buffer,
+              nomFichier: req.file.originalname, plan: planFeuilles,
+            });
+            /* Preuve explicite : analyser ne touche aucun stock. */
+            return res.json({ ...plan, stockImpact: 0 });
+          } finally { client.release(); }
+        }
+
         const rows = parser.readReceptionSheets(req.file.buffer);
         const groups = await matchProducts(companyId, groupReceptions(rows));
 
@@ -323,6 +366,26 @@ module.exports = function createStockReceptionsRouter(deps) {
       try {
         if (!req.file) return res.status(400).json({ error: "Aucun fichier reçu." });
         const companyId = companyOf(req);
+
+        const planFeuilles = lirePlan(req);
+        if (planFeuilles) {
+          const client = await pool.connect();
+          let plan;
+          try {
+            plan = await IMP.planifier(client, {
+              companyId, buffer: req.file.buffer,
+              nomFichier: req.file.originalname, plan: planFeuilles,
+            });
+          } finally { client.release(); }
+          /* `dry_run` par défaut VRAI : un appel qui oublie de se prononcer ne
+             peut rien écrire. Écrire demande de le demander. */
+          const dryRun = String(req.body?.dry_run ?? "true") !== "false";
+          const out = await IMP.appliquer(pool, {
+            companyId, plan, utilisateur: userOf(req), dryRun,
+          });
+          return res.status(dryRun ? 200 : 201).json({ success: true, dryRun, plan: plan.totaux, ...out });
+        }
+
         const groups = await matchProducts(companyId, groupReceptions(parser.readReceptionSheets(req.file.buffer)));
         const created = [], skipped = [];
 
