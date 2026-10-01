@@ -44,14 +44,41 @@ const ETAT = {
   AMBIGUE: "AMBIGUE",
   BLOQUEE: "BLOQUEE",
 };
-/* Les décisions possibles sur un libellé d'article. */
+/* Les décisions possibles sur un libellé d'article. Des CODES stables, et un
+   libellé pour l'affichage : un rapport se lit, un code se compare. */
 const DECISION = {
   EXACT: "EXACT",
-  PROBABLE: "PROBABLE À CONFIRMER",
+  PROBABLE: "PROBABLE_A_CONFIRMER",
   AMBIGU: "AMBIGU",
-  A_CREER: "PRODUIT À CRÉER",
-  BLOQUE: "BLOQUÉ",
+  A_CREER: "A_CREER",
+  BLOQUE: "BLOQUE",
 };
+const DECISION_LIBELLE = {
+  EXACT: "correspondance exacte",
+  PROBABLE_A_CONFIRMER: "probable, à confirmer",
+  AMBIGU: "ambigu",
+  A_CREER: "produit à créer",
+  BLOQUE: "bloqué",
+};
+
+/* L'action proposée pour une réception. Elle DÉCOULE de l'état, sans jugement
+   supplémentaire : une divergence et une ambiguïté demandent toutes deux un
+   examen humain, et c'est le même mot. */
+const ACTION = {
+  SKIP_IDENTICAL: "SKIP_IDENTICAL",
+  CREATE: "CREATE",
+  COMPLETE: "COMPLETE",
+  BLOCKED: "BLOCKED",
+  REVIEW: "REVIEW",
+};
+const actionDe = (etat) => ({
+  [ETAT.IDENTIQUE]: ACTION.SKIP_IDENTICAL,
+  [ETAT.ABSENTE]: ACTION.CREATE,
+  [ETAT.INCOMPLETE]: ACTION.COMPLETE,
+  [ETAT.BLOQUEE]: ACTION.BLOCKED,
+  [ETAT.AMBIGUE]: ACTION.REVIEW,
+  [ETAT.DIVERGENTE]: ACTION.REVIEW,
+}[etat] || ACTION.REVIEW);
 
 const norm = (v) => DB.normaliserLibelle(v);
 /* Les nombres d'un libellé : « 1800 LEDGER » et « 1000 LEDGER » sont deux
@@ -194,6 +221,45 @@ function deciderProduit(index, produits, libelle, unites, historique) {
    LE PLAN — AUCUNE ÉCRITURE
    ══════════════════════════════════════════════════════════════════════════ */
 
+/* ══════════════════════════════════════════════════════════════════════════
+   LE SCHÉMA TEL QU'IL EST DÉPLOYÉ
+
+   Le diagnostic doit pouvoir tourner sur la production AVANT que la migration
+   102 y soit appliquée. Lire `vehicle_plate` ou `received_label_norm` sans
+   vérifier leur existence fait échouer l'analyse entière sur une colonne
+   absente — et obligerait à migrer pour obtenir un simple diagnostic, c'est-à-dire
+   à écrire pour pouvoir lire.
+
+   On demande donc au catalogue ce qui existe, et on n'interroge que cela. Ce
+   qui manque est signalé, jamais supposé.
+   ══════════════════════════════════════════════════════════════════════════ */
+async function colonnesDisponibles(client) {
+  const { rows } = await client.query(
+    `SELECT table_name, column_name FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND (table_name, column_name) IN (
+          ('stock_receptions','vehicle_plate'),
+          ('stock_reception_lines','received_label_norm'),
+          ('stock_import_operations','vehicle_plate'))`);
+  const a = new Set(rows.map((r) => `${r.table_name}.${r.column_name}`));
+  const { rows: tables } = await client.query(
+    `SELECT table_name FROM information_schema.tables
+      WHERE table_schema = 'public'
+        AND table_name IN ('warehouse_import_aliases','stock_import_operations',
+                           'stock_import_anomalies','product_import_aliases')`);
+  const t = new Set(tables.map((r) => r.table_name));
+  return {
+    vehiculeSurReception: a.has("stock_receptions.vehicle_plate"),
+    libelleNormSurLigne: a.has("stock_reception_lines.received_label_norm"),
+    vehiculeSurOperation: a.has("stock_import_operations.vehicle_plate"),
+    aliasEntrepots: t.has("warehouse_import_aliases"),
+    operations: t.has("stock_import_operations"),
+    anomalies: t.has("stock_import_anomalies"),
+    aliasProduits: t.has("product_import_aliases"),
+    migration102: a.has("stock_receptions.vehicle_plate") && t.has("warehouse_import_aliases"),
+  };
+}
+
 /** L'empreinte d'une réception existante : si elle change, le plan est périmé. */
 const empreinteReception = (reception, lignes) => crypto.createHash("sha256").update([
   reception.id, reception.status,
@@ -205,6 +271,7 @@ const empreinteReception = (reception, lignes) => crypto.createHash("sha256").up
 async function planifier(client, { companyId, buffer, nomFichier, plan }) {
   const lecture = P.lireClasseur(buffer, { nomFichier, plan });
   const sha = lecture.fichier.sha256;
+  const schema = await colonnesDisponibles(client);
   const entrepots = await resoudreEntrepots(client, { companyId, plan });
 
   /* SÉQUENTIEL, et non `Promise.all` : un même client PostgreSQL n'exécute
@@ -220,14 +287,18 @@ async function planifier(client, { companyId, buffer, nomFichier, plan }) {
     .catch(() => ({ rows: [] }));
   const historique = new Map(historiqueRows.map((h) => [Number(h.product_id), h.n]));
 
-  /* Les réceptions déjà enregistrées, et leurs lignes. */
+  /* Les réceptions déjà enregistrées, et leurs lignes. Les colonnes de la
+     migration 102 ne sont lues que si elles existent : le diagnostic doit
+     fonctionner sur le schéma déployé aujourd'hui. */
   const { rows: existantes } = await client.query(
     `SELECT id, reception_number, container_number, reception_date::text AS reception_date,
-            status, warehouse_code, vehicle_plate
+            status, warehouse_code
+            ${schema.vehiculeSurReception ? ", vehicle_plate" : ", NULL::text AS vehicle_plate"}
        FROM stock_receptions WHERE company_id = $1 AND container_number IS NOT NULL`,
     [companyId]);
   const { rows: lignesExistantes } = await client.query(
-    `SELECT l.id, l.reception_id, l.received_label, l.received_label_norm, l.product_id,
+    `SELECT l.id, l.reception_id, l.received_label, l.product_id,
+            ${schema.libelleNormSurLigne ? "l.received_label_norm" : "NULL::text AS received_label_norm"},
             l.quantity_received, l.quantity_putaway, l.unit, l.warehouse_code, l.match_status
        FROM stock_reception_lines l
        JOIN stock_receptions r ON r.id = l.reception_id
@@ -242,10 +313,12 @@ async function planifier(client, { companyId, buffer, nomFichier, plan }) {
     parConteneur.get(kc).push(r);
   }
 
-  /* Les clés d'idempotence déjà consommées : la base est le juge, pas le code. */
-  const { rows: dejaFaites } = await client.query(
+  /* Les clés d'idempotence déjà consommées : la base est le juge, pas le code.
+     Si la table n'existe pas encore, aucune clé n'a été consommée — ce qui est
+     la vérité, et non un repli. */
+  const { rows: dejaFaites } = schema.operations ? await client.query(
     `SELECT idempotency_key FROM stock_import_operations
-      WHERE company_id = $1 AND file_sha256 = $2`, [companyId, sha]).catch(() => ({ rows: [] }));
+      WHERE company_id = $1 AND file_sha256 = $2`, [companyId, sha]) : { rows: [] };
   const consommees = new Set(dejaFaites.map((o) => o.idempotency_key));
 
   /* Les décisions par libellé distinct, calculées une fois. */
@@ -384,7 +457,22 @@ async function planifier(client, { companyId, buffer, nomFichier, plan }) {
                      datesBase: memeConteneur.map((m) => m.reception_date) },
         });
       } else if (!existante) {
-        etat = ETAT.ABSENTE;
+        /* Une réception dont AUCUNE ligne n'est écrivable n'est pas « à créer » :
+           la créer vide enregistrerait un conteneur sans marchandise, et
+           personne ne verrait qu'il manque un chiffre. Elle est BLOQUÉE, et le
+           motif dit lequel. C'est le cas de TGBU 686373/0 : sa seule ligne,
+           « ÉTÉS DE FER », n'a pas de quantité dans le document. */
+        const ecrivables = lignesPlan.filter((l) => l.action === "A_CREER");
+        if (!ecrivables.length && lignesPlan.length) {
+          etat = ETAT.BLOQUEE;
+          const raisons = [...new Set(lignesPlan.filter((l) => l.action === "BLOQUEE")
+            .map((l) => l.raison))];
+          motifs.push(raisons.length
+            ? `aucune ligne écrivable — ${raisons.join(" ; ")}`
+            : "aucune ligne écrivable");
+        } else {
+          etat = ETAT.ABSENTE;
+        }
       } else {
         const lb = lignesDe(existante.id);
         const aCreer = lignesPlan.filter((l) => l.action === "A_CREER").length;
@@ -405,6 +493,7 @@ async function planifier(client, { companyId, buffer, nomFichier, plan }) {
 
     const lbExist = existante ? lignesDe(existante.id) : [];
     receptions.push({
+      action: actionDe(etat),
       conteneur: rec.conteneur, date: rec.date, vehicule: rec.vehicule,
       vehiculeDeclare: rec.vehiculeDeclare,
       feuille, entrepot: entrepot?.code || null, entrepotId: entrepot?.id || null,
@@ -430,6 +519,10 @@ async function planifier(client, { companyId, buffer, nomFichier, plan }) {
 
   return {
     fichier: lecture.fichier,
+    /* Ce que le schéma déployé sait faire : le rapport doit pouvoir dire
+       « la plaque ne sera pas enregistrée tant que la 102 n'est pas appliquée »
+       au lieu de laisser croire qu'elle l'a été. */
+    schema,
     plan, dispositions: lecture.dispositions, feuillesIgnorees: lecture.feuillesIgnorees,
     entrepots, receptions, anomalies,
     produits: [...decisions.values()],
@@ -459,6 +552,47 @@ async function planifier(client, { companyId, buffer, nomFichier, plan }) {
   };
 }
 
+/**
+ * CE QUE L'IMPORT FERAIT — déduit du plan seul, sans toucher la base.
+ *
+ * `appliquer(dryRun)` relit la base pour vérifier qu'elle n'a pas bougé ; c'est
+ * utile avant d'écrire, inutile pour un diagnostic — et surtout cela prend des
+ * connexions hors de la transaction en lecture seule, ce qui briserait la
+ * garantie qu'on vient d'établir. Un diagnostic se contente donc du plan.
+ */
+function simuler(plan) {
+  const parAction = (a) => plan.receptions.filter((r) => r.action === a);
+  const lignesACreer = (r) => r.lignes.filter((l) => l.action === "A_CREER");
+  const qte = (liste) => liste.reduce((s, r) =>
+    s + lignesACreer(r).reduce((t, l) => t + Number(l.quantite || 0), 0), 0);
+  const creer = parAction(ACTION.CREATE);
+  const completer = parAction(ACTION.COMPLETE);
+  return {
+    creerait: creer.map((r) => ({
+      conteneur: r.conteneur, date: r.date, entrepot: r.entrepot, vehicule: r.vehicule,
+      lignes: lignesACreer(r).length,
+      quantite: lignesACreer(r).reduce((s, l) => s + Number(l.quantite || 0), 0),
+    })),
+    completerait: completer.map((r) => ({
+      conteneur: r.conteneur, date: r.date, numero: r.existante?.numero || null,
+      dejaRange: r.existante?.range || 0,
+      lignes: lignesACreer(r).length,
+      quantite: lignesACreer(r).reduce((s, l) => s + Number(l.quantite || 0), 0),
+    })),
+    sauterait: [...parAction(ACTION.SKIP_IDENTICAL), ...parAction(ACTION.BLOCKED),
+                ...parAction(ACTION.REVIEW)].map((r) => ({
+      conteneur: r.conteneur, date: r.date, action: r.action,
+      raison: r.motifs.join(" ; ") || (r.action === ACTION.SKIP_IDENTICAL
+        ? "déjà présente et identique" : r.action),
+    })),
+    quantiteCreation: qte(creer),
+    quantiteCompletion: qte(completer),
+    /* Par construction, et non par prudence : l'import n'appelle jamais le
+       moteur de stock. */
+    impactStock: 0,
+  };
+}
+
 /* ══════════════════════════════════════════════════════════════════════════
    APPLIQUER — SEULEMENT CE QUE LE PLAN A NOMMÉ
    ══════════════════════════════════════════════════════════════════════════ */
@@ -481,6 +615,16 @@ async function planifier(client, { companyId, buffer, nomFichier, plan }) {
  */
 async function appliquer(pool, { companyId, plan, utilisateur = null, dryRun = true, batchId = null }) {
   const sha = plan.fichier.sha256;
+  /* Écrire sans la 102 écrirait À MOITIÉ : les réceptions passeraient, les
+     plaques non, et la trace d'idempotence serait incomplète. On refuse d'un
+     bloc plutôt que de laisser un import partiel derrière soi. */
+  if (!dryRun && plan.schema && !plan.schema.migration102) {
+    const e = new Error(
+      "La migration 102 n'est pas appliquée : la plaque du véhicule et les alias "
+      + "d'entrepôt n'existent pas encore. L'analyse fonctionne, l'écriture est refusée.");
+    e.code = "MIGRATION_102_REQUISE";
+    throw e;
+  }
   const resultat = { dryRun, creees: [], completees: [], sautees: [], impactStock: 0 };
   const q = async (texte, params = []) => (await pool.query(texte, params));
 
@@ -640,5 +784,7 @@ async function appliquer(pool, { companyId, plan, utilisateur = null, dryRun = t
   return resultat;
 }
 
-module.exports = { ETAT, DECISION, resoudreEntrepots, deciderProduit, planifier, appliquer,
+module.exports = { ETAT, DECISION, DECISION_LIBELLE, ACTION, actionDe, simuler,
+                   colonnesDisponibles,
+                   resoudreEntrepots, deciderProduit, planifier, appliquer,
                    empreinteReception, proximite };

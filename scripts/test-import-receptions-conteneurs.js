@@ -13,6 +13,7 @@ const { Pool } = require("pg");
 const IMP = require("../services/import-receptions-conteneurs");
 const P = require("../services/import-em2s");
 const R = require("../services/receptions");
+const LS = require("../services/lecture-seule");
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const FICHIER = process.env.CLASSEUR;
@@ -321,6 +322,95 @@ const compte = async () => (await q(
     new Set(fauxPlafond.map((p) => (p.produit || p.propose)?.id).filter(Boolean)).size
       <= fauxPlafond.filter((p) => p.decision === IMP.DECISION.EXACT).length,
     fauxPlafond.map((p) => `${p.libelle}→${p.decision}`).join(" | "));
+
+  // ═══════════════════════════════════════════════════════════════════════
+  console.log("\n⑭ LA LECTURE SEULE EST IMPOSÉE PAR POSTGRESQL, PAS PROMISE");
+  const preuve = await LS.prouverLeVerrou(pool);
+  v("PostgreSQL refuse une écriture dans la transaction (code 25006)",
+    preuve.refuseParPostgres === true, JSON.stringify(preuve));
+  v("le garde refuse même de l'envoyer", preuve.refuseParLeGarde === true);
+  v("les deux barrières tiennent", preuve.solide === true);
+  for (const [sql, attendu] of [
+    ["SELECT 1", true],
+    ["WITH a AS (SELECT 1) SELECT * FROM a", true],
+    ["INSERT INTO products(name) VALUES ('x')", false],
+    ["WITH a AS (INSERT INTO products(name) VALUES ('x') RETURNING *) SELECT * FROM a", false],
+    ["UPDATE products SET stock = 0", false],
+    ["DELETE FROM stock_receptions", false],
+    ["TRUNCATE products", false],
+    ["DROP TABLE products", false],
+    ["ALTER TABLE products ADD COLUMN z int", false],
+    ["CREATE TABLE z (x int)", false],
+    ["SET default_transaction_read_only = off", false],
+    ["SELECT 1; DROP TABLE products", false],
+  ]) {
+    let passe = true;
+    try { LS.examiner(sql); } catch { passe = false; }
+    v(`${attendu ? "accepté" : "refusé"} : ${sql.slice(0, 54)}`, passe === attendu);
+  }
+  /* Le plan complet, établi DANS la transaction en lecture seule. */
+  const avantLS = await compte();
+  const sortieLS = await LS.dansUneTransactionLectureSeule(pool, (clientRO) =>
+    IMP.planifier(clientRO, {
+      companyId: 1, buffer: fs.readFileSync(FICHIER),
+      nomFichier: "CONTENEUR RECEPTIONNER.xlsx", plan: PLAN,
+    }));
+  v("le diagnostic complet s'exécute en lecture seule",
+    sortieLS.resultat.receptions.length === 27, String(sortieLS.resultat.receptions.length));
+  v("et n'a envoyé que des lectures",
+    sortieLS.journal.every((r) => /^\s*(SELECT|WITH)\b/i.test(r)),
+    sortieLS.journal.filter((r) => !/^\s*(SELECT|WITH)\b/i.test(r)).join(" | "));
+  v("rien n'a été écrit", JSON.stringify(await compte()) === JSON.stringify(avantLS));
+
+  // ═══════════════════════════════════════════════════════════════════════
+  console.log("\n⑮ LE DIAGNOSTIC N'EXIGE PAS LA MIGRATION 102");
+  const clientS = await pool.connect();
+  let schema;
+  try { schema = await IMP.colonnesDisponibles(clientS); } finally { clientS.release(); }
+  v("le schéma de test porte bien la 102", schema.migration102 === true, JSON.stringify(schema));
+  v("le plan annonce l'état du schéma", plan.schema && plan.schema.migration102 === true);
+  /* On simule un schéma d'avant la 102 : l'écriture doit être refusée d'un bloc,
+     et non échouer au milieu en laissant un import partiel. */
+  const planVieux = { ...plan, schema: { ...plan.schema, migration102: false } };
+  let refus = null;
+  try {
+    await IMP.appliquer(pool, { companyId: 1, plan: planVieux, dryRun: false, utilisateur: UTIL });
+  } catch (e) { refus = e; }
+  v("sans la 102, l'écriture est refusée AVANT de commencer",
+    refus?.code === "MIGRATION_102_REQUISE", String(refus?.code));
+  v("et l'analyse, elle, reste possible",
+    (await IMP.simuler(planVieux)).impactStock === 0);
+
+  // ═══════════════════════════════════════════════════════════════════════
+  console.log("\n⑯ UNE RÉCEPTION SANS AUCUNE LIGNE ÉCRIVABLE EST BLOQUÉE");
+  const tgbu2 = plan.receptions.find((r) => /TGBU\s*686373/.test(r.conteneur || ""));
+  v("TGBU 686373/0 est BLOQUEE, pas « à créer »", tgbu2?.etat === IMP.ETAT.BLOQUEE, tgbu2?.etat);
+  v("son action est BLOCKED", tgbu2?.action === IMP.ACTION.BLOCKED, tgbu2?.action);
+  v("le motif nomme la quantité absente",
+    /quantité absente/.test(tgbu2.motifs.join(" ")), tgbu2.motifs.join(" "));
+  /* Deux conteneurs commencent par TGBU : 686373/0 est bloqué, 786252/7 est à
+     créer. On vise donc le numéro complet, pas le préfixe. */
+  v("la simulation ne créerait pas TGBU 686373/0",
+    !IMP.simuler(plan).creerait.some((c) => c.conteneur === tgbu2.conteneur),
+    IMP.simuler(plan).creerait.filter((c) => /TGBU/.test(c.conteneur))
+      .map((c) => c.conteneur).join(", "));
+  v("mais elle créerait bien TGBU 786252/7, qui n'a rien de bloquant",
+    IMP.simuler(plan).creerait.some((c) => /TGBU\s*786252/.test(c.conteneur)));
+  v("aucune réception vide n'a été créée en base",
+    (await q(`SELECT count(*)::int AS n FROM stock_receptions r
+               WHERE r.company_id=1 AND r.container_number LIKE 'TGBU 686373%'`))[0].n === 0);
+
+  // ═══════════════════════════════════════════════════════════════════════
+  console.log("\n⑰ LES ACTIONS PORTENT LES CODES ATTENDUS");
+  const codes = new Set(plan.receptions.map((r) => r.action));
+  v("aucun code d'action inattendu",
+    [...codes].every((c) => Object.values(IMP.ACTION).includes(c)), [...codes].join(", "));
+  const decisions = new Set(plan.produits.map((p) => p.decision));
+  v("aucun code de décision inattendu",
+    [...decisions].every((d) => Object.values(IMP.DECISION).includes(d)), [...decisions].join(", "));
+  v("les codes de décision sont ceux du cahier des charges",
+    IMP.DECISION.PROBABLE === "PROBABLE_A_CONFIRMER" && IMP.DECISION.A_CREER === "A_CREER"
+    && IMP.DECISION.BLOQUE === "BLOQUE");
 
   console.log(`\n${ko === 0 ? "✅" : "❌"} ${ok} réussis, ${ko} échoués\n`);
   await pool.end();
