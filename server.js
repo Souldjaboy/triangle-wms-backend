@@ -19073,7 +19073,9 @@ const hoteBiometrie = require("./biometrie/hote-triangle")({
 const biometrieTriangle = creerRouteurBiometrie({
   hote: hoteBiometrie,
   service: creerServiceBiometrie({ pool, hote: hoteBiometrie }),
-  passkeys: creerPasskeys({ pool, env: { WEBAUTHN_RP_NAME: "Triangle WMS Pro", ...process.env } }),
+  /* Nom affiché par l'appareil lors d'une passkey : Triangle, jamais le nom
+     par défaut du noyau commun — même si la variable est présente mais vide. */
+  passkeys: creerPasskeys({ pool, env: { ...process.env, WEBAUTHN_RP_NAME: process.env.WEBAUTHN_RP_NAME || "Triangle WMS Pro" } }),
   limiteur: createRateLimiter({
     windowMs: 60 * 1000, max: 60, message: "Trop de tentatives biométriques : patientez une minute.",
   }),
