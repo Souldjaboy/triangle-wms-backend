@@ -519,6 +519,31 @@ const requirePermission = permissionsService.creerRequirePermission(
   (req) => getEffectiveCompanyIdStrict(req, req.user?.company_id)
 );
 
+/* Débit des lectures de badge et des pointages biométriques, par IP et par
+   chemin : une caméra qui lit en boucle, ou quelqu'un qui essaie des jetons
+   au hasard, bute ici bien avant la base. 60 lectures par minute couvrent
+   largement la file d'arrivée d'un dépôt. */
+const { createRateLimiter } = require("./middleware/rateLimit");
+const limiteScanPointage = createRateLimiter({
+  windowMs: 60 * 1000,
+  max: Number(process.env.ATTENDANCE_SCAN_RATE_LIMIT || 60),
+  message: "Trop de lectures de badge. Patientez une minute.",
+});
+
+/** Réponse unique des deux anciennes routes de pointage retirées. */
+async function refuserAncienPointage(req, res, quoi) {
+  await logAudit(req, "attendance.legacy_refused", "attendance", null, {
+    route: quoi,
+    badge_fourni: Boolean(req.body?.badge_code),
+    cible: req.body?.user_id ? Number(req.body.user_id) || null : null,
+  });
+  return res.status(410).json({
+    error: "Cet ancien mode de pointage est retiré. Utilisez le pointage QR (badge v2), le pointage manuel ou la biométrie.",
+    code: "LEGACY_ATTENDANCE_RETIRED",
+    remplacement: "/attendance-v2/qr/scan",
+  });
+}
+
 /* Repli historique (utilisé UNIQUEMENT si aucune permission explicite n'est
    configurée pour l'utilisateur). `responsable_entrepot` est ajouté : ce rôle
    figure dans l'écran Permissions et devait pouvoir valider. */
@@ -14535,10 +14560,16 @@ app.get("/scan/resolve/:code", authenticateToken, async (req, res) => {
       });
     }
 
+    /* Ancien badge imprimé (`users.badge_code`) : on dit à qui il
+       appartient dans CETTE société, sans courriel ni identifiant — et
+       l'écran ne propose plus d'y pointer : ce code est séquentiel, donc
+       devinable. Seul le badge v2 (jeton aléatoire) vaut pointage. La
+       recherche par identifiant numérique (« 12 » → compte n° 12) est
+       retirée : elle permettait d'énumérer les comptes. */
     const userResult = await pool.query(
-      `SELECT id, fullname, email, role, badge_code, company_id
+      `SELECT id, fullname, role, badge_code
        FROM users
-       WHERE (badge_code=$1 OR CAST(id AS TEXT)=$1)
+       WHERE badge_code=$1
        AND company_id=$2
        LIMIT 1`,
       /* Cette requête partageait le tableau `values` de la recherche
@@ -14549,28 +14580,12 @@ app.get("/scan/resolve/:code", authenticateToken, async (req, res) => {
 
     if (userResult.rows.length > 0) {
       const employee = userResult.rows[0];
-      const todayResult = await pool.query(
-        `SELECT *
-         FROM attendance_records
-         WHERE user_id=$1 AND work_date=CURRENT_DATE
-         LIMIT 1`,
-        [employee.id]
-      );
-      const historyResult = await pool.query(
-        `SELECT *
-         FROM attendance_history
-         WHERE user_id=$1
-         ORDER BY id DESC
-         LIMIT 10`,
-        [employee.id]
-      );
-
       return res.json({
         type: "employee",
         code,
-        employee,
-        today: todayResult.rows[0] || null,
-        history: historyResult.rows
+        badge_obsolete: true,
+        avertissement: "Ancien badge imprimé : il ne permet plus de pointer. Utilisez le badge QR v2 de l'employé.",
+        employee: { fullname: employee.fullname, role: employee.role, badge_code: employee.badge_code },
       });
     }
 
@@ -15561,187 +15576,16 @@ app.get("/attendance/history/:userId", authenticateToken, async (req, res) => {
   }
 });
 
-app.post("/attendance/legacy/check", authenticateToken, async (req, res) => {
-  try {
-    const { user_id, action_type, device_info, ip_address, location_info } =
-      req.body;
-
-    if (!user_id || !action_type) {
-      return res.status(400).json({
-        error: "Utilisateur et type d'action obligatoires"
-      });
-    }
-
-    if (Number(user_id) !== Number(req.user.id) && !canViewAllSalaries(req.user)) {
-      return res.status(403).json({ error: "Accès refusé." });
-    }
-
-    const isSuperAdmin = req.user.is_super_admin === true;
-    const targetUserResult = await pool.query(
-      `SELECT id, company_id
-       FROM users
-       WHERE id=$1 ${isSuperAdmin ? "" : "AND company_id=$2"}
-       LIMIT 1`,
-      isSuperAdmin ? [user_id] : [user_id, req.user.company_id]
-    );
-
-    if (!targetUserResult.rows[0]) {
-      return res.status(404).json({ error: "Utilisateur introuvable" });
-    }
-
-    const existingResult = await pool.query(
-      `SELECT *
-       FROM attendance_records
-       WHERE user_id=$1 AND work_date=CURRENT_DATE
-       LIMIT 1`,
-      [user_id]
-    );
-
-    let attendance = existingResult.rows[0];
-
-    if (!attendance) {
-      const created = await pool.query(
-        `INSERT INTO attendance_records
-        (user_id, work_date, status)
-        VALUES ($1, CURRENT_DATE, 'Absent')
-        RETURNING *`,
-        [user_id]
-      );
-
-      attendance = created.rows[0];
-    }
-
-    let updateQuery = "";
-    let status = attendance.status || "Absent";
-
-    if (action_type === "ARRIVEE") {
-      if (attendance.check_in) {
-        return res.status(400).json({ error: "Arrivée déjà pointée" });
-      }
-
-      const now = new Date();
-      const startLimit = new Date();
-      startLimit.setHours(8, 0, 0, 0);
-
-      const lateMinutes = Math.max(
-        0,
-        Math.round((now.getTime() - startLimit.getTime()) / 60000)
-      );
-
-      status = lateMinutes > 0 ? "En retard" : "Présent";
-
-      updateQuery = `
-        UPDATE attendance_records
-        SET check_in=CURRENT_TIMESTAMP,
-            status=$1,
-            late_minutes=$2,
-            updated_at=CURRENT_TIMESTAMP
-        WHERE id=$3
-        RETURNING *
-      `;
-
-      attendance = (
-        await pool.query(updateQuery, [status, lateMinutes, attendance.id])
-      ).rows[0];
-    }
-
-    if (action_type === "DEPART_PAUSE") {
-      if (!attendance.check_in) {
-        return res.status(400).json({ error: "Arrivée non pointée" });
-      }
-
-      if (attendance.break_out) {
-        return res.status(400).json({ error: "Départ pause déjà pointé" });
-      }
-
-      attendance = (
-        await pool.query(
-          `UPDATE attendance_records
-           SET break_out=CURRENT_TIMESTAMP,
-               status='En pause',
-               updated_at=CURRENT_TIMESTAMP
-           WHERE id=$1
-           RETURNING *`,
-          [attendance.id]
-        )
-      ).rows[0];
-    }
-
-    if (action_type === "RETOUR_PAUSE") {
-      if (!attendance.break_out) {
-        return res.status(400).json({ error: "Départ pause non pointé" });
-      }
-
-      if (attendance.break_in) {
-        return res.status(400).json({ error: "Retour pause déjà pointé" });
-      }
-
-      attendance = (
-        await pool.query(
-          `UPDATE attendance_records
-           SET break_in=CURRENT_TIMESTAMP,
-               status='Présent',
-               updated_at=CURRENT_TIMESTAMP
-           WHERE id=$1
-           RETURNING *`,
-          [attendance.id]
-        )
-      ).rows[0];
-    }
-
-    if (action_type === "DEBAUCHE") {
-      if (!attendance.check_in) {
-        return res.status(400).json({ error: "Arrivée non pointée" });
-      }
-
-      if (attendance.check_out) {
-        return res.status(400).json({ error: "Débauche déjà pointée" });
-      }
-
-      const updated = await pool.query(
-        `UPDATE attendance_records
-         SET check_out=CURRENT_TIMESTAMP,
-             status='Terminé',
-             total_work_minutes = GREATEST(
-               0,
-               EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - check_in)) / 60
-             ),
-             updated_at=CURRENT_TIMESTAMP
-         WHERE id=$1
-         RETURNING *`,
-        [attendance.id]
-      );
-
-      attendance = updated.rows[0];
-    }
-
-    await pool.query(
-      `INSERT INTO attendance_history
-       (user_id, action_type, device_info, ip_address, location_info)
-       VALUES ($1,$2,$3,$4,$5)`,
-      [
-        user_id,
-        action_type,
-        device_info || "",
-        ip_address || "",
-        location_info || ""
-      ]
-    );
-
-    await logActivity(
-      "Utilisateur",
-      "pointage",
-      `Pointage ${action_type}`,
-      "Pointage",
-      `Utilisateur ID ${user_id} a effectué : ${action_type}`
-    );
-
-    res.json(attendance);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Erreur pointage" });
-  }
-});
+/* ANCIEN POINTAGE DIRECT (`attendance_records`) — RETIRÉ.
+ *
+ * Il écrivait dans l'ancienne table, à côté du moteur v2 : un pointage fait
+ * ici n'existait ni pour les périodes, ni pour la paie, ni pour l'historique
+ * v2, et il suffisait du droit « voir tous les salaires » pour pointer à la
+ * place d'un collègue. Aucun écran ne l'appelle plus. Le pointage passe par
+ * `/attendance-v2/…` (manuel, QR, biométrie), qui applique verrou,
+ * anti-rebond, périmètre d'opérateur et journal. */
+app.post("/attendance/legacy/check", limiteScanPointage, authenticateToken, (req, res) =>
+  refuserAncienPointage(req, res, "check"));
 
 /* PARAMÈTRES POINTAGE */
 app.get(
@@ -16459,49 +16303,115 @@ app.delete("/attendance/groups/:id", authenticateToken, authorizeRoles("admin", 
   }
 });
 
-/* AFFECTATION HORAIRE EMPLOYÉ */
-app.put("/attendance/assign-user/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
+/* AFFECTATION HORAIRE EMPLOYÉ
+ *
+ * Cette route n'avait AUCUN garde : sans même un jeton, n'importe qui
+ * réécrivait l'horaire et les taux de paie de n'importe quel compte, de
+ * n'importe quelle société, et recevait en retour la ligne `users` entière —
+ * hachage du mot de passe compris.
+ *
+ * Désormais : authentifiée ; droit `pointage|configure` ; les taux de paie
+ * exigent EN PLUS `paie|adjust` ; bornée à la société active (un compte
+ * d'ailleurs répond « introuvable », comme un compte inexistant) ; auditée ;
+ * réponse réduite aux seuls champs modifiés. Un champ absent du corps n'est
+ * plus remis à zéro : il garde sa valeur. */
+const TYPES_PAIEMENT_AFFECTATION = new Set(["horaire", "journalier", "mensuel", "forfait"]);
 
-    const { schedule_group_id, hourly_rate, daily_rate, payment_type } =
-      req.body;
+app.put(
+  "/attendance/assign-user/:id",
+  authenticateToken,
+  requirePermission("pointage", "configure"),
+  async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ error: "Employé invalide.", code: "USER_INVALID" });
+      }
+      const companyId = Number(getEffectiveCompanyIdStrict(req, req.user.company_id) || 0);
+      if (!companyId) {
+        return res.status(409).json({ error: "Aucune entreprise active.", code: "NO_ACTIVE_COMPANY" });
+      }
 
-    const result = await pool.query(
-      `UPDATE users
-       SET
-         schedule_group_id=$1,
-         hourly_rate=$2,
-         daily_rate=$3,
-         payment_type=$4
-       WHERE id=$5
-       RETURNING *`,
-      [
-        schedule_group_id,
-        hourly_rate || 0,
-        daily_rate || 0,
-        payment_type || "horaire",
-        id
-      ]
-    );
+      const corps = req.body || {};
+      const fourni = (cle) => Object.prototype.hasOwnProperty.call(corps, cle) && corps[cle] !== undefined;
 
-    await logActivity(
-      "Administrateur",
-      "pointage",
-      "Affectation horaire employé",
-      "Pointage",
-      `Employé ID ${id} affecté au groupe ${schedule_group_id}`
-    );
+      const taux = (cle) => {
+        if (!fourni(cle) || corps[cle] === null || corps[cle] === "") return null;
+        const n = Number(corps[cle]);
+        if (!Number.isFinite(n) || n < 0 || n > 100000000) {
+          const e = new Error(`Montant « ${cle} » invalide.`); e.code = "RATE_INVALID"; throw e;
+        }
+        return n;
+      };
+      let hourly, daily;
+      try { hourly = taux("hourly_rate"); daily = taux("daily_rate"); } catch (e) {
+        return res.status(400).json({ error: e.message, code: e.code });
+      }
+      const paymentType = fourni("payment_type") ? String(corps.payment_type || "").trim().toLowerCase() : null;
+      if (paymentType !== null && !TYPES_PAIEMENT_AFFECTATION.has(paymentType)) {
+        return res.status(400).json({ error: "Type de paiement invalide.", code: "PAYMENT_TYPE_INVALID" });
+      }
 
-    res.json(result.rows[0]);
-  } catch (error) {
-    console.error(error);
+      /* Toucher un taux, c'est toucher une paie : le droit de configurer un
+         horaire n'y suffit pas. */
+      const touchePaie = hourly !== null || daily !== null || paymentType !== null;
+      if (touchePaie && !isSuperAdminUser(req.user)) {
+        const ctx = await permissionsService.chargerContexte(pool, req.user, companyId);
+        if (!permissionsService.decider(ctx, "paie", "adjust").autorise) {
+          return res.status(403).json({
+            error: "Modifier un taux de paie exige le droit « paie › ajuster ».",
+            code: "PERMISSION_DENIED",
+          });
+        }
+      }
 
-    res.status(500).json({
-      error: "Erreur affectation employé"
-    });
+      let groupe = null;
+      const toucheGroupe = fourni("schedule_group_id");
+      if (toucheGroupe && corps.schedule_group_id !== null && corps.schedule_group_id !== "") {
+        groupe = Number(corps.schedule_group_id);
+        const { rows } = await pool.query(
+          `SELECT id FROM schedule_groups WHERE id = $1 AND company_id = $2`, [groupe, companyId]);
+        if (!Number.isInteger(groupe) || !rows[0]) {
+          return res.status(404).json({ error: "Groupe horaire introuvable.", code: "SCHEDULE_GROUP_NOT_FOUND" });
+        }
+      }
+
+      const result = await pool.query(
+        `UPDATE users
+            SET schedule_group_id = CASE WHEN $1::boolean THEN $2::integer ELSE schedule_group_id END,
+                hourly_rate  = COALESCE($3::numeric, hourly_rate),
+                daily_rate   = COALESCE($4::numeric, daily_rate),
+                payment_type = COALESCE($5::varchar, payment_type)
+          WHERE id = $6 AND company_id = $7
+          RETURNING id, schedule_group_id, hourly_rate, daily_rate, payment_type`,
+        [toucheGroupe, groupe, hourly, daily, paymentType, id, companyId]
+      );
+      if (!result.rows[0]) {
+        return res.status(404).json({ error: "Employé introuvable.", code: "USER_NOT_FOUND" });
+      }
+
+      await logAudit(req, "attendance.assign_user", "user", id, {
+        company_id: companyId,
+        schedule_group_id: toucheGroupe ? groupe : undefined,
+        hourly_rate: hourly ?? undefined,
+        daily_rate: daily ?? undefined,
+        payment_type: paymentType ?? undefined,
+      });
+      await logActivity(
+        req.user.fullname || req.user.email || "Utilisateur",
+        req.user.role || "",
+        "Affectation horaire employé",
+        "Pointage",
+        `Employé ID ${id} affecté au groupe ${toucheGroupe ? groupe : "inchangé"}`
+      );
+
+      res.json({ success: true, user: result.rows[0] });
+    } catch (error) {
+      console.error("assign-user :", error.message || error);
+      res.status(500).json({ error: "Erreur affectation employé" });
+    }
   }
-});
+);
 
 function assistantScope(user, values) {
   const isSuperAdmin =
@@ -18818,346 +18728,19 @@ app.post("/payments/create", authenticateToken, async (req, res) => {
   }
 });
 
-/* ATTENDANCE QR SCAN */
-app.post("/attendance/legacy/scan", authenticateToken, async (req, res) => {
-  try {
-    const { badge_code, action_type, latitude, longitude, accuracy } = req.body;
-
-    if (!badge_code) {
-      return res.status(400).json({
-        error: "Badge QR manquant"
-      });
-    }
-
-    const userResult = await pool.query(
-      `
-      SELECT *
-      FROM users
-      WHERE badge_code = $1
-      LIMIT 1
-      `,
-      [badge_code]
-    );
-
-    if (userResult.rows.length === 0) {
-      return res.status(404).json({
-        error: "Employé introuvable"
-      });
-    }
-
-    const user = userResult.rows[0];
-
-    const gpsSettingsResult = await pool.query(
-      `INSERT INTO attendance_gps_settings
-       (id, gps_required, site_name, allowed_radius_meters,
-        allow_remote_attendance, kiosk_mode, employee_scanner_access,
-        allow_out_of_zone_global)
-       VALUES (1, false, '', 100, false, true, false, false)
-       ON CONFLICT (id) DO UPDATE SET id=EXCLUDED.id
-       RETURNING *`
-    );
-    const gpsSettings = gpsSettingsResult.rows[0] || {};
-    const gpsRequired = gpsSettings.gps_required === true;
-    const allowRemoteAttendance = gpsSettings.allow_remote_attendance === true || gpsSettings.allow_out_of_zone_global === true;
-    const lat = latitude === "" || latitude === null || latitude === undefined ? null : Number(latitude);
-    const lon = longitude === "" || longitude === null || longitude === undefined ? null : Number(longitude);
-    const gpsAccuracy = accuracy === "" || accuracy === null || accuracy === undefined ? null : Number(accuracy);
-    const userAttendanceSettings = await pool.query(
-      `SELECT primary_attendance_site_id, employee_mobile, allow_out_of_zone
-       FROM attendance_settings
-       WHERE user_id=$1
-       LIMIT 1`,
-      [user.id]
-    );
-    const employeeMobile = user.employee_mobile === true || userAttendanceSettings.rows[0]?.employee_mobile === true;
-    const allowOutOfZoneForUser = user.allow_out_of_zone === true || userAttendanceSettings.rows[0]?.allow_out_of_zone === true;
-    const allowedSites = await getAllowedAttendanceSitesForUser({
-      ...user,
-      primary_attendance_site_id: user.primary_attendance_site_id || userAttendanceSettings.rows[0]?.primary_attendance_site_id
-    });
-
-    if (gpsRequired && (lat === null || lon === null || !Number.isFinite(lat) || !Number.isFinite(lon))) {
-      return res.status(403).json({
-        error: "Pointage refusé : localisation obligatoire."
-      });
-    }
-
-    if (gpsRequired && !employeeMobile && allowedSites.length === 0) {
-      return res.status(403).json({
-        error: "Pointage refusé : aucun site de pointage autorisé."
-      });
-    }
-
-    let distanceMeters = null;
-    let isInsideZone = null;
-    let detectedSite = null;
-    let allowedRadius = Number(gpsSettings.allowed_radius_meters || 100);
-    let gpsStatus = "accepté";
-
-    if (
-      lat !== null &&
-      lon !== null &&
-      Number.isFinite(lat) &&
-      Number.isFinite(lon)
-    ) {
-      for (const site of allowedSites) {
-        const siteLat = Number(site.latitude);
-        const siteLon = Number(site.longitude);
-        if (!Number.isFinite(siteLat) || !Number.isFinite(siteLon)) continue;
-
-        const distance = calculateDistanceMeters(siteLat, siteLon, lat, lon);
-        if (distanceMeters === null || distance < distanceMeters) {
-          distanceMeters = distance;
-          detectedSite = site;
-          allowedRadius = Number(site.rayon_autorise_metre || gpsSettings.allowed_radius_meters || 100);
-          isInsideZone = distance <= allowedRadius;
-        }
-      }
-    }
-
-    if (employeeMobile) {
-      gpsStatus = "mobile";
-      isInsideZone = isInsideZone === null ? true : isInsideZone;
-    } else if (isInsideZone) {
-      gpsStatus = "accepté";
-    } else if (gpsRequired && (allowRemoteAttendance || allowOutOfZoneForUser)) {
-      gpsStatus = "hors_zone_autorisé";
-    } else if (gpsRequired) {
-      gpsStatus = "refusé";
-    }
-
-    if (gpsRequired && !employeeMobile && !allowRemoteAttendance && !allowOutOfZoneForUser && !isInsideZone) {
-      return res.status(403).json({
-        error: "Pointage refusé : vous êtes hors de la zone autorisée.",
-        distance_meters: distanceMeters,
-        allowed_radius_meters: allowedRadius,
-        site_name: detectedSite?.nom_du_site || ""
-      });
-    }
-
-    await pool.query(
-      `
-      INSERT INTO attendance_settings
-      (
-        user_id,
-        schedule_group,
-        salary_type,
-        hourly_rate,
-        daily_salary,
-        monthly_salary,
-        start_time,
-        end_time
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-      ON CONFLICT (user_id)
-      DO NOTHING
-      `,
-      [user.id, "Standard", "horaire", 1000, 8000, 200000, "08:00", "17:00"]
-    );
-
-    const existing = await pool.query(
-      `
-        SELECT *
-        FROM attendance_records
-        WHERE user_id = $1
-        AND work_date = CURRENT_DATE
-        LIMIT 1
-        `,
-      [user.id]
-    );
-
-    let result;
-    let action = "";
-
-    if (action_type === "checkin") {
-      if (existing.rows.length === 0) {
-        result = await pool.query(
-          `
-          INSERT INTO attendance_records
-          (
-            user_id,
-            work_date,
-            check_in,
-            status
-          )
-          VALUES
-          (
-            $1,
-            CURRENT_DATE,
-            NOW(),
-            'Présent'
-          )
-          RETURNING *
-          `,
-          [user.id]
-        );
-      } else {
-        result = await pool.query(
-          `
-          UPDATE attendance_records
-          SET status = CASE
-              WHEN check_out IS NOT NULL THEN 'Terminé'
-              WHEN break_out IS NOT NULL AND break_in IS NULL THEN 'En pause'
-              ELSE 'Présent'
-            END,
-            updated_at = CURRENT_TIMESTAMP
-          WHERE user_id = $1
-          AND work_date = CURRENT_DATE
-          RETURNING *
-          `,
-          [user.id]
-        );
-      }
-
-      action = "Début travail";
-    } else if (action_type === "pause_start") {
-      if (existing.rows.length === 0 || !existing.rows[0].check_in) {
-        return res.status(400).json({ error: "Début travail non pointé" });
-      }
-
-      if (existing.rows[0].break_out) {
-        return res.status(400).json({ error: "Début pause déjà pointé" });
-      }
-
-      result = await pool.query(
-        `
-        UPDATE attendance_records
-        SET break_out = NOW(),
-            status = 'En pause',
-            updated_at = CURRENT_TIMESTAMP
-        WHERE user_id = $1
-        AND work_date = CURRENT_DATE
-        RETURNING *
-        `,
-        [user.id]
-      );
-
-      action = "Début pause";
-    } else if (action_type === "pause_end") {
-      if (existing.rows.length === 0 || !existing.rows[0].break_out) {
-        return res.status(400).json({ error: "Début pause non pointé" });
-      }
-
-      if (existing.rows[0].break_in) {
-        return res.status(400).json({ error: "Fin pause déjà pointée" });
-      }
-
-      result = await pool.query(
-        `
-        UPDATE attendance_records
-        SET break_in = NOW(),
-            status = 'Présent',
-            updated_at = CURRENT_TIMESTAMP
-        WHERE user_id = $1
-        AND work_date = CURRENT_DATE
-        RETURNING *
-        `,
-        [user.id]
-      );
-
-      action = "Fin pause";
-    } else if (action_type === "checkout") {
-      if (existing.rows.length === 0 || !existing.rows[0].check_in) {
-        return res.status(400).json({ error: "Début travail non pointé" });
-      }
-
-      if (existing.rows[0].check_out) {
-        return res.status(400).json({ error: "Fin travail déjà pointée" });
-      }
-
-      result = await pool.query(
-        `
-        UPDATE attendance_records
-        SET check_out = NOW(),
-            status = 'Terminé',
-            updated_at = CURRENT_TIMESTAMP
-        WHERE user_id = $1
-        AND work_date = CURRENT_DATE
-        RETURNING *
-        `,
-        [user.id]
-      );
-
-      action = "Fin travail";
-    } else {
-      return res.status(400).json({
-        error: "Action invalide"
-      });
-    }
-
-    const updatedAttendance = await pool.query(
-      `UPDATE attendance_records
-       SET latitude=$1,
-           longitude=$2,
-           accuracy=$3,
-           distance_meters=$4,
-           is_inside_zone=$5,
-           attendance_site_id=$6,
-           attendance_site_name=$7,
-           gps_status=$8,
-           updated_at=CURRENT_TIMESTAMP
-       WHERE id=$9
-       RETURNING *`,
-      [
-        lat,
-        lon,
-        gpsAccuracy,
-        distanceMeters,
-        isInsideZone,
-        detectedSite?.id || null,
-        detectedSite?.nom_du_site || (employeeMobile ? "Pointage mobile" : ""),
-        gpsStatus,
-        result.rows[0].id
-      ]
-    );
-
-    await pool.query(
-      `INSERT INTO attendance_history
-       (user_id, action_type, device_info, location_info,
-        latitude, longitude, accuracy, distance_meters, is_inside_zone,
-        attendance_site_id, attendance_site_name, gps_status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-      [
-        user.id,
-        action_type,
-        "QR",
-        lat !== null && lon !== null ? `${lat},${lon}` : "",
-        lat,
-        lon,
-        gpsAccuracy,
-        distanceMeters,
-        isInsideZone,
-        detectedSite?.id || null,
-        detectedSite?.nom_du_site || (employeeMobile ? "Pointage mobile" : ""),
-        gpsStatus
-      ]
-    );
-
-    res.json({
-      success: true,
-      user,
-      attendance: updatedAttendance.rows[0] || result.rows[0],
-      action,
-      gps: {
-        gps_required: gpsRequired,
-        site_name: detectedSite?.nom_du_site || (employeeMobile ? "Pointage mobile" : gpsSettings.site_name || ""),
-        site_id: detectedSite?.id || null,
-        distance_meters: distanceMeters,
-        allowed_radius_meters: allowedRadius,
-        is_inside_zone: isInsideZone,
-        allow_remote_attendance: allowRemoteAttendance || allowOutOfZoneForUser,
-        employee_mobile: employeeMobile,
-        gps_status: gpsStatus
-      }
-    });
-  } catch (error) {
-    console.error("ERREUR ATTENDANCE SCAN :", error);
-
-    res.status(500).json({
-      error: "Erreur scan QR"
-    });
-  }
-});
+/* ANCIEN SCAN PAR `users.badge_code` — RETIRÉ.
+ *
+ * Il cherchait `users.badge_code` — un code IMPRIMÉ, séquentiel, donc
+ * devinable — dans TOUTES les sociétés, pointait dans l'ancienne table, et
+ * renvoyait la ligne `users` complète (hachage du mot de passe compris) à
+ * quiconque possédait un jeton. Le badge v2 porte un jeton tiré au hasard ;
+ * son scan (`/attendance-v2/qr/scan`) est borné à la société active, exige
+ * `pointage.qr|scan`, respecte le périmètre d'opérateur et ne renvoie que le
+ * nom, le matricule et l'étape. La route reste déclarée pour répondre
+ * clairement (410) aux anciens postes au lieu d'un 404 muet, et chaque
+ * tentative est limitée en débit et journalisée. */
+app.post("/attendance/legacy/scan", limiteScanPointage, authenticateToken, (req, res) =>
+  refuserAncienPointage(req, res, "scan"));
 // ===================================================================
 // RBAC : permissions effectives de l'utilisateur courant.
 // PHASE 31 — propagation immédiate : le frontend interroge cet endpoint à
@@ -19416,6 +18999,7 @@ app.use(
    on ne transforme pas l'un en l'autre — mais un seul moteur d'écriture,
    partagé avec lui : le mode change qui déclenche, pas la règle métier. */
 const createAttendanceQrRouter = require("./routes/attendance-qr");
+app.post("/attendance-v2/qr/scan", limiteScanPointage);
 app.use(
   "/",
   createAttendanceQrRouter({ pool, authenticateToken, getEffectiveCompanyId, requirePermission })
