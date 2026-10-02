@@ -2638,22 +2638,7 @@ app.post("/login", async (req, res) => {
     const canSearchPhone = usersHasPhone && !looksLikeEmail && normalizedPhone !== "";
 
     const result = await pool.query(
-      `SELECT 
-        u.*,
-        c.name AS company_name,
-        c.status AS company_status,
-        c.account_status AS company_account_status,
-        c.email_verified AS company_email_verified,
-        c.phone_verified AS company_phone_verified,
-        c.trial_end_date AS company_trial_end_date,
-        c.subscription_expires_at AS company_subscription_expires_at,
-        s.status AS subscription_status,
-        s.end_date AS subscription_end_date,
-        sp.name AS plan_name
-       FROM users u
-       LEFT JOIN companies c ON u.company_id = c.id
-       LEFT JOIN subscriptions s ON c.id = s.company_id
-       LEFT JOIN subscription_plans sp ON s.plan_id = sp.id
+      `${SELECT_UTILISATEUR_CONNEXION}
        WHERE LOWER(u.email) = LOWER($1)
           ${canSearchPhone ? "OR u.phone_normalise = $2" : ""}
        ORDER BY s.id DESC
@@ -2688,6 +2673,54 @@ app.post("/login", async (req, res) => {
         await hashPassword(password),
         user.id
       ]);
+    }
+
+    return finaliserConnexion(req, res, user, "mot_de_passe");
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erreur login SaaS" });
+  }
+});
+
+/* ═══════════════════════════════════════════════════════════════════════
+   FINALISER UNE CONNEXION — commun au mot de passe et à la passkey.
+
+   Une passkey prouve QUI se connecte ; elle ne dispense de rien d'autre.
+   Version (tenant), compte désactivé, vérification, société suspendue,
+   abonnement : exactement les mêmes contrôles que le mot de passe, dans le
+   même ordre, avec les mêmes réponses. Le jeton et les cookies sont posés au
+   même endroit. `methode` est journalisée.
+   ═══════════════════════════════════════════════════════════════════════ */
+const SELECT_UTILISATEUR_CONNEXION = `SELECT
+        u.*,
+        c.name AS company_name,
+        c.status AS company_status,
+        c.account_status AS company_account_status,
+        c.email_verified AS company_email_verified,
+        c.phone_verified AS company_phone_verified,
+        c.trial_end_date AS company_trial_end_date,
+        c.subscription_expires_at AS company_subscription_expires_at,
+        s.status AS subscription_status,
+        s.end_date AS subscription_end_date,
+        sp.name AS plan_name
+       FROM users u
+       LEFT JOIN companies c ON u.company_id = c.id
+       LEFT JOIN subscriptions s ON c.id = s.company_id
+       LEFT JOIN subscription_plans sp ON s.plan_id = sp.id`;
+
+async function finaliserConnexion(req, res, user, methode = "mot_de_passe") {
+  try {
+    const normalizedEmail = String(user.email || "").trim().toLowerCase();
+    const tenantId = getTenantFromRequest(req);
+
+    if (!(await companyBelongsToTenant(user.company_id, tenantId))) {
+      return res.status(403).json({
+        error: "Accès refusé : ce compte n’appartient pas à cette version."
+      });
+    }
+
+    if (user.is_active === false) {
+      return res.status(403).json({ error: "Compte désactivé" });
     }
 
     const isSuperAdmin =
@@ -2785,14 +2818,14 @@ app.post("/login", async (req, res) => {
       user.role,
       "Connexion utilisateur",
       "Authentification",
-      `${user.fullname} s'est connecté`
+      `${user.fullname} s'est connecté${methode === "passkey" ? " (passkey)" : ""}`
     );
     await logAudit(
       { ...req, user: { id: user.id, email: user.email, role: user.role, company_id: user.company_id } },
       "login",
       "user",
       user.id,
-      { email: user.email }
+      { email: user.email, methode }
     );
 
     const companyModules = isSuperAdmin ? await getCompanyModules(null) : await getCompanyModules(user.company_id);
@@ -2823,10 +2856,18 @@ app.post("/login", async (req, res) => {
       }
     });
   } catch (error) {
-    console.error(error);
+    console.error("finaliserConnexion :", error.message || error);
     res.status(500).json({ error: "Erreur login SaaS" });
   }
-});
+}
+
+/** Connexion d'un compte désigné par son identifiant (passkey). */
+async function finaliserConnexionParId(req, res, userId, methode) {
+  const { rows } = await pool.query(
+    `${SELECT_UTILISATEUR_CONNEXION} WHERE u.id = $1 ORDER BY s.id DESC LIMIT 1`, [Number(userId)]);
+  if (!rows[0]) return res.status(401).json({ error: "Compte introuvable.", code: "COMPTE_INTROUVABLE" });
+  return finaliserConnexion(req, res, rows[0], methode);
+}
 
 app.get("/support/config", async (req, res) => {
   res.json({
