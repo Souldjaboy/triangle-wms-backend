@@ -149,9 +149,18 @@ const enMinutes = (heure) => {
 /**
  * @param {object} p
  * @param {string} p.source 'QR' | 'MANUEL' | 'IMPORT' | 'CORRECTION_ADMINISTRATIVE'
+ *                          | 'VISAGE' | 'EMPREINTE' | 'PASSKEY_CONFIRMATION'
+ * @param {number} [p.deviceId]           appareil biométrique déclaré (biometric_devices)
+ * @param {number} [p.biometricScore]     score de correspondance, obligatoire pour VISAGE / EMPREINTE
+ * @param {string} [p.biometricProvider]  fournisseur qui a calculé ce score
+ * @param {number} [p.challengeId]        défi à usage unique consommé par la vérification
+ * @param {object} [p.metadata]           contexte sans donnée sensible (jamais de gabarit ni d'image)
  * @returns {{record:object, action:string, late:number, employee:object}}
  */
-async function enregistrerPointage(client, { companyId, employee, day, action, user, source }) {
+async function enregistrerPointage(client, {
+  companyId, employee, day, action, user, source,
+  deviceId = null, biometricScore = null, biometricProvider = null, challengeId = null, metadata = null,
+}) {
   const acte = assertAction(action);
 
   if (new Date() < new Date(employee.official_start_at)) {
@@ -208,10 +217,13 @@ async function enregistrerPointage(client, { companyId, employee, day, action, u
 
   await client.query(
     `INSERT INTO attendance_event_log_v2
-       (company_id, employee_id, record_id, action_type, event_at, performed_by, performed_by_name, source)
-     VALUES ($1,$2,$3,$4,now(),$5,$6,$7)`,
+       (company_id, employee_id, record_id, action_type, event_at, performed_by, performed_by_name, source,
+        device_id, biometric_score, biometric_provider, challenge_id, metadata)
+     VALUES ($1,$2,$3,$4,now(),$5,$6,$7,$8,$9,$10,$11,$12::jsonb)`,
     [companyId, employee.id, record.id, acte, user?.id || null,
-     user?.fullname || user?.email || "", String(source || "MANUEL")]
+     user?.fullname || user?.email || "", String(source || "MANUEL"),
+     deviceId || null, biometricScore ?? null, biometricProvider || null, challengeId || null,
+     JSON.stringify(metadata && typeof metadata === "object" ? metadata : {})]
   );
 
   return { record: misAJour[0], action: acte, late, employee };

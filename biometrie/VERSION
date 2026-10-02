@@ -1,0 +1,9 @@
+noyau-biometrie 1.1.0 — 2026-10-02
+Copie identique dans MaliLink, Triangle WMS et HAFIYA : core/, crypto/,
+providers/, routes.js, passkeys.js. Seul l'adaptateur hote-<système>.js
+diffère. Toute évolution du noyau se recopie dans les trois dépôts, avec
+les tests unitaires (tests/biometrie.unit.test.js).
+
+1.1.0 : « soi » reconnu pour un sujet employé rattaché à un compte
+(`compteId` fourni par l'hôte ; `hote.compteDuSujet` optionnel pour les
+lignes enregistrées). Sans effet pour MaliLink et HAFIYA (sujets comptes).

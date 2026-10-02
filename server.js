@@ -73,7 +73,14 @@ app.use(
   })
 );
 
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({
+  limit: "1mb",
+  /* Corps brut conservé pour la SEULE route signée par les terminaux
+     biométriques : la signature HMAC porte sur les octets reçus. */
+  verify: (req, res, buf) => {
+    if (String(req.originalUrl || req.url || "").includes("/biometrics/devices/events")) req.rawBody = Buffer.from(buf);
+  },
+}));
 
 app.use((req, res, next) => {
   if (req.url.startsWith("/api/")) {
@@ -19004,6 +19011,33 @@ app.use(
   "/",
   createAttendanceQrRouter({ pool, authenticateToken, getEffectiveCompanyId, requirePermission })
 );
+
+/* Biométrie (visage, empreinte) et passkeys : noyau commun aux trois
+   systèmes (biometrie/), adaptateur Triangle (biometrie/hote-triangle.js).
+   Sujets = fiches employés ; pointage = moteur v2, comme le QR et le manuel.
+   Gabarits chiffrés par BIOMETRIC_ENC_KEY (refus sans clé, aucun repli) ;
+   passkeys : WEBAUTHN_RP_ID / WEBAUTHN_ORIGINS. Toutes les modalités sont
+   fermées par défaut (biometric_settings). */
+const { creerServiceBiometrie } = require("./biometrie/core/service");
+const { creerPasskeys } = require("./biometrie/passkeys");
+const { creerRouteurBiometrie } = require("./biometrie/routes");
+const hoteBiometrie = require("./biometrie/hote-triangle")({
+  pool, authenticateToken, getEffectiveCompanyIdStrict, isSuperAdminUser, permissionsService,
+  attendance: require("./services/attendance-workforce"), logAudit,
+  /* Connexion par passkey : mêmes contrôles que le mot de passe
+     (finaliserConnexion, plus haut). Appel différé : aucune dépendance à
+     l'ordre de déclaration. */
+  finaliserConnexionParId: (req, res, userId, methode) => finaliserConnexionParId(req, res, userId, methode),
+});
+const biometrieTriangle = creerRouteurBiometrie({
+  hote: hoteBiometrie,
+  service: creerServiceBiometrie({ pool, hote: hoteBiometrie }),
+  passkeys: creerPasskeys({ pool, env: { WEBAUTHN_RP_NAME: "Triangle WMS Pro", ...process.env } }),
+  limiteur: createRateLimiter({
+    windowMs: 60 * 1000, max: 60, message: "Trop de tentatives biométriques : patientez une minute.",
+  }),
+});
+app.use("/", biometrieTriangle.router);
 
 /* Périodes du 25 au 24, validation du pointage et chemin d'une paie jusqu'au
    bon signé. Le passage par la Direction n'est pas une consigne : la route de
