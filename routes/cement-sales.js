@@ -1428,6 +1428,30 @@ module.exports = function createCementSalesRouter({
     }
   });
 
+  router.patch("/cement/proformas/:id", authenticateToken, cementModuleGuard, perm("update"), async (req,res) => {
+    const client = await pool.connect();
+    try {
+      const companyId=companyOf(req), b=req.body||{}, lines=Array.isArray(b.lines)?b.lines:[];
+      await client.query("BEGIN");
+      const old=(await client.query(`SELECT * FROM cement_proformas WHERE id=$1 AND company_id=$2 FOR UPDATE`,[req.params.id,companyId])).rows[0];
+      if(!old){ await client.query("ROLLBACK"); return res.status(404).json({error:"Proforma introuvable."}); }
+      if(old.status!=="BROUILLON"){ await client.query("ROLLBACK"); return res.status(409).json({error:"Seule une proforma en brouillon peut être modifiée."}); }
+      if(!lines.length){ await client.query("ROLLBACK"); return res.status(400).json({error:"Ajoutez au moins une ligne."}); }
+      let customer=null;
+      if(b.customer_id) customer=(await client.query(`SELECT * FROM cement_customers WHERE id=$1 AND company_id=$2`,[b.customer_id,companyId])).rows[0]||null;
+      const customerName=txt(b.customer_name)||txt(customer?.name)||old.customer_name;
+      let subtotal=0;
+      const normalized=lines.map((line,i)=>{ const quantity=positive(line.quantity),unit_price=positive(line.unit_price),line_total=quantity*unit_price; subtotal+=line_total; return {line_type:txt(line.line_type||"AUTRE"),description:txt(line.description),quantity,unit:txt(line.unit||"unité"),unit_price,line_total,sort_order:Number(line.sort_order??i)}; });
+      if(normalized.some(x=>!x.description)){ await client.query("ROLLBACK"); return res.status(400).json({error:"Toutes les lignes doivent avoir une désignation."}); }
+      const discount=positive(b.discount),taxAmount=positive(b.tax_amount),totalAmount=Math.max(subtotal-discount+taxAmount,0);
+      const updated=(await client.query(`UPDATE cement_proformas SET customer_id=$3,customer_name=$4,customer_phone=$5,customer_address=$6,destination=$7,valid_until=$8,subtotal=$9,discount=$10,tax_amount=$11,total_amount=$12,notes=$13,updated_at=NOW() WHERE id=$1 AND company_id=$2 RETURNING *`,[old.id,companyId,b.customer_id||null,customerName,txt(b.customer_phone)||txt(customer?.phone)||old.customer_phone||null,txt(b.customer_address)||txt(customer?.address)||old.customer_address||null,txt(b.destination)||null,b.valid_until||null,subtotal,discount,taxAmount,totalAmount,txt(b.notes)||null])).rows[0];
+      await client.query(`DELETE FROM cement_proforma_lines WHERE proforma_id=$1 AND company_id=$2`,[old.id,companyId]);
+      for(const line of normalized) await client.query(`INSERT INTO cement_proforma_lines(company_id,proforma_id,line_type,description,quantity,unit,unit_price,line_total,sort_order) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,[companyId,old.id,line.line_type,line.description,line.quantity,line.unit,line.unit_price,line.line_total,line.sort_order]);
+      await audit(client,req,"UPDATE","cement_proforma",old.id,old.proforma_number,old,updated);
+      await client.query("COMMIT"); res.json({...updated,lines:normalized});
+    } catch(e){ await client.query("ROLLBACK").catch(()=>{}); console.error(e); res.status(500).json({error:"Erreur modification proforma."}); } finally { client.release(); }
+  });
+
   router.post("/cement/proformas/:id/validate", authenticateToken, cementModuleGuard, perm("validate"), async (req,res) => {
     const client = await pool.connect();
     try {
@@ -1474,6 +1498,30 @@ module.exports = function createCementSalesRouter({
     } finally {
       client.release();
     }
+  });
+
+  router.post("/cement/proformas/:id/convert-to-invoice", authenticateToken, cementModuleGuard, perm("validate"), async (req,res) => {
+    const client=await pool.connect();
+    try {
+      const companyId=companyOf(req); await client.query("BEGIN");
+      const p=(await client.query(`SELECT * FROM cement_proformas WHERE id=$1 AND company_id=$2 FOR UPDATE`,[req.params.id,companyId])).rows[0];
+      if(!p){ await client.query("ROLLBACK"); return res.status(404).json({error:"Proforma introuvable."}); }
+      if(p.converted_invoice_id || p.status==="FACTUREE"){
+        const existing=p.converted_invoice_id?(await client.query(`SELECT * FROM cement_invoices WHERE id=$1 AND company_id=$2`,[p.converted_invoice_id,companyId])).rows[0]:null;
+        await client.query("ROLLBACK"); return res.status(409).json({error:"Cette proforma a déjà été transformée en facture.",invoice:existing||null});
+      }
+      if(!["VALIDEE","ACCEPTEE"].includes(p.status)){ await client.query("ROLLBACK"); return res.status(409).json({error:"Validez d'abord la proforma avant de la transformer en facture."}); }
+      const existing=(await client.query(`SELECT * FROM cement_invoices WHERE company_id=$1 AND proforma_id=$2 LIMIT 1`,[companyId,p.id])).rows[0];
+      if(existing){ await client.query(`UPDATE cement_proformas SET status='FACTUREE',converted_invoice_id=$3,converted_by=$4,converted_at=COALESCE(converted_at,NOW()),updated_at=NOW() WHERE id=$1 AND company_id=$2`,[p.id,companyId,existing.id,req.user.id]); await client.query("COMMIT"); return res.status(409).json({error:"Cette proforma a déjà été transformée en facture.",invoice:existing}); }
+      const invoiceNumber=await nextNumber(client,companyId,"FAC-CIM");
+      let terms=0; if(p.customer_id){ const cr=await client.query(`SELECT payment_terms_days FROM cement_customers WHERE id=$1 AND company_id=$2`,[p.customer_id,companyId]); terms=Math.max(parseInt(cr.rows[0]?.payment_terms_days||0,10)||0,0); }
+      const invoice=(await client.query(`INSERT INTO cement_invoices(company_id,sale_id,proforma_id,customer_id,invoice_number,operation_reference,invoice_date,due_date,destination,total_amount,paid_amount,remaining_amount,status,notes,created_by,validated_by,validated_at) VALUES($1,NULL,$2,$3,$4,$5,CURRENT_DATE,CURRENT_DATE+($6::int*INTERVAL '1 day'),$7,$8,0,$8,'IMPAYEE',$9,$10,$10,NOW()) RETURNING *`,[companyId,p.id,p.customer_id,invoiceNumber,p.proforma_number,terms,p.destination,p.total_amount,p.notes,req.user.id])).rows[0];
+      const lines=(await client.query(`SELECT * FROM cement_proforma_lines WHERE company_id=$1 AND proforma_id=$2 ORDER BY sort_order,id`,[companyId,p.id])).rows;
+      for(const line of lines) await client.query(`INSERT INTO cement_invoice_lines(company_id,invoice_id,description,quantity,unit,unit_price,line_total,sort_order) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,[companyId,invoice.id,line.description,line.quantity,line.unit,line.unit_price,line.line_total,line.sort_order]);
+      await client.query(`UPDATE cement_proformas SET status='FACTUREE',converted_invoice_id=$3,converted_by=$4,converted_at=NOW(),updated_at=NOW() WHERE id=$1 AND company_id=$2`,[p.id,companyId,invoice.id,req.user.id]);
+      await audit(client,req,"CONVERT_TO_INVOICE","cement_proforma",p.id,p.proforma_number,p,{invoice_id:invoice.id,invoice_number:invoice.invoice_number});
+      await client.query("COMMIT"); res.status(201).json({invoice});
+    } catch(e){ await client.query("ROLLBACK").catch(()=>{}); console.error(e); if(e?.code==="23505") return res.status(409).json({error:"Cette proforma a déjà été transformée en facture."}); res.status(500).json({error:"Erreur transformation en facture."}); } finally { client.release(); }
   });
 
   router.get("/cement/deliveries", authenticateToken, cementModuleGuard, perm("view"), async (req,res) => {
