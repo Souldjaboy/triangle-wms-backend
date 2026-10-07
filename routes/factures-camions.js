@@ -86,6 +86,31 @@ module.exports = function createFacturesCamionsRouter(deps) {
     } catch (e) { console.error("camions create:", e); res.status(500).json({ error: "Erreur création camion." }); }
   });
 
+  // Modification d'un camion existant : l'ID ne change jamais, donc l'historique reste lié.
+  router.patch("/camions/:id", authenticateToken, perm("comptabilite", "update"), async (req, res) => {
+    try {
+      const companyId = companyOf(req), b = req.body || {};
+      const current = (await pool.query(`SELECT * FROM camions WHERE id=$1 AND company_id=$2`, [req.params.id, companyId])).rows[0];
+      if (!current) return res.status(404).json({ error: "Camion introuvable." });
+      const code = b.code === undefined ? current.code : String(b.code || "").trim();
+      if (!code) return res.status(400).json({ error: "Code camion requis." });
+      const { rows } = await pool.query(
+        `UPDATE camions SET code=$3,immatriculation=$4,chauffeur=$5,statut=$6,notes=$7,updated_at=NOW()
+         WHERE id=$1 AND company_id=$2 RETURNING *`,
+        [current.id,companyId,code,
+         b.immatriculation===undefined?current.immatriculation:(String(b.immatriculation||"").trim()||null),
+         b.chauffeur===undefined?current.chauffeur:(String(b.chauffeur||"").trim()||null),
+         b.statut===undefined?current.statut:String(b.statut||"ACTIF").trim().toUpperCase(),
+         b.notes===undefined?current.notes:(String(b.notes||"").trim()||null)]
+      );
+      res.json(rows[0]);
+    } catch (e) {
+      console.error("camion update:", e);
+      if (e?.code === "23505") return res.status(409).json({ error: "Ce code camion existe déjà dans cette société." });
+      res.status(500).json({ error: "Erreur modification camion." });
+    }
+  });
+
   // Saisie manuelle d'une opération de trésorerie (recette/dépense) -> écriture équilibrée.
   router.post("/tresorerie", authenticateToken, perm("comptabilite", "create"), async (req, res) => {
     try {
