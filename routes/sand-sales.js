@@ -2430,5 +2430,111 @@ if (!multiTruckRows.length && sale.camion_id) {
     }
   );
 
+
+  // === ETATS DES FACTURES SABLE : une facture dans un seul état ===
+  router.get("/sand/invoice-statements",authenticateToken,sandModuleGuard,perm("view"),async(req,res)=>{
+    try {
+      const {rows}=await pool.query(
+        `SELECT * FROM sand_invoice_statements WHERE company_id=$1 ORDER BY generated_at DESC,id DESC`,
+        [companyOf(req)]);
+      res.json(rows);
+    } catch(e){console.error("STATEMENTS LIST",e);res.status(500).json({error:"Lecture des états impossible."});}
+  });
+
+  router.get("/sand/invoice-statements/eligible",authenticateToken,sandModuleGuard,perm("view"),async(req,res)=>{
+    try {
+      const {rows}=await pool.query(
+        `SELECT i.id,i.invoice_number,i.invoice_date::text AS invoice_date,
+                i.total_amount,i.paid_amount,i.remaining_amount,i.status,
+                s.destination AS site,s.quantity_m3,
+                COALESCE(c.name,s.customer_name) AS client_name
+           FROM sand_invoices i
+           LEFT JOIN sand_sales s ON s.id=i.sale_id AND s.company_id=i.company_id
+           LEFT JOIN sand_customers c ON c.id=i.customer_id AND c.company_id=i.company_id
+          WHERE i.company_id=$1 AND NOT EXISTS (
+            SELECT 1 FROM sand_invoice_statement_items x
+            WHERE x.company_id=i.company_id AND x.invoice_id=i.id)
+          ORDER BY i.invoice_date DESC,i.id DESC`,
+        [companyOf(req)]);
+      res.json(rows);
+    } catch(e){console.error("STATEMENTS ELIGIBLE",e);res.status(500).json({error:"Lecture des factures disponibles impossible."});}
+  });
+
+  router.get("/sand/invoice-statements/:id",authenticateToken,sandModuleGuard,perm("view"),async(req,res)=>{
+    try {
+      const companyId=companyOf(req);
+      const statement=(await pool.query(
+        "SELECT * FROM sand_invoice_statements WHERE id=$1 AND company_id=$2",
+        [req.params.id,companyId])).rows[0];
+      if(!statement)return res.status(404).json({error:"État introuvable."});
+      const items=(await pool.query(
+        "SELECT * FROM sand_invoice_statement_items WHERE statement_id=$1 AND company_id=$2 ORDER BY id",
+        [statement.id,companyId])).rows;
+      res.json({statement,items});
+    } catch(e){console.error("STATEMENT DETAIL",e);res.status(500).json({error:"Lecture de l'état impossible."});}
+  });
+
+  router.post("/sand/invoice-statements",authenticateToken,sandModuleGuard,perm("create"),async(req,res)=>{
+    const ids=req.body?.invoice_ids;
+    if(!Array.isArray(ids)||ids.length===0||ids.length>500||
+       ids.some(x=>!Number.isSafeInteger(Number(x))||Number(x)<=0)||
+       new Set(ids.map(Number)).size!==ids.length){
+      return res.status(400).json({error:"Sélection de factures invalide ou vide."});
+    }
+    const client=await pool.connect();
+    try {
+      const companyId=companyOf(req);
+      await client.query("BEGIN");
+      // Sérialise les créations pour cette société, y compris les numéros.
+      await client.query("SELECT id FROM companies WHERE id=$1 FOR UPDATE",[companyId]);
+      const {rows}=await client.query(
+        `SELECT i.id,i.invoice_number,i.invoice_date,i.total_amount,i.paid_amount,
+                i.remaining_amount,i.status,s.destination AS site,s.quantity_m3,
+                COALESCE(c.name,s.customer_name) AS client_name
+           FROM sand_invoices i
+           LEFT JOIN sand_sales s ON s.id=i.sale_id AND s.company_id=i.company_id
+           LEFT JOIN sand_customers c ON c.id=i.customer_id AND c.company_id=i.company_id
+          WHERE i.company_id=$1 AND i.id=ANY($2::int[])
+          ORDER BY i.id FOR UPDATE OF i`,[companyId,ids.map(Number)]);
+      if(rows.length!==ids.length){
+        await client.query("ROLLBACK");
+        return res.status(400).json({error:"Une ou plusieurs factures sont introuvables dans cette société."});
+      }
+      const used=(await client.query(
+        "SELECT invoice_id FROM sand_invoice_statement_items WHERE company_id=$1 AND invoice_id=ANY($2::int[])",
+        [companyId,ids.map(Number)])).rows;
+      if(used.length){
+        await client.query("ROLLBACK");
+        return res.status(409).json({error:"Une facture figure déjà dans un état.",invoice_ids:used.map(x=>x.invoice_id)});
+      }
+      const n=(await client.query(
+        "SELECT COALESCE(MAX(id),0)+1 AS n FROM sand_invoice_statements WHERE company_id=$1",
+        [companyId])).rows[0].n;
+      const number="ETAT-SAB-"+String(companyId).padStart(3,"0")+"-"+String(n).padStart(6,"0");
+      const sum=(field)=>rows.reduce((a,x)=>a+Number(x[field]||0),0);
+      const dates=rows.map(x=>x.invoice_date).filter(Boolean).sort((a,b)=>new Date(a)-new Date(b));
+      const statement=(await client.query(
+        `INSERT INTO sand_invoice_statements
+         (company_id,statement_number,generated_by,invoices_count,total_invoiced,total_paid,total_remaining,total_m3,period_from,period_to)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+        [companyId,number,req.user?.id||null,rows.length,sum("total_amount"),sum("paid_amount"),sum("remaining_amount"),sum("quantity_m3"),dates[0]||null,dates[dates.length-1]||null])).rows[0];
+      for(const x of rows){
+        await client.query(
+          `INSERT INTO sand_invoice_statement_items
+          (company_id,statement_id,invoice_id,invoice_number,invoice_date,client_name,site,quantity_m3,
+           total_amount_snapshot,paid_amount_snapshot,remaining_amount_snapshot,status_snapshot)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+          [companyId,statement.id,x.id,x.invoice_number,x.invoice_date,x.client_name,x.site,x.quantity_m3,
+           x.total_amount||0,x.paid_amount||0,x.remaining_amount||0,x.status]);
+      }
+      await client.query("COMMIT");
+      res.status(201).json(statement);
+    } catch(e){
+      await client.query("ROLLBACK").catch(()=>{});
+      console.error("CREATE STATEMENT",e);
+      res.status(e.code==="23505"?409:500).json({error:e.code==="23505"?"Une facture est déjà affectée à un état.":"Création de l'état impossible."});
+    } finally{client.release();}
+  });
+
   return router;
 };
