@@ -134,7 +134,10 @@ async function main() {
   // ────────────────────────────────────────────────────────────────────
   console.log(`\n${G}5. ANNULATION D'UNE VENTE PAYÉE PAR BANQUE${Z}`);
   {
-    banque = (await q(`SELECT * FROM accounting_banks WHERE company_id=$1`, [S2]))[0];
+    /* ORDER BY : sans tri, « la » banque est celle que PostgreSQL rend en
+       premier, et toute donnée voisine ajoutée à la base d'essai fait
+       porter le test sur un autre compte que celui qu'il a préparé. */
+    banque = (await q(`SELECT * FROM accounting_banks WHERE company_id=$1 ORDER BY id`, [S2]))[0];
     const bankAvant = Number(banque.current_balance);
     const r = await appel("POST", `/sand/sales/${jeu.ventes.validee_payee_banque}/cancel`, ADMIN,
       { reason: "Erreur de banque de destination" });

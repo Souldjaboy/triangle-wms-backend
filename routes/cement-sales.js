@@ -1120,8 +1120,14 @@ module.exports = function createCementSalesRouter({
         /* Solde reconstruit depuis la SOMME réelle des paiements (comme le
            Sable) : « ancien + montant » dérive au moindre incident. */
         const newPaid = Number((await client.query(
-          `SELECT COALESCE(SUM(amount),0) AS total FROM cement_payments
-            WHERE company_id=$1 AND invoice_id=$2`,
+          `SELECT COALESCE(SUM(pay.amount),0) AS total FROM cement_payments pay
+            WHERE pay.company_id=$1 AND pay.invoice_id=$2
+              /* Un paiement contrepassé n'a plus rien payé : sans ce filtre,
+                 un encaissement enregistré après une contrepassation rendrait
+                 la facture soldée alors qu'elle reste due. */
+              AND NOT EXISTS (SELECT 1 FROM cement_payment_reversals r
+                               WHERE r.company_id = pay.company_id
+                                 AND r.original_payment_id = pay.id)`,
           [companyId, invoice.id]
         )).rows[0].total);
 

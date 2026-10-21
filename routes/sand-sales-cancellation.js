@@ -141,7 +141,8 @@ module.exports = function createSandSalesCancellationRouter({
                  FROM sand_payments pay
                 WHERE pay.company_id = $1 AND pay.invoice_id = $2
                   AND NOT EXISTS (SELECT 1 FROM sand_payment_reversals r
-                                    WHERE r.original_payment_id = pay.id)) p
+                                    WHERE r.company_id = pay.company_id
+                                      AND r.original_payment_id = pay.id)) p
         WHERE i.id = $2 AND i.company_id = $1
         RETURNING i.*`,
       [companyId, invoiceId]

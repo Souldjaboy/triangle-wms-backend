@@ -19617,6 +19617,22 @@ app.use(
 );
 
 
+/* Contrepassation des encaissements ciment. Le Sable sait défaire un
+   encaissement depuis la 075 ; le moteur comptable partagé prévoyait déjà le
+   cas « cement », mais la table et la route manquaient — un encaissement
+   ciment saisi par erreur ne pouvait pas être défait. Contrepasser n'est pas
+   rembourser : `refund_pending` reste vrai tant que l'argent n'est pas
+   revenu au client. */
+const createCementCancellationRouter = require("./routes/cement-sales-cancellation");
+app.use(
+  "/",
+  createCementCancellationRouter({
+    pool, authenticateToken, getEffectiveCompanyId, requirePermission,
+    requireCompanyModule,
+    accounting: { nextAccountingNumber, createAccountingEntry },
+  })
+);
+
 // ===================================================================
 // FAT & MAT — VENTE DE SABLE
 // Indépendant du stock et du module ciment
