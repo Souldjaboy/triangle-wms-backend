@@ -1,6 +1,7 @@
 "use strict";
 
 const stockLocations = require("../services/stock-locations");
+const C = require("../services/demandes-correction");
 
 /**
  * Workflows stock MULTI-PRODUITS (PHASES 3-10) — Triangle WMS.
@@ -522,6 +523,143 @@ module.exports = function createStockWorkflowRouter(deps) {
       );
       res.json(rows);
     } catch (e) { console.error(e); res.status(500).json({ error: "Erreur audit." }); }
+  });
+
+
+  /* ═══════════════════════════════════════════════════════════════════════
+     CORRIGER UNE DEMANDE — §C
+
+     Une demande RECUE ne pouvait plus rien devenir : l'annulation la refusait
+     explicitement. Une erreur découverte après coup restait donc inscrite
+     pour toujours, et la seule issue était de créer une demande inverse « à
+     la main », sans lien avec l'originale et sans motif.
+
+     Trois gestes, du plus léger au plus lourd — voir
+     services/demandes-correction.js. Aucun ne réécrit un stock directement :
+     tout passe par le moteur qui a servi à la réception, avec le signe
+     opposé.
+     ═══════════════════════════════════════════════════════════════════════ */
+
+  const motifErreur = (res, e, secours) => {
+    if (!e.httpStatus) console.error(secours, e);
+    res.status(e.httpStatus || 500).json({
+      error: e.message || secours, code: e.code,
+      ...(e.statut !== undefined ? { statut: e.statut } : {}),
+      ...(e.mouvements !== undefined ? { mouvements: e.mouvements } : {}),
+    });
+  };
+  const utilisateurDe = (req) => ({
+    id: req.user?.id || null,
+    name: req.user?.fullname || req.user?.email || "Utilisateur",
+    role: req.user?.role,
+  });
+
+  const correction = (chemin, permission, fn, secours) =>
+    router.post(chemin, authenticateToken, permission, async (req, res) => {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const out = await fn(client, req);
+        await client.query("COMMIT");
+        res.json({ success: true, ...out });
+      } catch (e) {
+        await client.query("ROLLBACK").catch(() => {});
+        motifErreur(res, e, secours);
+      } finally { client.release(); }
+    });
+
+  /* Modifier : tant que la demande n'a rien produit. Une demande VALIDEE que
+     l'on modifie retourne EN_ATTENTE — le validateur avait approuvé un
+     contenu qui n'est plus celui-là. */
+  correction("/stock-requests/:id/modifier", perm("update"), async (client, req) => {
+    const out = await C.modifier(client, {
+      companyId: companyOf(req), requestId: Number(req.params.id),
+      modifications: req.body?.modifications || {},
+      lignes: Array.isArray(req.body?.lignes) ? req.body.lignes : null,
+      motif: req.body?.motif || req.body?.reason || "",
+      utilisateur: utilisateurDe(req),
+    });
+    await audit(client, {
+      companyId: companyOf(req), userId: req.user.id, action: "modify",
+      entity: "stock_request", entityId: out.demande.id, reference: out.demande.reference,
+      oldValue: out.changes, newValue: { statut: out.demande.status }, ip: req.ip,
+    });
+    return {
+      ...out,
+      message: out.revalidation_requise
+        ? `Demande ${out.demande.reference} modifiée. Elle repasse EN ATTENTE : `
+          + `le contenu validé n'est plus celui-là.`
+        : `Demande ${out.demande.reference} modifiée.`,
+    };
+  }, "Erreur de modification de la demande.");
+
+  /* Dévalider : reprendre une validation qui n'a rien produit. */
+  correction("/stock-requests/:id/devalider", perm("validate"), async (client, req) => {
+    const out = await C.devalider(client, {
+      companyId: companyOf(req), requestId: Number(req.params.id),
+      motif: req.body?.motif || req.body?.reason || "",
+      utilisateur: utilisateurDe(req),
+    });
+    await audit(client, {
+      companyId: companyOf(req), userId: req.user.id, action: "devalidate",
+      entity: "stock_request", entityId: out.demande.id, reference: out.demande.reference,
+      oldValue: { status: STATUS.VALIDATED }, newValue: { status: out.demande.status }, ip: req.ip,
+    });
+    return { ...out, message: `Validation de ${out.demande.reference} reprise. `
+      + `La demande repasse EN ATTENTE. Aucun stock n'avait bougé.` };
+  }, "Erreur de dévalidation.");
+
+  /* Contre-passer : la réception a déplacé du stock, chaque mouvement reçoit
+     son inverse. Droit DISTINCT : un magasinier qui réceptionne ne défait pas
+     seul ce que le magasin a déjà rangé. */
+  correction("/stock-requests/:id/contrepasser", requirePermission("demande", "contrepasser"),
+    async (client, req) => {
+      const out = await C.contrepasser(client, {
+        companyId: companyOf(req), requestId: Number(req.params.id),
+        motif: req.body?.motif || req.body?.reason || "",
+        utilisateur: utilisateurDe(req),
+        stockLocations,
+        annulerEnsuite: req.body?.annuler === true,
+      });
+      await audit(client, {
+        companyId: companyOf(req), userId: req.user.id, action: "reverse",
+        entity: "stock_request", entityId: out.demande.id, reference: out.demande.reference,
+        oldValue: { lignes: out.mouvements.length }, newValue: { status: out.demande.status }, ip: req.ip,
+      });
+      return { ...out, message:
+        `Réception de ${out.demande.reference} contre-passée : `
+        + `${out.mouvements.length} mouvement(s) inverse(s), `
+        + `${out.quantite_contrepassee} unité(s). `
+        + `Les mouvements d'origine sont conservés et marqués annulés.` };
+    }, "Erreur de contre-passation.");
+
+  /* L'historique des corrections : qui a défait quoi, quand, et pourquoi. */
+  router.get("/stock-requests/:id/corrections", authenticateToken, perm("view"), async (req, res) => {
+    try {
+      const companyId = companyOf(req);
+      const demande = await C.charger(pool, companyId, Number(req.params.id));
+      res.json({ demande, corrections: await C.historique(pool, companyId, demande.id) });
+    } catch (e) { motifErreur(res, e, "Erreur de lecture de l'historique."); }
+  });
+
+  /* Les demandes annulées dont des mouvements subsistent. Recensées, jamais
+     corrigées automatiquement : régulariser change un stock réel.
+
+     Le chemin ne passe PAS par /stock-requests/... : la route /:id est
+     déclarée plus haut et capterait « incoherentes » comme un identifiant. */
+  router.get("/demandes-stock/incoherentes", authenticateToken, perm("view"), async (req, res) => {
+    try {
+      const { rows } = await pool.query(
+        `SELECT * FROM v_demandes_incoherentes WHERE company_id = $1
+          ORDER BY cancelled_at DESC NULLS LAST LIMIT 200`, [companyOf(req)]);
+      res.json({
+        demandes: rows, total: rows.length,
+        avertissement: rows.length
+          ? `${rows.length} demande(s) annulée(s) dont des mouvements de stock subsistent. `
+            + `Aucune n'a été corrigée : chacune doit être examinée, puis contre-passée s'il y a lieu.`
+          : "Aucune demande annulée avec des mouvements encore actifs.",
+      });
+    } catch (e) { motifErreur(res, e, "Erreur de lecture."); }
   });
 
   return router;
