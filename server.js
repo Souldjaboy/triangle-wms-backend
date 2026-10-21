@@ -9480,6 +9480,29 @@ app.put("/accounting/vouchers/:id/reject", authenticateToken, async (req, res) =
     if (!canApproveAccounting(req.user) && !canManageAccounting(req.user)) {
       return res.status(403).json({ error: "Accès refus bon comptable refusé." });
     }
+    /* Un bon VALIDÉ a déjà déplacé de l'argent : le marquer « refusé » le
+       laissait peser sur le résultat sans qu'aucun écran ne le montre actif.
+       La seule façon de défaire une validation est la contre-passation. */
+    const dejaValide = await pool.query(
+      `SELECT voucher_number, status FROM cash_vouchers WHERE id=$1`,
+      [req.params.id]
+    );
+    const etatActuel = dejaValide.rows[0]?.status;
+    if (etatActuel === "validé") {
+      return res.status(409).json({
+        error: `Le bon ${dejaValide.rows[0].voucher_number} est validé : l'argent a déjà bougé. `
+          + `Le refuser le laisserait peser sur le résultat. Annulez-le : la contre-passation `
+          + `remettra le solde et conservera les écritures d'origine.`,
+        code: "VOUCHER_ALREADY_VALIDATED"
+      });
+    }
+    if (etatActuel === "annulé") {
+      return res.status(409).json({
+        error: `Le bon ${dejaValide.rows[0].voucher_number} est annulé : il ne se refuse plus.`,
+        code: "VOUCHER_CANCELLED"
+      });
+    }
+
     const isGlobalSuperAdmin = isSuperAdminUser(req.user) && !getEffectiveCompanyId(req);
     const values = [
       "refusé",
@@ -19486,6 +19509,19 @@ app.use(
   createTransfertsInternesRouter({
     pool, authenticateToken, getEffectiveCompanyId, requirePermission,
     nextAccountingNumber, createAccountingEntry, logActivity,
+  })
+);
+
+/* Correction des bons d'encaissement et de décaissement. Avant validation on
+   modifie, après validation on contre-passe : les écritures d'origine restent
+   et des écritures inverses s'y ajoutent. Rien n'est effacé, et chaque geste
+   laisse une ligne d'historique avec son motif. */
+const createBonsComptablesRouter = require("./routes/bons-comptables");
+app.use(
+  "/",
+  createBonsComptablesRouter({
+    pool, authenticateToken, getEffectiveCompanyId, requirePermission,
+    nextAccountingNumber, createJournalEntry, logActivity,
   })
 );
 

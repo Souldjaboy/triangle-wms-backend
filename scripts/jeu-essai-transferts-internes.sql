@@ -123,6 +123,58 @@ SELECT c.id, r.role, 'comptabilite', a.action, true
  WHERE c.id IN (1,2)
 ON CONFLICT (company_id, role, module_key, action) DO UPDATE SET allowed = true;
 
+-- ── Des bons d'encaissement et de décaissement, pour le §7 ────────────────
+-- Un bon soumis (modifiable), un bon qui sera validé par le test lui-même,
+-- et un bon REFUSÉ dont le mouvement d'argent existe pourtant : c'est le cas
+-- incohérent que la vue doit recenser sans le corriger.
+INSERT INTO cash_vouchers
+  (id, company_id, voucher_number, voucher_type, amount, origin, beneficiary,
+   bank_id, caisse_id, partner_name, reason, expense_category, status, created_by) VALUES
+ (1,1,'BD-2026-000001','decaissement', 400000,'','Fournisseur Keita',
+  1,NULL,'Keita SARL','Achat de pièces détachées','achat','soumis',903),
+ (2,1,'BE-2026-000002','encaissement', 250000,'Client Traoré','',
+  1,NULL,'Traoré & Fils','Encaissement sur facture','', 'soumis',903),
+ (3,1,'BD-2026-000003','decaissement', 150000,'','Transporteur',
+  NULL,1,'Transport Bamako','Frais de transport','autre','soumis',903),
+ (4,1,'BD-2026-000004','decaissement', 300000,'','Ancien fournisseur',
+  1,NULL,'Ancien','Bon refusé alors que l''argent avait bougé','achat','refusé',903),
+ (10,2,'BD-F-000001','decaissement', 90000,'','Fournisseur FAT',
+  10,NULL,'Fournisseur FAT','Bon de FAT & MAT','achat','soumis',901)
+ON CONFLICT (id) DO NOTHING;
+SELECT setval(pg_get_serial_sequence('cash_vouchers','id'), 100, true);
+
+-- Le mouvement resté actif derrière le bon refusé n° 4 : exactement le défaut
+-- que la migration 104 recense et ne corrige pas.
+INSERT INTO accounting_transactions
+  (company_id,transaction_number,transaction_type,source_type,source_id,bank_id,
+   amount,currency,direction,category,description,status,operation_date,created_by) VALUES
+ (1,'DEC-ORPHELIN-1','decaissement','cash_voucher',4,1,
+  300000,'FCFA','sortie','achat','Mouvement du bon BD-2026-000004, resté actif','validé','2026-09-20',903)
+ON CONFLICT DO NOTHING;
+
+INSERT INTO role_permissions(company_id, role, module_key, action, allowed)
+SELECT c.id, 'direction', 'comptabilite.bon', a.action, true
+  FROM companies c CROSS JOIN (VALUES ('visible'),('view'),('create'),('update'),('validate'),('delete'),('print')) AS a(action)
+ WHERE c.id IN (1,2)
+ON CONFLICT (company_id, role, module_key, action) DO UPDATE SET allowed = true;
+
+INSERT INTO role_permissions(company_id, role, module_key, action, allowed)
+SELECT c.id, 'comptable', 'comptabilite.bon', a.action, true
+  FROM companies c CROSS JOIN (VALUES ('visible'),('view'),('create'),('update'),('print')) AS a(action)
+ WHERE c.id IN (1,2)
+ON CONFLICT (company_id, role, module_key, action) DO UPDATE SET allowed = true;
+
+INSERT INTO role_permissions(company_id, role, module_key, action, allowed)
+SELECT c.id, 'comptable', 'comptabilite.bon', 'delete', false
+  FROM companies c WHERE c.id IN (1,2)
+ON CONFLICT (company_id, role, module_key, action) DO UPDATE SET allowed = false;
+
+INSERT INTO role_permissions(company_id, role, module_key, action, allowed)
+SELECT c.id, 'magasinier', 'comptabilite.bon', a.action, true
+  FROM companies c CROSS JOIN (VALUES ('visible'),('view')) AS a(action)
+ WHERE c.id IN (1,2)
+ON CONFLICT (company_id, role, module_key, action) DO UPDATE SET allowed = true;
+
 COMMIT;
 
 DO $$
