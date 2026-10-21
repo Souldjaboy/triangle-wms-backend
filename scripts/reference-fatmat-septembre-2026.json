@@ -1,0 +1,44 @@
+{
+  "commentaire": [
+    "Les trois relevés de référence fournis par la direction pour FAT & MAT.",
+    "Ils donnent un NOMBRE, une DATE et un TOTAL — pas le détail facture par",
+    "facture. La réconciliation compare donc d'abord ces trois agrégats, puis",
+    "examine chaque facture de la base pour expliquer les écarts.",
+    "",
+    "Si la direction fournit un jour le détail ligne à ligne, il se place dans",
+    "`factures` de chaque relevé et la comparaison devient nominative."
+  ],
+  "societe": "FAT & MAT",
+  "periode": { "du": "2026-09-01", "au": "2026-10-05" },
+  "releves": [
+    {
+      "cle": "PAYEES_09_09",
+      "libelle": "Factures réglées au 09/09/2026",
+      "date_releve": "2026-09-09",
+      "statut_attendu": "PAYEE",
+      "nombre": 14,
+      "total": 20239000,
+      "factures": []
+    },
+    {
+      "cle": "IMPAYEES_23_09",
+      "libelle": "Factures impayées au 23/09/2026",
+      "date_releve": "2026-09-23",
+      "statut_attendu": "IMPAYEE",
+      "nombre": 11,
+      "total": 10286000,
+      "factures": []
+    },
+    {
+      "cle": "IMPAYEES_30_09_05_10",
+      "libelle": "Factures impayées du 30/09 au 05/10/2026",
+      "date_debut": "2026-09-30",
+      "date_fin": "2026-10-05",
+      "statut_attendu": "IMPAYEE",
+      "nombre": 9,
+      "total": 7956000,
+      "factures": []
+    }
+  ],
+  "totaux_attendus": { "nombre": 34, "montant": 38481000 }
+}
