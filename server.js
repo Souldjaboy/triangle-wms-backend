@@ -9709,9 +9709,14 @@ app.get("/accounting/statements", authenticateToken, async (req, res) => {
       values
     );
     const cashflow = await pool.query(
+      /* Un transfert interne n'est ni un produit ni une charge : sans ce
+         filtre, déplacer 5 000 000 FCFA de la banque vers la caisse gonflait
+         les produits ET les charges du même montant. */
       `SELECT direction, COALESCE(SUM(amount),0)::numeric AS total
        FROM accounting_transactions
-       WHERE status='validé' ${andFilter}
+       WHERE status='validé'
+         AND COALESCE(show_in_financial_movements,TRUE)=TRUE
+         ${andFilter}
        GROUP BY direction`,
       values
     );
@@ -19467,6 +19472,20 @@ app.use(
   createFiscaliteRouter({
     pool, authenticateToken, getEffectiveCompanyId, requirePermission,
     nextAccountingNumber, createAccountingEntry,
+  })
+);
+
+/* Transferts internes de fonds. Déplacer de l'argent entre deux comptes de la
+   même société n'est NI une recette NI une dépense : les deux mouvements
+   portent show_in_financial_movements = FALSE et les écritures s'équilibrent
+   entre les deux comptes, sans compte de charge ni de produit. Le total des
+   fonds, le chiffre d'affaires et le bénéfice restent inchangés. */
+const createTransfertsInternesRouter = require("./routes/transferts-internes");
+app.use(
+  "/",
+  createTransfertsInternesRouter({
+    pool, authenticateToken, getEffectiveCompanyId, requirePermission,
+    nextAccountingNumber, createAccountingEntry, logActivity,
   })
 );
 

@@ -122,6 +122,7 @@ module.exports = function createMeetingPresentationRouter({
               WHERE company_id=$1
                 AND direction='sortie'
                 AND status='validé'
+                AND COALESCE(show_in_financial_movements,TRUE)=TRUE
                 AND COALESCE(operation_date,created_at::date)
                     BETWEEN $2::date AND $3::date
 
@@ -154,6 +155,7 @@ module.exports = function createMeetingPresentationRouter({
                 WHERE company_id=$1
                   AND direction='sortie'
                   AND status='validé'
+                  AND COALESCE(show_in_financial_movements,TRUE)=TRUE
                   AND COALESCE(operation_date,created_at::date)
                       BETWEEN $2::date AND $3::date
 
