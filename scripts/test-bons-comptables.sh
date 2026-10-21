@@ -24,8 +24,8 @@ for f in $(ls *.sql | grep -E '^[0-9]' | sort -V); do
 done
 echo "   $N appliquées"
 
-echo "── les migrations 103 et 104, en montrant ce qu'elles disent"
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$RACINE/sql/103_transferts_internes_de_fonds.sql" -f "$RACINE/sql/104_correction_bons_comptables.sql" 2>&1 \
+echo "── les migrations 150 et 151, en montrant ce qu'elles disent"
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$RACINE/sql/150_transferts_internes_de_fonds.sql" -f "$RACINE/sql/151_correction_bons_comptables.sql" 2>&1 \
   | grep -E "NOTICE|ERROR" || true
 
 echo "── jeu d'essai"

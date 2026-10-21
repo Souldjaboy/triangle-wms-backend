@@ -101,11 +101,11 @@ puis vide le schéma et restaure.
 
 | Fichier | Ce qu'elle fait | Destructive ? |
 |---|---|---|
-| `103_transferts_internes_de_fonds.sql` | Crée `show_in_financial_movements` (absente, et pourtant lue par le tableau de bord), `internal_fund_transfers`, la vue des anciens mouvements candidats | Non |
-| `104_correction_bons_comptables.sql` | Historique et contre-passation des bons, vue des bons incohérents | Non |
-| `105_contrepassation_paiements_ciment.sql` | `cement_payment_reversals` et l'index unique manquant côté sable | Non |
-| `106_correction_demandes_validees.sql` | Journal des corrections de demandes, marques d'annulation sur les mouvements | Non |
-| `107_documents_rh.sql` | Contrats, clauses, registre des documents du personnel | Non |
+| `150_transferts_internes_de_fonds.sql` | Crée `show_in_financial_movements` (absente, et pourtant lue par le tableau de bord), `internal_fund_transfers`, la vue des anciens mouvements candidats | Non |
+| `151_correction_bons_comptables.sql` | Historique et contre-passation des bons, vue des bons incohérents | Non |
+| `152_contrepassation_paiements_ciment.sql` | `cement_payment_reversals` et l'index unique manquant côté sable | Non |
+| `153_correction_demandes_validees.sql` | Journal des corrections de demandes, marques d'annulation sur les mouvements | Non |
+| `154_documents_rh.sql` | Contrats, clauses, registre des documents du personnel | Non |
 
 **Toutes sont additives et idempotentes.** Aucune ne supprime de donnée,
 aucune ne modifie une ligne existante, aucune ne reclasse d'écriture

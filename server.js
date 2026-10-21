@@ -19849,6 +19849,18 @@ app.use(
   })
 );
 
+/* Deux routeurs qui déclarent le même chemin : Express sert le premier et
+   ignore le second, sans erreur ni trace. La V16 RH, posée directement sur
+   le serveur, déclare /rh/contrats que le nouveau routeur déclare aussi —
+   selon l'ordre de montage, l'un des deux disparaît. On le dit au démarrage
+   plutôt que de le chercher pendant des heures. */
+const routesEnDouble = require("./services/routes-en-double");
+
 app.listen(5050, () => {
   console.log("Backend sécurisé démarré sur le port 5050");
+  try {
+    routesEnDouble.signaler(app, { logger: console });
+  } catch (e) {
+    console.warn("Détection des routes masquées impossible :", e.message);
+  }
 });

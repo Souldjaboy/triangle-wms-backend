@@ -25,7 +25,7 @@ done
 echo "   $N appliquées"
 
 echo "── la migration 103, cette fois en montrant ce qu'elle dit"
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$RACINE/sql/103_transferts_internes_de_fonds.sql" 2>&1 \
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$RACINE/sql/150_transferts_internes_de_fonds.sql" 2>&1 \
   | grep -E "NOTICE|ERROR" || true
 
 echo "── jeu d'essai"
