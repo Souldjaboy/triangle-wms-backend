@@ -78,7 +78,11 @@ module.exports = function createStockLocationsRouter(deps) {
     AND UPPER(TRIM(COALESCE(NULLIF(l.rayon_code,''), l.zone,  ''))) !~ '${rules.SQL.PLACEHOLDER}'
     AND UPPER(TRIM(COALESCE(NULLIF(l.case_code,''),  l.rayon, ''))) !~ '${rules.SQL.PLACEHOLDER}'`;
 
-  const VIVANT = `COALESCE(l.is_active, TRUE) = TRUE AND l.merged_into_location_id IS NULL`;
+  /* `archived_at` manquait : un bac archivé restait proposé comme destination
+     dans les sélecteurs alors que l'administration des emplacements ne le
+     montrait plus. On transférait vers un emplacement officiellement retiré. */
+  const VIVANT = `COALESCE(l.is_active, TRUE) = TRUE AND l.merged_into_location_id IS NULL
+    AND l.archived_at IS NULL`;
 
   const COMPOSANTES = `
     l.id, l.warehouse_id, l.warehouse_code,
@@ -100,7 +104,13 @@ module.exports = function createStockLocationsRouter(deps) {
           WHERE l.company_id = $1 AND ${VIVANT} AND ${BAC_REEL}
             AND ($2::int IS NULL OR l.warehouse_id = $2)
           GROUP BY l.id
-          ORDER BY l.warehouse_code, 3, 4, 5, l.bin_code`,
+          /* Par RANG, pas par texte : trié alphabétiquement, « TOP » tombe
+             entre « 3 » et « 4 », et « D10 » avant « D2 ». L'objet JSON
+             conserve l'ordre d'insertion, donc le sélecteur affiche les
+             niveaux dans l'ordre où ils sont physiquement empilés. */
+          ORDER BY l.warehouse_code, 3, 4,
+                   COALESCE(l.level_rank, 8999), 5,
+                   COALESCE(l.bin_rank, 999999), l.bin_code`,
         [companyOf(req), await entrepotDe(req)]
       );
       /* Arborescence prête à alimenter des sélecteurs dépendants : un bin
@@ -155,10 +165,30 @@ module.exports = function createStockLocationsRouter(deps) {
          l'écran les montre — désactivés, et expliqués. Ils ne rejoignent pas
          `tree` : y entrer les rendrait sélectionnables, et un transfert
          partirait vers une destination que personne ne peut retrouver. */
+      /* ── CE QUI DISPARAÎT, ET OÙ EXACTEMENT ──
+         L'ancien rapport ne décrivait QUE les rayons dont AUCUN bac n'était
+         exploitable (`HAVING count(*) FILTER (WHERE retenu) = 0`). Un rayon
+         qui possédait ne serait-ce qu'un bac valable était donc réputé sain —
+         et tout ce qu'il contenait d'inexploitable s'évaporait sans un mot.
+
+         C'est précisément le symptôme décrit : dans le rayon D, le niveau D1
+         n'avait que des FULLBIN hérités. D2 et D3 étant corrects, le rayon D
+         passait pour normal, et D1 n'apparaissait NI dans l'arbre NI dans la
+         liste des indisponibles. Son stock devenait invisible : non pas
+         refusé, mais absent, ce qui ne laisse rien à comprendre.
+
+         On décrit donc chaque CHEMIN complet — entrepôt / rayon / étagère /
+         niveau — dont les bacs sont inexploitables, avec leur motif et le
+         stock concerné. Rien n'entre dans `tree` : un bac dont on ignore
+         l'identité ne doit pas devenir une destination. Mais plus rien ne
+         disparaît en silence. */
       const { rows: ecartes } = await pool.query(
         `WITH classe AS (
            SELECT l.warehouse_code,
-                  COALESCE(NULLIF(l.rayon_code,''), l.zone) AS rayon,
+                  COALESCE(NULLIF(l.rayon_code,''), l.zone)    AS rayon,
+                  COALESCE(NULLIF(l.case_code,''),  l.rayon)   AS etagere,
+                  COALESCE(NULLIF(l.level_code,''), l.etagere) AS niveau,
+                  COALESCE(l.level_rank, 8999) AS rang,
                   l.id,
                   (${BAC_REEL}) AS retenu,
                   CASE
@@ -169,22 +199,29 @@ module.exports = function createStockLocationsRouter(deps) {
                     WHEN l.bin_code ~* '${rules.SQL.WRITE_OFF}'
                       OR COALESCE(l.warehouse_code,'') ~* '${rules.SQL.WRITE_OFF}'
                       OR COALESCE(l.emplacement_code,'') ~* '${rules.SQL.WRITE_OFF}' THEN 'REBUT'
+                    WHEN UPPER(TRIM(COALESCE(NULLIF(l.rayon_code,''), l.zone, ''))) ~ '${rules.SQL.PLACEHOLDER}'
+                      OR UPPER(TRIM(COALESCE(NULLIF(l.case_code,''), l.rayon, ''))) ~ '${rules.SQL.PLACEHOLDER}'
+                      THEN 'GENEREE'
                     ELSE 'AUTRE'
                   END AS motif
              FROM locations l
             WHERE l.company_id = $1 AND ${VIVANT}
               AND ($2::int IS NULL OR l.warehouse_id = $2)
          )
-         SELECT c.warehouse_code, c.rayon,
+         SELECT c.warehouse_code, c.rayon, c.etagere, c.niveau,
+                MIN(c.rang)::int AS rang,
                 count(*) FILTER (WHERE NOT c.retenu)::int AS bacs_ecartes,
+                count(*) FILTER (WHERE c.retenu)::int     AS bacs_valables,
                 mode() WITHIN GROUP (ORDER BY c.motif) FILTER (WHERE NOT c.retenu) AS motif,
                 COALESCE(sum(b.quantity) FILTER (WHERE NOT c.retenu), 0)::numeric AS quantite
            FROM classe c
            LEFT JOIN stock_location_balances b ON b.location_id = c.id AND b.company_id = $1
-          GROUP BY c.warehouse_code, c.rayon
+          GROUP BY c.warehouse_code, c.rayon, c.etagere, c.niveau
+         /* Un niveau n'est signalé que s'il n'offre AUCUNE destination : tant
+            qu'un bac valable y subsiste, il est dans l'arbre et visible. */
          HAVING count(*) FILTER (WHERE c.retenu) = 0
             AND count(*) FILTER (WHERE NOT c.retenu) > 0
-          ORDER BY c.warehouse_code, c.rayon`,
+          ORDER BY c.warehouse_code, c.rayon, c.etagere, MIN(c.rang), c.niveau`,
         [companyOf(req), imposePourArbre]
       );
 
@@ -194,21 +231,68 @@ module.exports = function createStockLocationsRouter(deps) {
         BIN_ABSENT: "emplacement précis requis : aucun bac n'est indiqué",
         NON_PRECISE: "emplacement précis requis : le bac n'est pas précisé",
         REBUT: "mise au rebut : un état du produit, pas une destination",
+        GENEREE: "valeur générée (« NOUVEAU », « AUTO ») : ce n'est pas un lieu du terrain",
         AUTRE: "emplacement précis requis",
       };
+      const explication = (m) => MOTIFS[m] || MOTIFS.AUTRE;
+
+      /* Le détail complet, à afficher là où le niveau manque. */
+      const cheminsIndisponibles = {};
+      /* Et la vue par rayon, conservée telle quelle : l'écran existant la lit,
+         et un rayon ENTIÈREMENT indisponible reste le cas le plus parlant. */
       const indisponibles = {};
+
       for (const r of ecartes) {
-        const w = r.warehouse_code || "—", ro = r.rayon || "—";
-        indisponibles[w] ??= {};
-        indisponibles[w][ro] = {
+        const w = r.warehouse_code || "—";
+        const ro = r.rayon || "—";
+        const et = r.etagere || "—";
+        const niv = r.niveau || "—";
+        cheminsIndisponibles[w] ??= {};
+        cheminsIndisponibles[w][ro] ??= {};
+        cheminsIndisponibles[w][ro][et] ??= {};
+        cheminsIndisponibles[w][ro][et][niv] = {
           motif: r.motif || "AUTRE",
-          explication: MOTIFS[r.motif] || MOTIFS.AUTRE,
+          explication: explication(r.motif),
           bacs: Number(r.bacs_ecartes),
           quantite: Number(r.quantite),
+          rang: Number(r.rang),
+          /* Ce que l'utilisateur doit faire : préciser le bac. La route
+             /stock/locations/bins/:id/regulariser existe pour cela. */
+          regularisable: r.motif !== "REBUT",
         };
       }
 
-      res.json({ tree: arbre, bins: rows.length, rayonsIndisponibles: indisponibles });
+      /* Un rayon est « indisponible » quand l'arbre ne lui offre aucune
+         destination du tout — c'est-à-dire qu'il n'apparaît nulle part dans
+         `tree`. Calculé depuis l'arbre, et non plus par un HAVING séparé qui
+         pouvait diverger de ce que l'écran montre. */
+      for (const [w, rayons] of Object.entries(cheminsIndisponibles)) {
+        for (const [ro, etageres] of Object.entries(rayons)) {
+          if (arbre[w] && arbre[w][ro]) continue;   // le rayon a des destinations
+          const niveaux = Object.values(etageres).flatMap((e) => Object.values(e));
+          const motifs = niveaux.map((n) => n.motif);
+          indisponibles[w] ??= {};
+          indisponibles[w][ro] = {
+            motif: motifs[0] || "AUTRE",
+            explication: explication(motifs[0]),
+            bacs: niveaux.reduce((n, x) => n + x.bacs, 0),
+            quantite: niveaux.reduce((n, x) => n + x.quantite, 0),
+          };
+        }
+      }
+
+      res.json({
+        tree: arbre,
+        bins: rows.length,
+        rayonsIndisponibles: indisponibles,
+        cheminsIndisponibles,
+        /* De quoi écrire une phrase juste à l'écran sans refaire la somme. */
+        resume: {
+          bacs_ecartes: ecartes.reduce((n, r) => n + Number(r.bacs_ecartes), 0),
+          quantite_bloquee: ecartes.reduce((n, r) => n + Number(r.quantite), 0),
+          niveaux_concernes: ecartes.length,
+        },
+      });
     } catch (e) { fail(res, e, "Erreur chargement des emplacements."); }
   });
 

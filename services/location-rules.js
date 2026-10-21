@@ -26,15 +26,23 @@ const NON_PRECISE_RE = /NON[\s_-]*PRECISE|NON[\s_-]*PRÉCIS|\bN\/?A\b|\bINCONNU\
 const RANGE_RE = /^\s*(BIN\s*)?(\d+)\s*[-–/]\s*(\d+)\s*$/i;
 /* « FULLBIN » dit qu'un bac est plein, pas LEQUEL : ce n'est pas un repère. */
 const FULLBIN_RE = /^\s*FULL[\s_-]*BIN\s*$/i;
-const PLACEHOLDER_RE = /^\s*(NOUVEAU|AUTO|DEFAUT|DEFAULT|TEST|TEMP|X+|-+|0+)\s*$/i;
+/* « X » SEUL EST UN VRAI RAYON.
+   Le motif écartait « X+ » : la zone X de l'entrepôt — qui existe, qui porte
+   du stock et que les magasiniers utilisent — était donc classée « valeur
+   générée » et disparaissait des sélecteurs. Deux X ou plus restent un
+   remplissage ; un seul est un nom de rayon. */
+const PLACEHOLDER_RE = /^\s*(NOUVEAU|AUTO|DEFAUT|DEFAULT|TEST|TEMP|X{2,}|-+|0+)\s*$/i;
 
 /* Équivalents PostgreSQL, pour les requêtes et les migrations. */
+/* Équivalents PostgreSQL. Ils doivent dire EXACTEMENT la même chose que les
+   expressions JavaScript ci-dessus : « N/A » manquait côté SQL, si bien qu'un
+   bac ainsi nommé était refusé par le moteur et accepté par les requêtes. */
 const SQL = {
   WRITE_OFF: "(WRITE[[:space:]_-]*OFF|\\mREBUT\\M|\\mCASSE\\M)",
-  NON_PRECISE: "(NON[[:space:]_-]*PRECISE|NON[[:space:]_-]*PRÉCIS|\\mINCONNU\\M|\\mDIVERS\\M)",
+  NON_PRECISE: "(NON[[:space:]_-]*PRECISE|NON[[:space:]_-]*PRÉCIS|\\mN/?A\\M|\\mINCONNU\\M|\\mDIVERS\\M)",
   RANGE: "^(BIN[[:space:]]*)?[0-9]+[[:space:]]*[-/][[:space:]]*[0-9]+$",
   FULLBIN: "^FULL[[:space:]_-]*BIN$",
-  PLACEHOLDER: "^(NOUVEAU|AUTO|DEFAUT|DEFAULT|TEST|TEMP|X+|-+|0+)$",
+  PLACEHOLDER: "^(NOUVEAU|AUTO|DEFAUT|DEFAULT|TEST|TEMP|XX+|-+|0+)$",
 };
 
 const s = (v) => String(v ?? "").trim();
