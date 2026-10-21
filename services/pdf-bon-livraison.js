@@ -31,11 +31,11 @@ const MARGE = 40;
 const NOIR = "#000000";
 const GRIS = "#555555";
 
-/** Le FCFA n'a pas de centime : un montant s'écrit en francs entiers. */
-function fcfa(valeur) {
-  const n = Math.round(Number(valeur || 0));
-  return `${n.toLocaleString("fr-FR")} FCFA`;
-}
+/* Le FCFA n'a pas de centime : un montant s'écrit en francs entiers.
+   Et son séparateur de milliers passe par le formateur partagé : l'espace
+   fine insécable de toLocaleString ne s'encode pas en WinAnsi, et les bons
+   imprimaient « 450 /000 FCFA ». */
+const { fcfa, nombreFr } = require("./format-pdf");
 
 function jour(valeur) {
   if (!valeur) return "—";

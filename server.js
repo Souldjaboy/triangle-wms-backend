@@ -19525,6 +19525,20 @@ app.use(
   })
 );
 
+/* Documents du personnel : contrats CDI/CDD, bulletins, attestations,
+   certificats et diplômes. Aucun taux de cotisation n'est écrit dans le code :
+   le bulletin lit `tax_rules`, et sans taux vérifié il affiche « non calculé »
+   plutôt qu'un net faux d'allure crédible. Le droit de voir une rémunération
+   est distinct du droit d'éditer une attestation. */
+const createDocumentsRhRouter = require("./routes/documents-rh");
+app.use(
+  "/",
+  createDocumentsRhRouter({
+    pool, authenticateToken, getEffectiveCompanyId, requirePermission,
+    permissionsService, logActivity,
+  })
+);
+
 /* Le calendrier administratif : jours fériés, jours chômés, journées
    exceptionnelles. Le moteur de paie LIT ce calendrier avant de décider ce
    qu'est une absence — aucune interprétation juridique n'est écrite dans le

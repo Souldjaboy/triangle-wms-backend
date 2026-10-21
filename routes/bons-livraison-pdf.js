@@ -20,6 +20,9 @@
 
 const express = require("express");
 const P = require("../services/pdf-bon-livraison");
+/* Même raison que dans le générateur : l'espace fine insécable de
+   toLocaleString ne s'encode pas dans un PDF. */
+const { nombreFr } = require("../services/format-pdf");
 
 module.exports = function createBonsLivraisonPdfRouter(deps) {
   const { pool, authenticateToken, getEffectiveCompanyId, requirePermission } = deps;
@@ -120,7 +123,7 @@ module.exports = function createBonsLivraisonPdfRouter(deps) {
           ],
           lignes: [{
             designation: "Sable",
-            quantite: Number(bl.quantity_m3 || 0).toLocaleString("fr-FR"),
+            quantite: nombreFr(bl.quantity_m3),
             unite: "m³",
           }],
           observation: bl.notes,
@@ -181,7 +184,7 @@ module.exports = function createBonsLivraisonPdfRouter(deps) {
           ],
           lignes: [{
             designation: "Ciment",
-            quantite: Number(bl.tonnage || 0).toLocaleString("fr-FR"),
+            quantite: nombreFr(bl.tonnage),
             unite: "t",
           }],
           observation: bl.notes,
@@ -239,7 +242,7 @@ module.exports = function createBonsLivraisonPdfRouter(deps) {
           ],
           lignes: lignes.map((l) => ({
             designation: l.product_name || l.designation || "—",
-            quantite: Number(l.quantity || 0).toLocaleString("fr-FR"),
+            quantite: nombreFr(l.quantity),
             prix: l.unit_price != null ? P.fcfa(l.unit_price) : "—",
             montant: l.total_price != null ? P.fcfa(l.total_price) : "—",
           })),
