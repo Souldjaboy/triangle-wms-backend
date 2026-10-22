@@ -205,18 +205,53 @@ function objetsCrees(chemin) {
       rapport.rh_v16 = rhAutres;
     }
 
-    /* ── VERDICT ──────────────────────────────────────────────────────── */
-    const bloquant = bloquants > 0 || (rapport.rh_v16 || []).length > 0;
+    /* ── VERDICT ──────────────────────────────────────────────────────────
+     *
+     * DEUX SITUATIONS QU'IL NE FAUT PAS CONFONDRE.
+     *
+     * Un CONFLIT (code 2) : la branche veut créer une structure qui existe
+     * déjà, ou un numéro est représenté des deux côtés. Appliquer par-dessus
+     * laisserait le registre et le schéma en désaccord. Cela doit arrêter un
+     * déploiement, sans exception.
+     *
+     * Une RECONNAISSANCE À FAIRE (code 3) : les tables RH de la V16 sont là.
+     * Elles y seront TOUJOURS — c'est la production. En faire un blocage
+     * permanent reviendrait à interdire tout déploiement pour de bon. Il faut
+     * donc une reconnaissance explicite, une fois, de la part de la personne
+     * qui déploie : elle atteste avoir comparé les deux modèles.
+     *
+     * Les mélanger, comme le faisait la première version de ce script,
+     * transforme un garde-fou utile en porte murée.
+     */
+    const conflit = bloquants > 0;
+    const aReconnaitre = (rapport.rh_v16 || []).length > 0 || (rapport.rh_existantes || []).length > 0;
+    const reconnu = process.env.V16_RH_RECONCILIEE === "oui";
+
     log(`\n${"═".repeat(74)}`);
-    log(bloquant
-      ? "  VERDICT : NE PAS DÉPLOYER EN L'ÉTAT. Voir §1 et §4."
-      : "  VERDICT : aucun conflit bloquant détecté.");
+    if (conflit) {
+      log("  VERDICT : NE PAS DÉPLOYER. Conflit réel de structures — voir §1.");
+    } else if (aReconnaitre && !reconnu) {
+      log("  VERDICT : aucun conflit de structures. Mais les tables RH de la V16");
+      log("  sont en base, et leur modèle n'a pas été déclaré comparé.");
+      log("");
+      log("  Comparez-les (scripts/comparer-rh-v16.js), puis déployez avec :");
+      log("      V16_RH_RECONCILIEE=oui ./livraison/deployer.sh deployer");
+      log("");
+      log("  Cette reconnaissance ne modifie rien : elle atteste seulement que");
+      log("  vous avez vu les deux modèles et choisi de les laisser coexister.");
+    } else if (aReconnaitre) {
+      log("  VERDICT : aucun conflit. Coexistence avec la V16 RH reconnue.");
+    } else {
+      log("  VERDICT : aucun conflit bloquant détecté.");
+    }
     log("  Aucune écriture n'a été tentée : transaction en lecture seule.");
     log("═".repeat(74) + "\n");
 
-    rapport.bloquant = bloquant;
+    rapport.conflit = conflit;
+    rapport.reconnaissance_requise = aReconnaitre && !reconnu;
+    rapport.bloquant = conflit;   /* conservé : d'anciens appels le lisent */
     if (JSON_SEUL) console.log(JSON.stringify(rapport, null, 2));
-    process.exitCode = bloquant ? 2 : 0;
+    process.exitCode = conflit ? 2 : (aReconnaitre && !reconnu ? 3 : 0);
   } finally {
     await client.query("ROLLBACK").catch(() => {});
     client.release();

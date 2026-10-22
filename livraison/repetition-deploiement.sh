@@ -102,15 +102,34 @@ ok "$avant_demandes demande(s) antérieure(s) en base, empreinte ${avant_emprein
 
 # ═══════════════════════════════════════════════════════════════════════
 titre "Détection des conflits AVANT de toucher à quoi que ce soit"
-set +e
 node scripts/verifier-migrations.js > /tmp/repetition-conflits.log 2>&1
 code=$?
-set -e
 grep -q "rh_contrats" /tmp/repetition-conflits.log; v $? "les tables de la V16 sont repérées"
 grep -q "106_documents_rh_v16.sql" /tmp/repetition-conflits.log; v $? "la migration 106 hors Git est repérée"
 grep -q "aucun numéro partagé entre la branche et la base" /tmp/repetition-conflits.log
-v $? "aucune collision de numéro après renumérotation en 150–154"
-[ "$code" = "2" ]; v $? "le détecteur sort en code 2 : il bloquerait le déploiement"
+v $? "aucun numéro partagé entre la branche et la base (renumérotation en 150–154)"
+
+# Un conflit réel et une reconnaissance à faire ne sont pas la même chose. Ici
+# il n'y a aucun conflit : seules les tables de la V16 demandent à être vues.
+[ "$code" = "3" ] && c=0 || c=1
+v $c "code 3 : reconnaissance à faire, pas conflit (code $code)"
+grep -q "V16_RH_RECONCILIEE=oui" /tmp/repetition-conflits.log
+v $? "il indique comment attester la comparaison"
+
+V16_RH_RECONCILIEE=oui node scripts/verifier-migrations.js > /tmp/repetition-conflits2.log 2>&1
+v $? "une fois attesté, le détecteur passe (code 0)"
+grep -q "Coexistence avec la V16 RH reconnue" /tmp/repetition-conflits2.log
+v $? "et il le dit"
+
+# Le garde-fou doit tenir sur le chemin que « deployer » emprunte vraiment.
+RACINE="$RACINE" SAUVEGARDES="$SAUVEGARDES" DATABASE_URL="$DATABASE_URL" \
+  bash livraison/deployer.sh migrer > /tmp/repetition-migrer0.log 2>&1
+[ "$?" != "0" ] && c=0 || c=1
+v $c "« deployer.sh migrer » REFUSE sans l'attestation"
+grep -q "pas un conflit" /tmp/repetition-migrer0.log
+v $? "et explique que ce n'est pas un conflit"
+[ "$(psql "$DATABASE_URL" -tAc "SELECT to_regclass('public.hr_contracts')")" = "" ] && c=0 || c=1
+v $c "aucune migration n'a été appliquée pendant ce refus"
 
 # ═══════════════════════════════════════════════════════════════════════
 titre "Parcours Git — pour de vrai, sur une copie isolée"
@@ -173,7 +192,7 @@ v $? "les dépendances clés se chargent ici aussi"
 titre "Sauvegarde vérifiée, puis migrations"
 rm -rf "$SAUVEGARDES"
 RACINE="$RACINE" SAUVEGARDES="$SAUVEGARDES" DATABASE_URL="$DATABASE_URL" \
-  bash livraison/deployer.sh migrer > /tmp/repetition-migrer.log 2>&1
+  V16_RH_RECONCILIEE=oui bash livraison/deployer.sh migrer > /tmp/repetition-migrer.log 2>&1
 code=$?
 grep -q "restauration d'essai réussie" /tmp/repetition-migrer.log
 v $? "la sauvegarde a été RESTAURÉE pour vérification, pas seulement écrite"
@@ -199,7 +218,7 @@ v $c "aucune demande MODIFIÉE (même empreinte de contenu)"
 # ═══════════════════════════════════════════════════════════════════════
 titre "Idempotence : rejouer ne doit rien changer"
 RACINE="$RACINE" SAUVEGARDES="$SAUVEGARDES" DATABASE_URL="$DATABASE_URL" \
-  bash livraison/deployer.sh migrer > /tmp/repetition-migrer2.log 2>&1
+  V16_RH_RECONCILIEE=oui bash livraison/deployer.sh migrer > /tmp/repetition-migrer2.log 2>&1
 grep -q "aucune migration à appliquer" /tmp/repetition-migrer2.log
 v $? "le second passage ne rejoue rien"
 

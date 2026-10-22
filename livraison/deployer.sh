@@ -93,8 +93,55 @@ migrations_en_attente() {
   done
 }
 
+# ── LES COLLISIONS DE MIGRATIONS ─────────────────────────────────────────
+# Un numéro de migration n'est qu'une étiquette : ce qui compte, c'est de
+# savoir si les STRUCTURES existent déjà. Le détecteur compare les fichiers de
+# la branche aux objets réellement présents dans la base, en lecture seule, et
+# sort en code 2 quand une collision empêcherait le déploiement d'aboutir.
+verifier_collisions() {
+  titre "Collisions de migrations"
+  resoudre_base
+  if [ ! -f "$RACINE/scripts/verifier-migrations.js" ]; then
+    alerte "scripts/verifier-migrations.js absent : collisions non vérifiées."
+    return 0
+  fi
+  local journal="$SAUVEGARDES/collisions-$HORODATAGE.log"
+  mkdir -p "$SAUVEGARDES"
+  # Le statut se relève par « || code=$? », et pas autrement. Deux pièges se
+  # cumulent ici : après un « if cmd; then … fi » sans else, $? vaut 0 même
+  # quand cmd a échoué ; et sous « set -e », une commande qui rend 3 hors d'une
+  # condition tue le script sur place, avant le case. Les deux rendaient ce
+  # garde-fou inopérant, chacun à sa manière.
+  local code=0
+  ( cd "$RACINE" && node scripts/verifier-migrations.js ) > "$journal" 2>&1 || code=$?
+  if [ "$code" = "0" ]; then
+    ok "aucune collision"
+    return 0
+  fi
+  case "$code" in
+    2)
+      sed -n '/BLOQUANT/,$p' "$journal" | head -30
+      echo "    Rapport complet : $journal"
+      echec "Une migration de la branche entrerait en conflit avec ce que la base
+  porte déjà. Résolvez d'abord (voir sql/README-NUMEROTATION.md) : appliquer
+  par-dessus laisserait le registre et le schéma en désaccord." ;;
+    3)
+      sed -n '/VERDICT/,$p' "$journal" | head -16
+      echo "    Rapport complet : $journal"
+      echec "Les tables RH de la V16 sont en base et leur modèle n'a pas été
+  déclaré comparé. Ce n'est pas un conflit : les deux modèles peuvent coexister.
+  Comparez-les, puis relancez en l'attestant :
+      V16_RH_RECONCILIEE=oui $0 ${COMMANDE:-deployer}" ;;
+    *)
+      echo "    Rapport complet : $journal"
+      alerte "le détecteur a renvoyé le code $code : lisez $journal" ;;
+  esac
+}
+
 verifier() {
   verifier_prerequis
+  verifier_collisions
+
   titre "Migrations"
   local liste; liste="$(migrations_en_attente || true)"
   if [ -z "$liste" ]; then
@@ -175,8 +222,9 @@ sauvegarder() {
 # Séparée du déploiement : on peut appliquer le schéma sans toucher au code,
 # ce qui est exactement ce qu'on veut pour une reprise après incident.
 migrer() {
-  titre "Migrations"
   resoudre_base
+  verifier_collisions
+  titre "Migrations"
   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -c \
     "CREATE TABLE IF NOT EXISTS schema_migrations (filename TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
   local liste; liste="$(migrations_en_attente || true)"
