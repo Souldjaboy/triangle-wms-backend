@@ -19525,6 +19525,21 @@ app.use(
   })
 );
 
+/* Les factures qui se ressemblent. Deux factures du même client et du même
+   montant ne sont PAS un doublon : un abonnement en produit douze par an. Ce
+   module rassemble les signaux — même vente, série régulière, livraisons
+   distinctes, encaissements des deux côtés — et laisse une personne trancher.
+   Neutraliser exige un verdict préalable, et déplace les encaissements
+   légitimes vers la facture qui fait foi plutôt que de les perdre. */
+const createDoublonsFacturesRouter = require("./routes/doublons-factures");
+app.use(
+  "/",
+  createDoublonsFacturesRouter({
+    pool, authenticateToken, getEffectiveCompanyId, permissionsService, logActivity,
+    isCompanyModuleEnabled,
+  })
+);
+
 /* Réaffecter un paiement à la bonne facture. L'argent est entré et y reste :
    seule son imputation change, et AUCUNE écriture de trésorerie n'est créée —
    en créer une seconde doublerait les recettes. Le déplacement est atomique,
