@@ -70,7 +70,10 @@ transferts="$(q "SELECT count(*) FROM internal_fund_transfers WHERE status = 'AC
 masques="$(q "SELECT count(*) FROM accounting_transactions WHERE show_in_financial_movements = FALSE")"
 [ "${masques:-0}" -ge 2 ] && c=0 || c=1; v $c "$masques mouvement(s) exclus du résultat"
 
-bash livraison/retour-base.sh verifier 2>&1 | grep -q "RÉAPPARAÎTRE"
+# Pas de « | grep -q » ici : grep ferme le tube, le producteur reçoit SIGPIPE,
+# et « pipefail » transforme un contrôle réussi en échec.
+bash livraison/retour-base.sh verifier > /tmp/n1b.log 2>&1
+grep -q "RÉAPPARAÎTRE" /tmp/n1b.log
 v $? "niveau 1 avertit que défaire ferait réapparaître ces mouvements"
 
 echo "RETIRER LES AJOUTS" | bash livraison/retour-base.sh defaire-ajouts > /tmp/n2-bloque.log 2>&1
