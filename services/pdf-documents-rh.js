@@ -151,6 +151,27 @@ function rendre(construire, options) {
 }
 
 /**
+ * LE FILIGRANE D'UN APERÇU.
+ *
+ * Un aperçu imprimé puis posé sur un bureau ne doit pas pouvoir passer pour
+ * la pièce elle-même. La mention traverse la page en diagonale, en gris
+ * clair, sous le texte : elle se voit à l'œil et ne gêne pas la lecture.
+ *
+ * On sauvegarde et restaure l'état graphique : sans cela, la rotation et la
+ * couleur resteraient actives pour tout ce qui serait écrit ensuite.
+ */
+function filigrane(doc, texte = "APERÇU — NON ÉMIS") {
+  doc.save();
+  const cx = doc.page.width / 2;
+  const cy = doc.page.height / 2;
+  doc.rotate(-38, { origin: [cx, cy] });
+  doc.font("Helvetica-Bold").fontSize(46).fillColor("#000000").opacity(0.09);
+  doc.text(texte, cx - 320, cy - 28, { width: 640, align: "center", lineBreak: false });
+  doc.opacity(1);
+  doc.restore();
+}
+
+/**
  * Pose en-tête et pied sur chaque page déjà écrite. À appeler en dernier,
  * une fois tout le contenu posé.
  */
@@ -160,6 +181,9 @@ function habiller(doc, infos) {
     doc.switchToPage(start + i);
     entete(doc, infos);
     pied(doc, { ...infos, page: i + 1, total: count });
+    /* Le filigrane en dernier, sur chaque page : une page sans mention
+       suffirait à faire prendre l'aperçu pour la pièce. */
+    if (infos.apercu) filigrane(doc);
   }
 }
 
@@ -168,10 +192,10 @@ const RESERVE_ENTETE = 52;
 
 /* ═══════════════════════════════════════════════════════════ CONTRAT ══ */
 
-function contrat({ entreprise, salarie, contrat: c, clauses = [], annexes = [] }) {
+function contrat({ entreprise, salarie, contrat: c, clauses = [], annexes = [], apercu = false }) {
   const estCDD = c.contract_type === "CDD";
   const titre = estCDD ? "CONTRAT À DURÉE DÉTERMINÉE" : "CONTRAT À DURÉE INDÉTERMINÉE";
-  const infos = { entreprise, titre, reference: c.reference };
+  const infos = { entreprise, titre, reference: c.reference, apercu };
   const aValider = clauses.filter((cl) => cl.requires_legal_validation);
 
   return rendre((doc) => {
@@ -312,8 +336,8 @@ function contrat({ entreprise, salarie, contrat: c, clauses = [], annexes = [] }
 
 /* ══════════════════════════════════════════════════════════ BULLETIN ══ */
 
-function bulletin({ entreprise, salarie, periode, calcul, contrat: c }) {
-  const infos = { entreprise, titre: "BULLETIN DE PAIE", reference: `BP-${periode}-${salarie?.employee_number || salarie?.id}` };
+function bulletin({ entreprise, salarie, periode, calcul, contrat: c, apercu = false }) {
+  const infos = { entreprise, titre: "BULLETIN DE PAIE", reference: `BP-${periode}-${salarie?.employee_number || salarie?.id}`, apercu };
 
   return rendre((doc) => {
     const L = doc.page.margins.left;
@@ -496,7 +520,7 @@ const ATTESTATIONS = {
 function attestation(type, donnees) {
   const modele = ATTESTATIONS[type];
   if (!modele) throw new Error(`Type d'attestation inconnu : ${type}`);
-  const infos = { entreprise: donnees.entreprise, titre: modele.titre, reference: donnees.reference };
+  const infos = { entreprise: donnees.entreprise, titre: modele.titre, reference: donnees.reference, apercu: donnees.apercu === true };
 
   return rendre((doc) => {
     const L = doc.page.margins.left;
@@ -541,7 +565,7 @@ function attestation(type, donnees) {
  * Il porte une référence unique et les données réelles de l'entreprise et du
  * bénéficiaire : c'est une pièce, pas une décoration.
  */
-function diplome({ entreprise, beneficiaire, intitule, mention, du, au, duree_heures, lieu, date, reference, signataire }) {
+function diplome({ entreprise, beneficiaire, intitule, mention, du, au, duree_heures, lieu, date, reference, signataire, apercu = false }) {
   return rendre((doc) => {
     const L = doc.page.margins.left;
     const large = doc.page.width - L - doc.page.margins.right;
@@ -623,7 +647,11 @@ function diplome({ entreprise, beneficiaire, intitule, mention, du, au, duree_he
              { width: large, align: "center", lineBreak: false });
     doc.page.margins.bottom = margeBasse;
     /* Pas d'en-tête ni de pied standard : un diplôme n'est pas un formulaire.
-       Le cadre, le logo et la référence en bas suffisent. */
+       Le cadre, le logo et la référence en bas suffisent.
+       Le filigrane d'aperçu, lui, est posé à la main — ce document ne passe
+       pas par `habiller`, et un aperçu sans mention se confondrait avec la
+       pièce, qui est précisément faite pour être encadrée. */
+    if (apercu) filigrane(doc);
   }, { size: "A4", layout: "landscape",
        margins: { top: 48, bottom: 48, left: 56, right: 56 } });
 }
@@ -635,5 +663,5 @@ function diplome({ entreprise, beneficiaire, intitule, mention, du, au, duree_he
    l'une des deux finirait par ajouter une page par pied. */
 module.exports = {
   contrat, bulletin, attestation, diplome, ATTESTATIONS,
-  logoDe, fcfa, jour, rendre, habiller, entete, pied, RESERVE_ENTETE,
+  logoDe, fcfa, jour, rendre, habiller, entete, pied, filigrane, RESERVE_ENTETE,
 };

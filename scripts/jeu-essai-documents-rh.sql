@@ -60,6 +60,19 @@ SELECT c.id, 'assistant_rh', 'rh.document', 'voir_remuneration', false
   FROM companies c WHERE c.id IN (1,2)
 ON CONFLICT (company_id, role, module_key, action) DO UPDATE SET allowed = false;
 
+/* Réimprimer et annuler : deux droits que l'assistante RH n'a PAS, et que la
+   direction a. Une seconde sortie d'une pièce déjà remise circule, et une
+   annulation retire sa valeur à un document que le salarié détient peut-être
+   déjà : ce sont des décisions, pas des gestes de saisie. */
+INSERT INTO role_permissions(company_id, role, module_key, action, allowed)
+SELECT c.id, r.role, 'rh.document', a.action, r.droit
+  FROM companies c
+  CROSS JOIN (VALUES ('direction',true),('super_admin',true),
+                     ('comptable',false),('assistant_rh',false)) AS r(role,droit)
+  CROSS JOIN (VALUES ('reprint'),('delete')) AS a(action)
+ WHERE c.id IN (1,2)
+ON CONFLICT (company_id, role, module_key, action) DO UPDATE SET allowed = EXCLUDED.allowed;
+
 COMMIT;
 
 DO $$

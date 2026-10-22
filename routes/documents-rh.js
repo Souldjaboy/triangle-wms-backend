@@ -111,20 +111,125 @@ module.exports = function createDocumentsRhRouter(deps) {
     `SELECT * FROM attendance_employees WHERE id = $1 AND company_id = $2`, [id, companyId]
   )).rows[0];
 
-  /** Enregistre la pièce remise, avec ce qu'elle disait et son empreinte. */
+  /** Une ligne au journal des pièces. */
+  async function journaliser(client, {
+    companyId, documentId = null, employeeId = null, docType,
+    action, motif = "", details = {}, utilisateur,
+  }) {
+    await client.query(
+      `INSERT INTO hr_document_history
+         (company_id, document_id, employee_id, doc_type, action, reason, details, acted_by, acted_by_name)
+       VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9)`,
+      [companyId, documentId, employeeId, docType, action, String(motif || ""),
+       JSON.stringify(details || {}), utilisateur?.id || null, utilisateur?.name || ""]);
+  }
+
+  /**
+   * Enregistre la pièce remise : ses octets, son empreinte, ce qu'elle disait.
+   *
+   * LES OCTETS SONT CONSERVÉS, et pas seulement l'empreinte. Réimprimer en
+   * RÉGÉNÉRANT reviendrait à produire, au moindre changement du générateur —
+   * une marge, une mention, un logo —, un document différent de celui qui a
+   * été remis au salarié, et dont l'empreinte ne correspondrait plus. Une
+   * attestation signée se conserve, elle ne se recalcule pas.
+   *
+   * LES VERSIONS SE CHAÎNENT — MAIS SEULEMENT QUAND C'EST LA MÊME PIÈCE.
+   *
+   * Un bulletin de septembre et un autre bulletin de septembre pour le même
+   * salarié sont deux versions d'une seule pièce : la seconde doit remplacer
+   * la première, sans quoi deux bulletins du même mois circulent et rien ne
+   * dit lequel fait foi. Il en va de même pour le contrat : rééditer celui de
+   * Monsieur Diallo, c'est le corriger.
+   *
+   * Une attestation de travail demandée en janvier et une autre en juin ne
+   * sont PAS deux versions : ce sont deux pièces, chacune datée, chacune
+   * valable. Les chaîner obligerait à justifier d'un « motif de correction »
+   * pour une demande parfaitement ordinaire, et marquerait « remplacée » une
+   * attestation que le salarié détient toujours.
+   *
+   * Le versionnement s'applique donc quand la pièce a une IDENTITÉ NATURELLE :
+   * une période (le bulletin) ou un contrat (le contrat). Sinon, chaque
+   * édition est une pièce de plus, avec sa propre référence.
+   */
   async function enregistrer(client, {
     companyId, employeeId, contractId = null, docType, ref, titre,
-    periode = null, payload, pdf, utilisateur,
+    periode = null, payload, pdf, utilisateur, motifVersion = "",
+    versionnee = false,
   }) {
+    let precedente = null;
+    if (versionnee) {
+      const { rows: precedentes } = await client.query(
+        `SELECT * FROM hr_documents
+          WHERE company_id = $1 AND doc_type = $3 AND status = 'EMIS'
+            AND employee_id IS NOT DISTINCT FROM $2
+            AND COALESCE(period_code,'') = COALESCE($4,'')
+            AND contract_id IS NOT DISTINCT FROM $5
+          ORDER BY version DESC, id DESC
+          FOR UPDATE`,
+        [companyId, employeeId || null, docType, periode, contractId]);
+      precedente = precedentes[0] || null;
+    }
+
+    if (precedente) {
+      const motif = String(motifVersion || "").trim();
+      if (motif.length < 10) {
+        throw erreur(
+          `Une pièce ${docType} existe déjà pour ce salarié${periode ? ` et la période ${periode}` : ""} (${precedente.reference}). La rééditer demande un motif de 10 caractères minimum : il dira pourquoi deux versions existent.`,
+          "VERSION_REASON_REQUIRED", 409);
+      }
+    }
+    const version = precedente ? Number(precedente.version) + 1 : 1;
+
     const { rows } = await client.query(
       `INSERT INTO hr_documents
          (company_id, employee_id, contract_id, doc_type, reference, title,
-          period_code, payload, pdf_sha256, issued_by, issued_by_name)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11) RETURNING *`,
+          period_code, payload, pdf_sha256, pdf_content, pdf_bytes,
+          status, version, supersedes_document_id, version_reason,
+          issued_by, issued_by_name)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,'EMIS',$12,$13,$14,$15,$16)
+       RETURNING *`,
       [companyId, employeeId || null, contractId, docType, ref, titre, periode,
        JSON.stringify(payload), crypto.createHash("sha256").update(pdf).digest("hex"),
+       pdf, pdf.length, version, precedente ? precedente.id : null,
+       precedente ? String(motifVersion).trim() : "",
        utilisateur?.id || null, utilisateur?.name || ""]);
-    return rows[0];
+    const doc = rows[0];
+
+    if (precedente) {
+      await client.query(
+        `UPDATE hr_documents
+            SET status = 'REMPLACE', superseded_at = now(), superseded_by_document_id = $2
+          WHERE id = $1`, [precedente.id, doc.id]);
+      await journaliser(client, {
+        companyId, documentId: precedente.id, employeeId, docType,
+        action: "REMPLACEMENT", motif: String(motifVersion).trim(),
+        details: { remplacee_par: doc.reference, version: doc.version }, utilisateur,
+      });
+    }
+    await journaliser(client, {
+      companyId, documentId: doc.id, employeeId, docType,
+      action: precedente ? "NOUVELLE_VERSION" : "EMISSION",
+      motif: precedente ? String(motifVersion).trim() : "",
+      details: { reference: ref, version, octets: pdf.length }, utilisateur,
+    });
+
+    /* Les octets ne repartent pas au client HTTP : la réponse JSON porte le
+       registre, pas le fichier. `GET /rh/documents/:id/pdf` sert la pièce. */
+    delete doc.pdf_content;
+    return doc;
+  }
+
+  /**
+   * Un aperçu : le PDF est construit exactement comme la pièce, portant un
+   * filigrane « APERÇU — NON ÉMIS », et RIEN n'est enregistré au registre.
+   * Seul le fait d'avoir regardé est noté — c'est la preuve que le document a
+   * été relu avant d'être remis.
+   */
+  async function noterApercu(client, { companyId, employeeId, docType, utilisateur, details }) {
+    await journaliser(client, {
+      companyId, documentId: null, employeeId, docType,
+      action: "APERCU", details: details || {}, utilisateur,
+    });
   }
 
   const envoyerPdf = (res, pdf, nom) => {
@@ -307,15 +412,28 @@ module.exports = function createDocumentsRhRouter(deps) {
         /* Les annexes ne sont citées que si elles sont RÉELLEMENT jointes. */
         const annexes = Array.isArray(req.body?.annexes) ? req.body.annexes : [];
 
-        const pdf = await PDF.contrat({ entreprise, salarie, contrat, clauses, annexes });
+        const apercu = req.query.apercu === "1";
+        const pdf = await PDF.contrat({ entreprise, salarie, contrat, clauses, annexes, apercu });
 
         await client.query("BEGIN");
+        if (apercu) {
+          await noterApercu(client, {
+            companyId, employeeId: salarie?.id, docType: "CONTRAT",
+            utilisateur: { id: req.user?.id, name: nomDe(req) },
+            details: { contrat: contrat.reference },
+          });
+          await client.query("COMMIT");
+          return envoyerPdf(res, pdf, `APERCU-${contrat.reference}`);
+        }
         await enregistrer(client, {
           companyId, employeeId: salarie?.id, contractId: contrat.id,
           docType: "CONTRAT", ref: await reference(client, companyId, "DOC"),
           titre: `Contrat ${contrat.contract_type} — ${salarie?.full_name || ""}`,
           payload: { contrat, clauses: clauses.map((c) => c.clause_key), annexes },
           pdf, utilisateur: { id: req.user?.id, name: nomDe(req) },
+          motifVersion: req.query.motif_version || req.body?.motif_version,
+          /* Rééditer le contrat de la même personne, c'est le corriger. */
+          versionnee: true,
         });
         await client.query("COMMIT");
 
@@ -361,15 +479,29 @@ module.exports = function createDocumentsRhRouter(deps) {
         });
 
         const entreprise = await entrepriseDe(companyId);
-        const pdf = await PDF.bulletin({ entreprise, salarie, periode, calcul, contrat });
+        const apercu = req.query.apercu === "1" || req.body?.apercu === true;
+        const pdf = await PDF.bulletin({ entreprise, salarie, periode, calcul, contrat, apercu });
 
         await client.query("BEGIN");
+        if (apercu) {
+          await noterApercu(client, {
+            companyId, employeeId: salarie.id, docType: "BULLETIN",
+            utilisateur: { id: req.user?.id, name: nomDe(req) },
+            details: { periode, net_calcule: calcul.complet === true },
+          });
+          await client.query("COMMIT");
+          return envoyerPdf(res, pdf, `APERCU-BP-${periode}`);
+        }
         const doc = await enregistrer(client, {
           companyId, employeeId: salarie.id, contractId: contrat?.id || null,
           docType: "BULLETIN", ref: await reference(client, companyId, "BP"),
           titre: `Bulletin ${periode} — ${salarie.full_name}`, periode,
           payload: { calcul, brut }, pdf,
           utilisateur: { id: req.user?.id, name: nomDe(req) },
+          motifVersion: req.body?.motif_version,
+          /* Deux bulletins du même mois pour le même salarié sont deux
+             versions d'une seule pièce. */
+          versionnee: true,
         });
         await client.query("COMMIT");
 
@@ -420,14 +552,29 @@ module.exports = function createDocumentsRhRouter(deps) {
           formation: req.body?.formation || {},
           lieu: req.body?.lieu || null, date: req.body?.date || new Date(),
         };
-        const pdf = await PDF.attestation(type, donnees);
+        /* L'APERÇU construit le MÊME document, filigrané, et n'enregistre
+           rien. On émettait pour voir ; une pièce émise par erreur se range
+           au registre et demande ensuite une annulation motivée. */
+        const apercu = req.query.apercu === "1" || req.body?.apercu === true;
+        const pdf = await PDF.attestation(type, { ...donnees, apercu });
 
         await client.query("BEGIN");
+        if (apercu) {
+          await noterApercu(client, {
+            companyId, employeeId: salarie.id, docType: type,
+            utilisateur: { id: req.user?.id, name: nomDe(req) },
+            details: { contrat: contrat.reference },
+          });
+          await client.query("COMMIT");
+          return envoyerPdf(res, pdf, `APERCU-${ref}`);
+        }
         const doc = await enregistrer(client, {
           companyId, employeeId: salarie.id, contractId: contrat.id,
           docType: type, ref, titre: PDF.ATTESTATIONS[type].titre,
           payload: { contrat_reference: contrat.reference, formation: donnees.formation },
           pdf, utilisateur: { id: req.user?.id, name: nomDe(req) },
+          /* Pas de versionnement : une attestation demandée six mois plus
+             tard est une pièce de plus, pas la correction de la première. */
         });
         await client.query("COMMIT");
 
@@ -458,15 +605,25 @@ module.exports = function createDocumentsRhRouter(deps) {
 
         const entreprise = await entrepriseDe(companyId);
         const ref = await reference(client, companyId, "DIP");
+        const apercu = req.query.apercu === "1" || req.body?.apercu === true;
         const pdf = await PDF.diplome({
           entreprise, beneficiaire: { full_name: nom },
           intitule: b.intitule, mention: b.mention, du: b.du, au: b.au,
           duree_heures: b.duree_heures, lieu: b.lieu, date: b.date || new Date(),
-          reference: ref,
+          reference: ref, apercu,
           signataire: b.signataire || { fonction: "La Direction", nom: entreprise?.manager || "" },
         });
 
         await client.query("BEGIN");
+        if (apercu) {
+          await noterApercu(client, {
+            companyId, employeeId: salarie?.id || null, docType: "DIPLOME",
+            utilisateur: { id: req.user?.id, name: nomDe(req) },
+            details: { intitule: b.intitule },
+          });
+          await client.query("COMMIT");
+          return envoyerPdf(res, pdf, `APERCU-${ref}`);
+        }
         const doc = await enregistrer(client, {
           companyId, employeeId: salarie?.id || null, docType: "DIPLOME", ref,
           titre: `Diplôme — ${nom}`, payload: { beneficiaire: nom, intitule: b.intitule },
@@ -493,8 +650,20 @@ module.exports = function createDocumentsRhRouter(deps) {
         if (req.query.type) { params.push(String(req.query.type)); conditions.push(`d.doc_type = $${params.length}`); }
         if (req.query.employee_id) { params.push(Number(req.query.employee_id)); conditions.push(`d.employee_id = $${params.length}`); }
 
+        /* Surtout pas « d.* » : la colonne pdf_content porte les octets du
+           fichier, et le registre renverrait quelques méga-octets de base64
+           à chaque chargement d'écran. Les pièces se servent une par une,
+           par /rh/documents/:id/pdf. */
         const { rows } = await pool.query(
-          `SELECT d.*, e.full_name, e.employee_number
+          `SELECT d.id, d.company_id, d.employee_id, d.contract_id, d.doc_type,
+                  d.reference, d.title, d.period_code, d.issued_on, d.payload,
+                  d.pdf_sha256, d.pdf_bytes, d.issued_by_name, d.status, d.version,
+                  d.supersedes_document_id, d.superseded_by_document_id,
+                  d.superseded_at, d.version_reason, d.printed_count,
+                  d.last_printed_at, d.cancelled_at, d.cancel_reason,
+                  d.cancelled_by_name, d.created_at,
+                  (d.pdf_content IS NOT NULL) AS archivee,
+                  e.full_name, e.employee_number
              FROM hr_documents d
              LEFT JOIN attendance_employees e ON e.id = d.employee_id
             WHERE ${conditions.join(" AND ")}
@@ -505,6 +674,162 @@ module.exports = function createDocumentsRhRouter(deps) {
           remunerations_masquees: !montants,
         });
       } catch (e) { fail(res, e, "Lecture du registre impossible."); }
+    });
+
+  /* ──────────────────── LA PIÈCE ARCHIVÉE, TELLE QUE REMISE ───────────── */
+  router.get("/rh/documents/:id/pdf", authenticateToken, requirePermission(MODULE, "print"),
+    async (req, res) => {
+      const companyId = requireCompany(req, res); if (!companyId) return;
+      const client = await pool.connect();
+      try {
+        const { rows } = await client.query(
+          `SELECT * FROM hr_documents WHERE id = $1 AND company_id = $2`,
+          [Number(req.params.id), companyId]);
+        const doc = rows[0];
+        if (!doc) throw erreur("Pièce introuvable dans cette société.", "DOCUMENT_NOT_FOUND", 404);
+
+        /* Les pièces éditées avant la migration 157 n'ont que leur empreinte :
+           on ne peut pas les resservir à l'identique, et on le DIT plutôt que
+           de régénérer un document différent sous le même numéro. */
+        if (!doc.pdf_content) {
+          throw erreur(
+            `La pièce ${doc.reference} a été éditée avant la conservation des fichiers : seules son empreinte et ses données sont gardées. La rééditer produirait un document qui n'est pas celui qui a été remis — faites-en une nouvelle version, avec son motif.`,
+            "ARCHIVE_ABSENTE", 409);
+        }
+
+        /* Réimprimer une pièce déjà remise est un droit distinct : la seconde
+           sortie circule, et toutes les mains n'ont pas à pouvoir la produire. */
+        if (doc.printed_count > 0) {
+          const ctx = await permissionsService.chargerContexte(pool, req.user, companyId);
+          if (permissionsService.decider(ctx, MODULE, "reprint").autorise !== true) {
+            throw erreur(
+              `La pièce ${doc.reference} est déjà sortie ${doc.printed_count} fois. La réimprimer demande un droit distinct.`,
+              "REPRINT_FORBIDDEN", 403);
+          }
+        }
+
+        await client.query("BEGIN");
+        const { rows: maj } = await client.query(
+          `UPDATE hr_documents
+              SET printed_count = printed_count + 1, last_printed_at = now()
+            WHERE id = $1 RETURNING printed_count`, [doc.id]);
+        await journaliser(client, {
+          companyId, documentId: doc.id, employeeId: doc.employee_id, docType: doc.doc_type,
+          action: maj[0].printed_count > 1 ? "REIMPRESSION" : "EMISSION",
+          details: { sortie: maj[0].printed_count },
+          utilisateur: { id: req.user?.id, name: nomDe(req) },
+        });
+        await client.query("COMMIT");
+
+        /* L'EMPREINTE EST REVÉRIFIÉE AVANT DE SERVIR. Si les octets stockés ne
+           donnent plus l'empreinte enregistrée, le fichier a été altéré : on
+           refuse de le remettre plutôt que de laisser circuler une pièce dont
+           on ne peut plus dire qu'elle est la bonne. */
+        const empreinte = crypto.createHash("sha256").update(doc.pdf_content).digest("hex");
+        if (empreinte !== doc.pdf_sha256) {
+          throw erreur(
+            `L'empreinte de la pièce ${doc.reference} ne correspond plus à son contenu archivé. Elle n'est pas servie.`,
+            "ARCHIVE_ALTEREE", 409);
+        }
+        envoyerPdf(res, doc.pdf_content, doc.reference);
+      } catch (e) {
+        await client.query("ROLLBACK").catch(() => {});
+        fail(res, e, "Lecture de la pièce impossible.");
+      } finally { client.release(); }
+    });
+
+  /* ─────────────────────────── LES VERSIONS ───────────────────────────── */
+  router.get("/rh/documents/:id/versions", authenticateToken, requirePermission(MODULE, "view"),
+    async (req, res) => {
+      const companyId = requireCompany(req, res); if (!companyId) return;
+      try {
+        const { rows: base } = await pool.query(
+          `SELECT * FROM hr_documents WHERE id = $1 AND company_id = $2`,
+          [Number(req.params.id), companyId]);
+        const doc = base[0];
+        if (!doc) throw erreur("Pièce introuvable dans cette société.", "DOCUMENT_NOT_FOUND", 404);
+
+        /* Toute la chaîne : même salarié, même type, même période. C'est ce
+           triplet qui définit « la même pièce », pas l'identifiant. */
+        const { rows: versions } = await pool.query(
+          `SELECT id, reference, title, version, status, issued_on, issued_by_name,
+                  version_reason, superseded_at, cancelled_at, cancel_reason,
+                  cancelled_by_name, printed_count, pdf_bytes,
+                  (pdf_content IS NOT NULL) AS archivee
+             FROM hr_documents
+            WHERE company_id = $1 AND doc_type = $2
+              AND employee_id IS NOT DISTINCT FROM $3
+              AND COALESCE(period_code,'') = COALESCE($4,'')
+            ORDER BY version DESC, id DESC`,
+          [companyId, doc.doc_type, doc.employee_id, doc.period_code]);
+
+        const { rows: histo } = await pool.query(
+          `SELECT * FROM hr_document_history
+            WHERE company_id = $1 AND document_id = ANY($2::bigint[])
+            ORDER BY acted_at DESC, id DESC`,
+          [companyId, versions.map((v) => v.id)]);
+
+        res.json({
+          document: { id: doc.id, reference: doc.reference, doc_type: doc.doc_type,
+                      period_code: doc.period_code, employee_id: doc.employee_id },
+          versions,
+          en_vigueur: versions.find((v) => v.status === "EMIS") || null,
+          historique: histo,
+        });
+      } catch (e) { fail(res, e, "Lecture des versions impossible."); }
+    });
+
+  /* ───────────────────────────── ANNULER ──────────────────────────────── */
+  router.post("/rh/documents/:id/annuler", authenticateToken, requirePermission(MODULE, "delete"),
+    async (req, res) => {
+      const companyId = requireCompany(req, res); if (!companyId) return;
+      const client = await pool.connect();
+      try {
+        const motif = String(req.body?.motif || "").trim();
+        if (motif.length < 10) {
+          throw erreur(
+            "Motif d'annulation obligatoire (10 caractères minimum) : il restera attaché à la pièce.",
+            "REASON_REQUIRED", 400);
+        }
+        await client.query("BEGIN");
+        const { rows } = await client.query(
+          `SELECT * FROM hr_documents WHERE id = $1 AND company_id = $2 FOR UPDATE`,
+          [Number(req.params.id), companyId]);
+        const doc = rows[0];
+        if (!doc) throw erreur("Pièce introuvable dans cette société.", "DOCUMENT_NOT_FOUND", 404);
+        if (doc.status === "ANNULE") {
+          throw erreur(`La pièce ${doc.reference} est déjà annulée.`, "ALREADY_CANCELLED", 409);
+        }
+        if (doc.status === "REMPLACE") {
+          throw erreur(
+            `La pièce ${doc.reference} a été remplacée par une version plus récente : c'est celle-là qu'il faut annuler.`,
+            "DOCUMENT_SUPERSEDED", 409);
+        }
+
+        /* La pièce N'EST PAS SUPPRIMÉE. Elle a pu être remise au salarié ; la
+           faire disparaître du registre rendrait inexplicable le document
+           qu'il a entre les mains. */
+        const { rows: maj } = await client.query(
+          `UPDATE hr_documents
+              SET status = 'ANNULE', cancelled_at = now(), cancelled_by = $2,
+                  cancelled_by_name = $3, cancel_reason = $4
+            WHERE id = $1 RETURNING *`,
+          [doc.id, req.user?.id || null, nomDe(req), motif]);
+        await journaliser(client, {
+          companyId, documentId: doc.id, employeeId: doc.employee_id,
+          docType: doc.doc_type, action: "ANNULATION", motif,
+          utilisateur: { id: req.user?.id, name: nomDe(req) },
+        });
+        await client.query("COMMIT");
+        delete maj[0].pdf_content;
+        res.json({
+          document: maj[0],
+          avertissement: "La pièce reste au registre, marquée annulée. Si elle a déjà été remise, prévenez le salarié : le document qu'il détient ne fait plus foi.",
+        });
+      } catch (e) {
+        await client.query("ROLLBACK").catch(() => {});
+        fail(res, e, "Annulation impossible.");
+      } finally { client.release(); }
     });
 
   return router;
