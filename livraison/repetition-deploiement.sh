@@ -200,9 +200,25 @@ grep -qE "[0-9]+ migration\(s\) appliquée\(s\)" /tmp/repetition-migrer.log
 v $? "les migrations se sont appliquées"
 [ "$code" = "0" ]; v $? "la commande s'est terminée sans erreur"
 
-for t in internal_fund_transfers hr_contracts hr_documents stock_request_corrections cement_payment_reversals; do
+for t in internal_fund_transfers hr_contracts hr_documents stock_request_corrections \
+         cement_payment_reversals invoice_statements invoice_statement_lines \
+         payment_reallocations hr_document_history invoice_duplicate_reviews; do
   psql "$DATABASE_URL" -tAc "SELECT to_regclass('public.$t')" | grep -q "$t"
   v $? "table $t créée"
+done
+# Les colonnes ajoutées à des tables ANTÉRIEURES : c'est là qu'une migration
+# additive peut malgré tout échouer sans qu'on s'en aperçoive.
+for c in "hr_documents:pdf_content" "sand_payments:original_invoice_id" \
+         "cement_payments:reallocation_count" "sand_invoices:duplicate_of_invoice_id" \
+         "accounting_transactions:show_in_financial_movements"; do
+  t="${c%%:*}"; col="${c##*:}"
+  [ "$(psql "$DATABASE_URL" -tAc "SELECT count(*) FROM information_schema.columns WHERE table_name='$t' AND column_name='$col'")" = "1" ] && r=0 || r=1
+  v $r "colonne $t.$col ajoutée"
+done
+# Les vues : une vue cassée ne se voit qu'à la première lecture.
+for vue in v_factures_deja_sur_etat v_paiements_reaffectes v_documents_rh_courants v_paires_tranchees; do
+  psql "$DATABASE_URL" -tAc "SELECT count(*) FROM $vue" >/dev/null 2>&1
+  v $? "vue $vue interrogeable"
 done
 
 # Le point le plus important : la V16 n'a pas été touchée.

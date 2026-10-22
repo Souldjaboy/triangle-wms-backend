@@ -96,10 +96,10 @@ ls "$SORTIES"/*-defaire/role_permissions-concernees.csv >/dev/null 2>&1
 v $? "les droits concernés ont été exportés"
 
 t "Niveau 2 forcé : le résultat"
-for x in internal_fund_transfers cash_voucher_history cement_payment_reversals stock_request_corrections hr_contracts hr_contract_clauses hr_documents; do
+for x in internal_fund_transfers cash_voucher_history cement_payment_reversals stock_request_corrections hr_contracts hr_contract_clauses hr_documents invoice_statements invoice_statement_lines payment_reallocations hr_document_history invoice_duplicate_reviews; do
   [ "$(q "SELECT to_regclass('public.$x') IS NULL")" = t ] && c=0 || c=1; v $c "$x retirée"
 done
-for x in v_transferts_internes_candidats v_bons_incoherents v_remboursements_attendus v_demandes_incoherentes; do
+for x in v_transferts_internes_candidats v_bons_incoherents v_remboursements_attendus v_demandes_incoherentes v_factures_deja_sur_etat v_paiements_reaffectes v_documents_rh_courants v_paires_tranchees; do
   [ "$(q "SELECT to_regclass('public.$x') IS NULL")" = t ] && c=0 || c=1; v $c "vue $x retirée"
 done
 [ "$(q "SELECT count(*) FROM information_schema.columns WHERE table_name='accounting_transactions' AND column_name='show_in_financial_movements'")" = 0 ] && c=0 || c=1

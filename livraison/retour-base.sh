@@ -13,7 +13,7 @@
 #    niveau 1   ./retour-base.sh verifier
 #               Ne touche à rien. Dit si le retour du CODE SEUL suffit.
 #               Dans la quasi-totalité des cas, c'est la bonne réponse : les
-#               cinq migrations du lot n'ajoutent que des tables, des colonnes
+#               neuf migrations du lot n'ajoutent que des tables, des colonnes
 #               et des vues. L'ancien code les ignore.
 #
 #    niveau 2   ./retour-base.sh defaire-ajouts
@@ -45,12 +45,17 @@ echec() { echo "  ${ROUGE}✘ $*${ZERO}" >&2; exit 1; }
 q() { psql "$DATABASE_URL" -tA -c "$1" 2>/dev/null; }
 q "SELECT 1" >/dev/null || echec "Base inaccessible."
 
-# Les cinq migrations du lot et ce qu'elles ont apporté.
-LOT=(150 151 152 153 154)
+# Les migrations du lot et ce qu'elles ont apporté.
+LOT=(150 151 152 153 154 155 156 157 158)
 NOUVELLES_TABLES=(internal_fund_transfers cash_voucher_history cement_payment_reversals
-                  stock_request_corrections hr_contracts hr_contract_clauses hr_documents)
+                  stock_request_corrections hr_contracts hr_contract_clauses hr_documents
+                  invoice_statements invoice_statement_lines invoice_statement_history
+                  invoice_statement_history_notice payment_reallocations
+                  hr_document_history invoice_duplicate_reviews)
 NOUVELLES_VUES=(v_transferts_internes_candidats v_bons_incoherents
-                v_remboursements_attendus v_demandes_incoherentes)
+                v_remboursements_attendus v_demandes_incoherentes
+                v_factures_deja_sur_etat v_paiements_reaffectes
+                v_documents_rh_courants v_paires_tranchees)
 
 confirmer() {
   local phrase="$1"
@@ -81,6 +86,26 @@ verifier() {
     fi
   done
 
+  titre "Les gestes déjà faits, que défaire ne défera PAS"
+  for t in payment_reallocations invoice_duplicate_reviews; do
+    if [ "$(q "SELECT to_regclass('public.$t') IS NOT NULL")" = "t" ]; then
+      n="$(q "SELECT count(*) FROM $t")"
+      [ "${n:-0}" -gt 0 ] && echo "  • $t : ${GRAS}$n${ZERO} — voir ci-dessous"
+    fi
+  done
+  reaff="$(q "SELECT count(*) FROM payment_reallocations WHERE reverted_at IS NULL" 2>/dev/null || echo 0)"
+  neutr="$(q "SELECT count(*) FROM invoice_duplicate_reviews WHERE neutralized_at IS NOT NULL" 2>/dev/null || echo 0)"
+  if [ "${reaff:-0}" -gt 0 ]; then
+    alerte "$reaff paiement(s) ont été portés sur une autre facture. Retirer le"
+    alerte "journal des réaffectations ne les ramènera PAS : ils resteront où ils"
+    alerte "sont, et plus rien ne dira qu'ils ont bougé. Annulez-les d'abord si"
+    alerte "vous voulez revenir en arrière."
+  fi
+  if [ "${neutr:-0}" -gt 0 ]; then
+    alerte "$neutr facture(s) ont été neutralisées comme doublons. Elles restent"
+    alerte "annulées : supprimer le registre des verdicts n'y change rien."
+  fi
+
   titre "Les transferts internes, le point sensible"
   if [ "$(q "SELECT to_regclass('public.internal_fund_transfers') IS NOT NULL")" = "t" ]; then
     local actifs; actifs="$(q "SELECT count(*) FROM internal_fund_transfers WHERE status = 'ACTIF'")"
@@ -97,7 +122,7 @@ verifier() {
   fi
 
   titre "Verdict"
-  echo "  Les cinq migrations du lot sont ${GRAS}additives${ZERO} : nouvelles tables,"
+  echo "  Les neuf migrations du lot sont ${GRAS}additives${ZERO} : nouvelles tables,"
   echo "  nouvelles colonnes avec valeur par défaut, nouvelles vues, nouveaux"
   echo "  droits. Aucune ne réécrit ni ne supprime de donnée antérieure."
   echo
@@ -231,7 +256,7 @@ defaire_ajouts() {
 
   titre "Suppression, dans l'ordre inverse de l'application"
   local echecs=0
-  for n in 154 153 152 151 150; do
+  for n in 158 157 156 155 154 153 152 151 150; do
     local f; f="$(ls "$RACINE"/sql/retour/${n}_*_defaire.sql 2>/dev/null | head -1)"
     [ -n "$f" ] || { alerte "aucun fichier de retour pour $n"; continue; }
     if psql "$DATABASE_URL" -q -v ON_ERROR_STOP=1 -f "$f" >/dev/null 2>"$dossier/erreur-$n.log"; then
