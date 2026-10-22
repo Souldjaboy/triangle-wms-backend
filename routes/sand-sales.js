@@ -1737,6 +1737,13 @@ if (!multiTruckRows.length && sale.camion_id) {
              LEFT JOIN sand_customers c ON c.id = i.customer_id AND c.company_id = i.company_id
             WHERE i.company_id = $1
               AND COALESCE(i.remaining_amount, 0) > 0
+              /* Une facture ANNULÉE n'est pas due. Sans ce filtre elle
+                 figurait dans les impayés et gonflait le « TOTAL RÉELLEMENT
+                 IMPAYÉ » de son montant — un chiffre que personne ne
+                 réclamera jamais, puisque la facture n'existe plus
+                 commercialement. */
+              AND i.status <> 'ANNULEE'
+              AND i.cancelled_at IS NULL
             ORDER BY i.invoice_date DESC, i.id DESC`,
           [companyId]
         );

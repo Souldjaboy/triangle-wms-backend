@@ -126,4 +126,12 @@ ON CONFLICT (company_id, role, module_key, action) DO UPDATE SET allowed = EXCLU
 UPDATE role_permissions SET allowed = false
  WHERE company_id = 2 AND role = 'comptable' AND module_key = 'ciment';
 
+-- Les modules souscrits par la société. « sand » et « cement » sont opt-in :
+-- sans ces lignes, le serveur répond « module non activé » et les écrans
+-- restent vides — ce que l'essai mesurerait comme un défaut d'interface.
+INSERT INTO company_modules (company_id, module_key, is_enabled)
+SELECT c.id, m.k, TRUE
+  FROM (VALUES (1),(2)) AS c(id), (VALUES ('sand'),('cement')) AS m(k)
+ON CONFLICT (company_id, module_key) DO UPDATE SET is_enabled = TRUE;
+
 COMMIT;

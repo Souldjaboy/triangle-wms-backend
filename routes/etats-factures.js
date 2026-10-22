@@ -36,7 +36,7 @@ const MODULE = "etat_facture";
 
 module.exports = function createEtatsFacturesRouter(deps) {
   const { pool, authenticateToken, getEffectiveCompanyId, requirePermission,
-          permissionsService, logActivity } = deps;
+          permissionsService, logActivity, isCompanyModuleEnabled } = deps;
   const router = express.Router();
 
   const companyOf = (req) => Number(getEffectiveCompanyId(req, req.user?.company_id) || 0);
@@ -61,12 +61,20 @@ module.exports = function createEtatsFacturesRouter(deps) {
 
   /* Le second verrou : voir le produit. On répond 404 et non 403, comme le
      fait requirePermission pour un module caché — dire « interdit » apprend
-     déjà que la chose existe. */
+     déjà que la chose existe.
+     Deux questions distinctes, et les deux doivent avoir une réponse :
+     la société a-t-elle SOUSCRIT au module (company_modules), et la personne
+     a-t-elle le DROIT de le voir (role_permissions) ? Sans la première, une
+     société sans le module sable lirait ses factures par les états. */
   async function produitAutorise(req, res, companyId, produitCle) {
     let p;
     try { p = E.produitDe(produitCle); }
     catch (e) { res.status(400).json({ error: e.message, code: e.code }); return null; }
     try {
+      if (isCompanyModuleEnabled && !(await isCompanyModuleEnabled(companyId, p.module))) {
+        res.status(404).json({ error: "Ressource introuvable.", code: "NOT_FOUND" });
+        return null;
+      }
       const ctx = await permissionsService.chargerContexte(pool, req.user, companyId);
       const vu = permissionsService.decider(ctx, p.module, "visible").autorise === true
               || permissionsService.decider(ctx, p.module, "view").autorise === true;

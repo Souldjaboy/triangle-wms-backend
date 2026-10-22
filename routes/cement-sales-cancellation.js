@@ -24,6 +24,7 @@
  */
 
 const express = require("express");
+const S = require("../services/soldes-factures");
 const { reverseSalePaymentAccounting } = require("./sales-payment-accounting");
 
 module.exports = function createCementCancellationRouter({
@@ -56,59 +57,12 @@ module.exports = function createCementCancellationRouter({
        JSON.stringify(avant || {}), JSON.stringify(apres || {})]);
   }
 
-  /**
-   * Le solde de la facture, reconstruit depuis la SOMME RÉELLE des paiements
-   * NON contrepassés. « ancien − montant » dériverait au moindre incident.
-   */
-  async function recomputerFacture(client, companyId, invoiceId) {
-    const { rows } = await client.query(
-      `UPDATE cement_invoices i
-          SET paid_amount = p.total,
-              remaining_amount = GREATEST(i.total_amount - p.total, 0),
-              status = CASE
-                WHEN i.cancelled_at IS NOT NULL THEN i.status
-                WHEN p.total >= i.total_amount AND i.total_amount > 0 THEN 'PAYEE'
-                WHEN p.total > 0 THEN 'PARTIELLEMENT_PAYEE'
-                ELSE 'IMPAYEE' END,
-              updated_at = NOW()
-         FROM (SELECT COALESCE(SUM(pay.amount), 0) AS total
-                 FROM cement_payments pay
-                WHERE pay.company_id = $1 AND pay.invoice_id = $2
-                  AND NOT EXISTS (SELECT 1 FROM cement_payment_reversals r
-                                   WHERE r.company_id = pay.company_id
-                                     AND r.original_payment_id = pay.id)) p
-        WHERE i.id = $2 AND i.company_id = $1
-        RETURNING i.*`,
-      [companyId, invoiceId]);
-    const facture = rows[0];
-
-    /* La vente porte les mêmes montants que sa facture : les laisser diverger
-       ferait dire deux choses différentes à deux écrans. */
-    if (facture?.sale_id) {
-      await client.query(
-        /* Deux pièges tenus ici.
-
-           Les types sont donnés explicitement : le même paramètre sert de
-           valeur à affecter ET de terme de comparaison, et PostgreSQL refuse
-           alors de deviner.
-
-           Et une VENTE ne connaît pas le statut « IMPAYEE » — c'est la
-           facture qui l'emploie. Une vente facturée dont plus rien n'est
-           réglé retourne à « FACTUREE ». L'encaissement n'avait jamais
-           rencontré ce cas : un paiement fait toujours monter le payé. La
-           contrepassation, elle, peut le ramener à zéro. */
-        `UPDATE cement_sales
-            SET paid_amount = $3::numeric, remaining_amount = $4::numeric,
-                status = CASE WHEN $4::numeric <= 0 THEN 'PAYEE'
-                              WHEN $3::numeric > 0 THEN 'PARTIELLEMENT_PAYEE'
-                              ELSE 'FACTUREE' END,
-                updated_at = NOW()
-          WHERE id = $1::int AND company_id = $2::int`,
-        [facture.sale_id, companyId,
-         Number(facture.paid_amount), Number(facture.remaining_amount)]);
-    }
-    return facture;
-  }
+  /* Le solde se reconstruit depuis la somme réelle des paiements non
+     contrepassés. Le calcul vit dans services/soldes-factures.js : il servait
+     ici et dans le sable, à l'identique, et la réaffectation en avait besoin
+     à son tour. Trois copies d'une règle comptable disent trois choses. */
+  const recomputerFacture = (client, companyId, invoiceId) =>
+    S.recomputerFacture(client, { companyId, product: "CIMENT", invoiceId });
 
   /* ─────────────────────── CONTREPASSER UN PAIEMENT ───────────────────── */
   router.post(

@@ -37,6 +37,7 @@
  */
 
 const express = require("express");
+const S = require("../services/soldes-factures");
 const {
   recordSalePaymentAccounting, reverseSalePaymentAccounting,
 } = require("./sales-payment-accounting");
@@ -126,29 +127,13 @@ module.exports = function createSandSalesCancellationRouter({
   /** paid_amount/remaining_amount/status recalculés en EXCLUANT les paiements
       contrepassés — un paiement contrepassé reste en base, mais ne compte
       plus dans les recettes actives ni dans le solde de la facture. */
-  async function recomputerFacture(client, companyId, invoiceId) {
-    const { rows } = await client.query(
-      `UPDATE sand_invoices i
-          SET paid_amount = p.total,
-              remaining_amount = GREATEST(i.total_amount - p.total, 0),
-              status = CASE
-                WHEN i.cancelled_at IS NOT NULL THEN i.status
-                WHEN p.total >= i.total_amount AND i.total_amount > 0 THEN 'PAYEE'
-                WHEN p.total > 0 THEN 'PARTIELLEMENT_PAYEE'
-                ELSE 'IMPAYEE' END,
-              updated_at = NOW()
-         FROM (SELECT COALESCE(SUM(pay.amount), 0) AS total
-                 FROM sand_payments pay
-                WHERE pay.company_id = $1 AND pay.invoice_id = $2
-                  AND NOT EXISTS (SELECT 1 FROM sand_payment_reversals r
-                                    WHERE r.company_id = pay.company_id
-                                      AND r.original_payment_id = pay.id)) p
-        WHERE i.id = $2 AND i.company_id = $1
-        RETURNING i.*`,
-      [companyId, invoiceId]
-    );
-    return rows[0];
-  }
+  /* Même calcul que pour le ciment, au même endroit. Au passage, la vente de
+     sable voit désormais ses montants payés suivre sa facture : ils restaient
+     périmés après une contrepassation. Son STATUT n'est pas touché — la
+     contrainte de sand_sales n'accepte pas « PAYEE », et un statut de vente ne
+     dit pas où en est le règlement. */
+  const recomputerFacture = (client, companyId, invoiceId) =>
+    S.recomputerFacture(client, { companyId, product: "SABLE", invoiceId });
 
   /**
    * Contrepasse UN paiement : argent ressorti, écritures inverses, jamais

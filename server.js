@@ -19525,6 +19525,21 @@ app.use(
   })
 );
 
+/* Réaffecter un paiement à la bonne facture. L'argent est entré et y reste :
+   seule son imputation change, et AUCUNE écriture de trésorerie n'est créée —
+   en créer une seconde doublerait les recettes. Le déplacement est atomique,
+   de sorte qu'il n'existe aucun instant où le paiement serait libre et
+   attribuable deux fois. À distinguer de la contrepassation, qui fait
+   ressortir l'argent, et du remboursement, qui le rend au client. */
+const createReaffectationPaiementsRouter = require("./routes/reaffectation-paiements");
+app.use(
+  "/",
+  createReaffectationPaiementsRouter({
+    pool, authenticateToken, getEffectiveCompanyId, permissionsService, logActivity,
+    isCompanyModuleEnabled,
+  })
+);
+
 /* États de factures, sable et ciment. Un état validé est une pièce : ses
    factures cessent d'être disponibles, et la règle est tenue par un index
    unique — pas par une vérification applicative que deux validations
@@ -19535,7 +19550,7 @@ app.use(
   "/",
   createEtatsFacturesRouter({
     pool, authenticateToken, getEffectiveCompanyId, requirePermission,
-    permissionsService, logActivity,
+    permissionsService, logActivity, isCompanyModuleEnabled,
   })
 );
 
