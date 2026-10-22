@@ -628,4 +628,12 @@ function diplome({ entreprise, beneficiaire, intitule, mention, du, au, duree_he
        margins: { top: 48, bottom: 48, left: 56, right: 56 } });
 }
 
-module.exports = { contrat, bulletin, attestation, diplome, ATTESTATIONS, logoDe, fcfa, jour };
+/* `rendre`, `habiller`, `entete`, `pied` et RESERVE_ENTETE sont exportés pour
+   que les états de factures posent leurs pages de la même façon : pages
+   tamponnées, en-tête et pied sur chacune, marge basse neutralisée le temps
+   d'écrire le pied. Deux implémentations de ce mécanisme divergeraient, et
+   l'une des deux finirait par ajouter une page par pied. */
+module.exports = {
+  contrat, bulletin, attestation, diplome, ATTESTATIONS,
+  logoDe, fcfa, jour, rendre, habiller, entete, pied, RESERVE_ENTETE,
+};

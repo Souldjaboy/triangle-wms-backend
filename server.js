@@ -19525,6 +19525,20 @@ app.use(
   })
 );
 
+/* États de factures, sable et ciment. Un état validé est une pièce : ses
+   factures cessent d'être disponibles, et la règle est tenue par un index
+   unique — pas par une vérification applicative que deux validations
+   simultanées contourneraient. Corriger n'efface rien : un nouvel état
+   remplace l'ancien, qui reste consultable et cesse de réclamer. */
+const createEtatsFacturesRouter = require("./routes/etats-factures");
+app.use(
+  "/",
+  createEtatsFacturesRouter({
+    pool, authenticateToken, getEffectiveCompanyId, requirePermission,
+    permissionsService, logActivity,
+  })
+);
+
 /* Documents du personnel : contrats CDI/CDD, bulletins, attestations,
    certificats et diplômes. Aucun taux de cotisation n'est écrit dans le code :
    le bulletin lit `tax_rules`, et sans taux vérifié il affiche « non calculé »
