@@ -15,7 +15,9 @@
 #  Le but n'est pas de voir le script « marcher » : c'est de voir ce qui
 #  casse, dans un endroit où cela ne coûte rien.
 # ═════════════════════════════════════════════════════════════════════════
-set -euo pipefail
+# Pas de « set -e » : une répétition doit montrer TOUS les points qui cassent,
+# pas s'arrêter au premier. Les commandes dont dépend la suite portent « || echec ».
+set -uo pipefail
 
 PGBIN="${PGBIN:-/usr/lib/postgresql/16/bin}"
 PGPORT="${PGPORT:-5433}"
