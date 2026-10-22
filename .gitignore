@@ -4,3 +4,10 @@ uploads
 .DS_Store
 sql/.DS_Store
 uploads/imports/
+
+# Les archives de livraison : des binaires de plusieurs méga-octets, que
+# « livraison/preparer-archives.sh » reconstruit à l'identique quand il faut.
+# Les garder dans Git alourdirait chaque clone sans rien apporter.
+livraison/archives/
+livraison/triangle-livraison-*.tar.gz
+livraison/triangle-livraison-*.sha256
