@@ -40,6 +40,7 @@ v() { if [ "$1" = "0" ]; then reussis=$((reussis+1)); ok "$2"; else echoues=$((e
 
 nettoyer() {
   [ -n "${SRV:-}" ] && kill "$SRV" 2>/dev/null || true
+  [ -n "${COPIE:-}" ] && rm -rf "$COPIE" || true
   psql "postgresql://postgres@127.0.0.1:${PGPORT}/postgres" -tAc \
     "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='${BASE}'" >/dev/null 2>&1 || true
   su postgres -c "$PGBIN/dropdb -p $PGPORT --force --if-exists $BASE" >/dev/null 2>&1 || true
@@ -82,10 +83,22 @@ CREATE TABLE IF NOT EXISTS rh_documents_emis (id SERIAL PRIMARY KEY, company_id 
 SQL
 ok "V16 RH simulée (tables rh_*, migrations 106 au registre)"
 
-# Des données, pour que le retour arrière ait quelque chose à protéger.
-psql "$DATABASE_URL" -q -f scripts/jeu-essai-demandes-correction.sql >/dev/null 2>&1 || true
-avant_demandes="$(psql "$DATABASE_URL" -tAc "SELECT count(*) FROM stock_requests" 2>/dev/null || echo 0)"
-ok "$avant_demandes demande(s) en base"
+# Des données d'AVANT le lot, pour que « rien n'a été perdu » veuille dire
+# quelque chose. Le jeu d'essai de la partie C dépend de la migration 153 : il
+# ne peut donc pas servir ici, où l'on simule l'état antérieur. On écrit donc
+# directement dans les tables que la production possède déjà.
+psql "$DATABASE_URL" -q <<'SQL' >/dev/null
+INSERT INTO companies(id, name) VALUES (1,'Triangle'),(2,'FAT & MAT') ON CONFLICT (id) DO NOTHING;
+INSERT INTO stock_requests(company_id, reference, request_type, status, motif, validated_at)
+VALUES (1,'REP-AVANT-1','SORTIE','VALIDEE','antérieure au lot', now()),
+       (1,'REP-AVANT-2','TRANSFERT','RECUE','antérieure au lot', now()),
+       (2,'REP-AVANT-3','ENTREE','VALIDEE','antérieure au lot', now())
+ON CONFLICT (company_id, reference) DO NOTHING;
+SQL
+avant_demandes="$(psql "$DATABASE_URL" -tAc "SELECT count(*) FROM stock_requests")"
+avant_empreinte="$(psql "$DATABASE_URL" -tAc "SELECT md5(string_agg(reference||status, ',' ORDER BY id)) FROM stock_requests")"
+[ "$avant_demandes" -ge 3 ] || echec "Les données d'avant ne se sont pas écrites : la suite ne prouverait rien."
+ok "$avant_demandes demande(s) antérieure(s) en base, empreinte ${avant_empreinte:0:12}"
 
 # ═══════════════════════════════════════════════════════════════════════
 titre "Détection des conflits AVANT de toucher à quoi que ce soit"
@@ -100,19 +113,61 @@ v $? "aucune collision de numéro après renumérotation en 150–154"
 [ "$code" = "2" ]; v $? "le détecteur sort en code 2 : il bloquerait le déploiement"
 
 # ═══════════════════════════════════════════════════════════════════════
-titre "Parcours Git"
+titre "Parcours Git — pour de vrai, sur une copie isolée"
 cd "$RACINE"
-git rev-parse --abbrev-ref HEAD >/dev/null 2>&1; v $? "le dépôt répond"
 BRANCHE_ACTUELLE="$(git rev-parse --abbrev-ref HEAD)"
-COMMIT_AVANT="$(git rev-parse HEAD)"
-ok "branche $BRANCHE_ACTUELLE, commit ${COMMIT_AVANT:0:8}"
-[ -z "$(git status --porcelain)" ]; v $? "l'arbre de travail est propre (sinon le déploiement écraserait du local)"
+COMMIT_CIBLE="$(git rev-parse HEAD)"
+COMMIT_AVANT_LOT="${COMMIT_AVANT_LOT:-$(git merge-base HEAD origin/main 2>/dev/null || echo '')}"
+[ -z "$(git status --porcelain)" ] && c=0 || c=1
+v $c "l'arbre de travail est propre (sinon le déploiement écraserait du local)"
+
+# On ne se contente pas de regarder : on refait le geste du déploiement sur une
+# COPIE placée à l'état d'avant le lot, comme l'est la production.
+COPIE="$(mktemp -d /tmp/repetition-prod-XXXXXX)"
+if [ -n "$COMMIT_AVANT_LOT" ]; then
+  git clone --quiet --no-hardlinks "$RACINE" "$COPIE/backend" 2>/dev/null
+  ( cd "$COPIE/backend" && git checkout --quiet "$COMMIT_AVANT_LOT" -B simulation-production ) 2>/dev/null
+  [ -d "$COPIE/backend/.git" ] && c=0 || c=1
+  v $c "copie « production » placée sur ${COMMIT_AVANT_LOT:0:8}, avant le lot"
+
+  # git fetch — le geste exact du script de déploiement
+  ( cd "$COPIE/backend" && git fetch origin "$BRANCHE_ACTUELLE" ) >/dev/null 2>&1
+  v $? "git fetch origin $BRANCHE_ACTUELLE"
+
+  # git checkout puis merge --ff-only : ce qui échoue si la branche a divergé
+  ( cd "$COPIE/backend" && git checkout --quiet "$BRANCHE_ACTUELLE" ) >/dev/null 2>&1
+  v $? "git checkout $BRANCHE_ACTUELLE (la branche locale est créée au besoin)"
+  ( cd "$COPIE/backend" && git merge --ff-only "origin/$BRANCHE_ACTUELLE" ) >/dev/null 2>&1
+  v $? "git merge --ff-only : avance sans commit de fusion"
+  [ "$(cd "$COPIE/backend" && git rev-parse HEAD)" = "$COMMIT_CIBLE" ] && c=0 || c=1
+  v $c "la copie est arrivée sur ${COMMIT_CIBLE:0:8}, le commit visé"
+
+  # Et le refus attendu quand la production a un commit local : le déploiement
+  # doit s'arrêter, pas écraser.
+  ( cd "$COPIE/backend" && git checkout --quiet -B divergence "$COMMIT_AVANT_LOT" \
+      && git commit --quiet --allow-empty -m "commit posé à la main sur la production" \
+      && ! git merge --ff-only "origin/$BRANCHE_ACTUELLE" ) >/dev/null 2>&1
+  v $? "merge --ff-only REFUSE d'avancer si la production porte un commit local"
+else
+  alerte "origin/main introuvable : parcours Git réel non testé."
+fi
 
 # ═══════════════════════════════════════════════════════════════════════
-titre "Dépendances"
-[ -f package-lock.json ]; v $? "package-lock.json présent (npm ci l'exige)"
+titre "Dépendances — npm ci réellement exécuté"
+[ -f package-lock.json ] && c=0 || c=1
+v $c "package-lock.json présent (npm ci l'exige)"
+if [ -d "$COPIE/backend" ]; then
+  ( cd "$COPIE/backend" && git checkout --quiet "$BRANCHE_ACTUELLE" 2>/dev/null
+    npm ci --omit=dev --no-audit --no-fund ) > /tmp/repetition-npmci.log 2>&1
+  v $? "npm ci --omit=dev aboutit sur la copie"
+  [ -d "$COPIE/backend/node_modules/express" ] && c=0 || c=1
+  v $c "les dépendances sont bien installées (express présent)"
+  # pdfkit sert aux documents RH : s'il est en devDependencies, --omit=dev le perd.
+  [ -d "$COPIE/backend/node_modules/pdfkit" ] && c=0 || c=1
+  v $c "pdfkit survit à --omit=dev (sinon les PDF RH casseraient en production)"
+fi
 node -e "require('pdfkit'); require('pg'); require('express')" 2>/dev/null
-v $? "les dépendances clés se chargent (pdfkit, pg, express)"
+v $? "les dépendances clés se chargent ici aussi"
 
 # ═══════════════════════════════════════════════════════════════════════
 titre "Sauvegarde vérifiée, puis migrations"
@@ -135,8 +190,11 @@ done
 psql "$DATABASE_URL" -tAc "SELECT to_regclass('public.rh_contrats')" | grep -q rh_contrats
 v $? "les tables de la V16 sont INTACTES"
 apres_demandes="$(psql "$DATABASE_URL" -tAc "SELECT count(*) FROM stock_requests")"
-[ "$apres_demandes" = "$avant_demandes" ]
-v $? "aucune donnée perdue ($avant_demandes demandes avant et après)"
+apres_empreinte="$(psql "$DATABASE_URL" -tAc "SELECT md5(string_agg(reference||status, ',' ORDER BY id)) FROM stock_requests")"
+[ "$apres_demandes" = "$avant_demandes" ] && c=0 || c=1
+v $c "aucune demande perdue ($avant_demandes avant, $apres_demandes après)"
+[ "$apres_empreinte" = "$avant_empreinte" ] && c=0 || c=1
+v $c "aucune demande MODIFIÉE (même empreinte de contenu)"
 
 # ═══════════════════════════════════════════════════════════════════════
 titre "Idempotence : rejouer ne doit rien changer"
@@ -194,16 +252,23 @@ v $? "les tables du lot ont bien disparu ($restantes restante(s))"
 psql "$DATABASE_URL" -tAc "SELECT to_regclass('public.rh_contrats')" | grep -q rh_contrats
 v $? "les tables de la V16 sont revenues avec la sauvegarde"
 retour_demandes="$(psql "$DATABASE_URL" -tAc "SELECT count(*) FROM stock_requests" 2>/dev/null || echo 0)"
-[ "$retour_demandes" = "$avant_demandes" ]
-v $? "les données d'avant sont retrouvées ($retour_demandes demandes)"
+retour_empreinte="$(psql "$DATABASE_URL" -tAc "SELECT md5(string_agg(reference||status, ',' ORDER BY id)) FROM stock_requests" 2>/dev/null || echo vide)"
+[ "$retour_demandes" = "$avant_demandes" ] && c=0 || c=1
+v $c "les données d'avant sont retrouvées ($retour_demandes demandes)"
+[ "$retour_empreinte" = "$avant_empreinte" ] && c=0 || c=1
+v $c "et à l'identique (même empreinte de contenu)"
 
 # ═══════════════════════════════════════════════════════════════════════
 titre "Retour arrière du CODE — distinct de celui de la base"
 cd "$RACINE"
-git rev-parse --verify "$COMMIT_AVANT" >/dev/null 2>&1
-v $? "le commit d'avant est retrouvable (${COMMIT_AVANT:0:8})"
-[ "$(git rev-parse HEAD)" = "$COMMIT_AVANT" ]
-v $? "le dépôt est resté sur son commit (la répétition n'a rien déplacé)"
+# Le déploiement note le commit d'avant dans $SAUVEGARDES/.commit-<horodatage> :
+# c'est ce fichier, et non la base, qui permet de revenir au code d'avant.
+git rev-parse --verify "$COMMIT_AVANT_LOT" >/dev/null 2>&1
+v $? "le commit d'avant le lot est retrouvable (${COMMIT_AVANT_LOT:0:8})"
+ls "$SAUVEGARDES"/.commit-* >/dev/null 2>&1 && c=1 || c=0
+v $c "« migrer » seul n'a pas touché au code (aucun .commit-* écrit)"
+[ "$(git rev-parse HEAD)" = "$COMMIT_CIBLE" ] && c=0 || c=1
+v $c "le dépôt est resté sur son commit (la répétition n'a rien déplacé)"
 
 echo
 echo "${GRAS}$(printf '─%.0s' $(seq 1 62))${ZERO}"
