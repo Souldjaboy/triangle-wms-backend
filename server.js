@@ -100,6 +100,36 @@ if (!fs.existsSync(laboratoryUploadDir)) {
   fs.mkdirSync(laboratoryUploadDir, { recursive: true });
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+   LES PIÈCES JOINTES DU CHAT SONT GARDÉES — ET CE MONTAGE DOIT RESTER ICI.
+
+   La ligne suivante sert tout le dossier « uploads » en statique, sans jeton,
+   sans société, sans conversation : qui connaît un nom de fichier obtient le
+   fichier. Ce routeur intercepte « /uploads/chat/... » AVANT elle, applique
+   les contrôles, et sert — ou refuse.
+
+   Monté APRÈS express.static, il ne serait jamais atteint : le fichier serait
+   déjà parti. L'ordre est donc la correction elle-même.
+
+   TOUT CE QUI EST PASSÉ ICI EST UN RELAIS, PAS UNE RÉFÉRENCE. `pool`,
+   `requirePermission` et `authenticateToken` sont déclarés PLUS BAS dans ce
+   fichier : les nommer à cet endroit les évaluerait maintenant, et Node
+   s'arrête sur « Cannot access 'pool' before initialization ». Les envelopper
+   dans des fonctions diffère la lecture au moment de la requête, quand tout
+   est en place. Déplacer ce montage plus bas ne serait pas une solution : il
+   passerait alors APRÈS express.static, et ne garderait plus rien.
+   ═══════════════════════════════════════════════════════════════════════ */
+const createPiecesJointesChatRouter = require("./routes/pieces-jointes-chat");
+app.use(
+  "/",
+  createPiecesJointesChatRouter({
+    pool: { query: (...a) => pool.query(...a) },
+    authenticateToken: (req, res, next) => authenticateToken(req, res, next),
+    getEffectiveCompanyId: (req, fallback) => getEffectiveCompanyId(req, fallback),
+    requirePermission: (m, a) => (req, res, next) => requirePermission(m, a)(req, res, next),
+  })
+);
+
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
 const storage = multer.diskStorage({

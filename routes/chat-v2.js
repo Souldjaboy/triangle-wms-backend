@@ -1294,8 +1294,16 @@ module.exports = function createChatV2Router({
         }
 
         res.status(201).json({
+          /* L'ADRESSE RENVOYÉE PASSE DÉSORMAIS PAR UN POINT D'ACCÈS GARDÉ.
+             « /uploads/chat/... » était servi en statique, sans jeton ni
+             vérification de conversation, et n'était de toute façon pas
+             joignable depuis le frontend — dont la réécriture ne couvre que
+             « /api/:path* ». D'où le 404 au clic sur un classeur Excel.
+             Les messages déjà enregistrés gardent leur ancienne adresse :
+             routes/pieces-jointes-chat.js la garde aussi, avec les mêmes
+             contrôles, pour que l'historique continue de fonctionner. */
           file_url:
-            `/uploads/chat/${encodeURIComponent(
+            `/chat/attachments/${encodeURIComponent(
               req.file.filename
             )}`,
 
