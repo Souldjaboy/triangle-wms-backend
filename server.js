@@ -19599,6 +19599,21 @@ app.use(
   })
 );
 
+/* Le scanner. Une séance de numérisation est un BROUILLON PRIVÉ : ses pages
+   sont rangées dès la capture — scanner dix pages prend des minutes, et un
+   écran qui se verrouille ne doit pas tout faire perdre — mais elles ne sont
+   pas dans la bibliothèque, ne se cherchent pas et ne se partagent pas tant
+   que la séance n'est pas assemblée. L'assemblage produit un PDF ordinaire,
+   avec sa version 1 marquée « original ». pdfkit s'en charge : aucune
+   dépendance nouvelle sur le serveur. */
+const createStudioScannerRouter = require("./routes/studio-scanner");
+app.use(
+  "/",
+  createStudioScannerRouter({
+    pool, authenticateToken, getEffectiveCompanyId, requirePermission, logActivity,
+  })
+);
+
 /* États de factures, sable et ciment. Un état validé est une pièce : ses
    factures cessent d'être disponibles, et la règle est tenue par un index
    unique — pas par une vérification applicative que deux validations

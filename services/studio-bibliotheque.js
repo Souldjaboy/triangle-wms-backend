@@ -146,6 +146,10 @@ async function deposer(client, {
   folderId = null, kind = "FICHIER", description = "", tags = [],
   visibility = "PRIVE", sourceDocumentId = null, sourceNote = "",
   ocrText = "", ocrLanguage = "", pageCount = null, ip = "",
+  /* D'où vient ce document, quand c'est un scan assemblé : on garde le lien
+     vers la séance pour pouvoir remonter aux pages d'origine si le PDF
+     déçoit, au lieu de tout rescanner. */
+  scanSessionId = null,
 }) {
   const controle = S.verifier({ buffer, mimeAnnonce, nomOrigine });
 
@@ -165,14 +169,16 @@ async function deposer(client, {
       `INSERT INTO studio_documents
          (company_id, folder_id, name, kind, mime, size_bytes, sha256, storage_key,
           page_count, version, ocr_text, ocr_language, tags, description, visibility,
-          owner_id, owner_name, updated_by_name, source_document_id, source_note)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,1,$10,$11,$12,$13,$14,$15,$16,$16,$17,$18)
+          owner_id, owner_name, updated_by_name, source_document_id, source_note,
+          scan_session_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,1,$10,$11,$12,$13,$14,$15,$16,$16,$17,$18,$19)
        RETURNING *`,
       [companyId, folderId, nom, kind, controle.mime, controle.taille, controle.sha256, cle,
         pageCount, String(ocrText || "").slice(0, 2_000_000), String(ocrLanguage || ""),
         Array.isArray(tags) ? tags.map((t) => String(t).slice(0, 40)).slice(0, 20) : [],
         String(description || "").slice(0, 2000), visibility,
-        utilisateur?.id || null, nomDe(utilisateur), sourceDocumentId, String(sourceNote || "")]);
+        utilisateur?.id || null, nomDe(utilisateur), sourceDocumentId, String(sourceNote || ""),
+        scanSessionId]);
     const document = rows[0];
 
     /* La version 1 EST l'original. Elle porte la marque, et ne la perdra

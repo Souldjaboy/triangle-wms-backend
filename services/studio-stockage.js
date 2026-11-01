@@ -181,10 +181,21 @@ async function ecrire(cle, buffer) {
   return { cle, taille: buffer.length, sha256: empreinte(buffer) };
 }
 
+/* ATTENTION AU NOM : « lire » rend les MÉTADONNÉES, pas le contenu. C'est le
+   piège dans lequel le scanner est tombé : il attendait un Buffer et
+   recevait { chemin, taille }, ce qui n'échouait qu'à l'écriture suivante,
+   loin de la cause. Pour les octets, c'est `octets()`. */
 async function lire(cle) {
   const chemin = cheminDe(cle);
   const stat = await fsp.stat(chemin);
   return { chemin, taille: stat.size };
+}
+
+/** Le contenu complet, en mémoire. Pour servir un fichier, préférer `flux` :
+    charger cent mégaoctets pour les recopier dans une réponse est inutile.
+    Ici c'est nécessaire — assembler un PDF demande les octets. */
+async function octets(cle) {
+  return fsp.readFile(cheminDe(cle));
 }
 
 function flux(cle) {
@@ -217,5 +228,5 @@ async function empreinteStockee(cle) {
 module.exports = {
   RACINE, TAILLE_MAX, TYPES_ACCEPTES, SANS_SIGNATURE,
   erreur, verifier, empreinte, empreinteStockee, familleReelle,
-  cleNouvelle, cheminDe, ecrire, lire, flux, existe, supprimer,
+  cleNouvelle, cheminDe, ecrire, lire, octets, flux, existe, supprimer,
 };
