@@ -19585,6 +19585,20 @@ app.use(
   })
 );
 
+/* Triangle Studio Pro — la bibliothèque documentaire.
+   Les fichiers vivent sous `storage/`, hors de tout ce qu'express sert en
+   statique : il n'existe aucune adresse publique vers eux. Le seul chemin
+   passe par des routes qui vérifient l'identité, la société et le partage.
+   L'original ne change jamais : enregistrer une modification crée une
+   version de plus, et la version 1 garde son fichier et son empreinte. */
+const createStudioBibliothequeRouter = require("./routes/studio-bibliotheque");
+app.use(
+  "/",
+  createStudioBibliothequeRouter({
+    pool, authenticateToken, getEffectiveCompanyId, requirePermission, logActivity,
+  })
+);
+
 /* États de factures, sable et ciment. Un état validé est une pièce : ses
    factures cessent d'être disponibles, et la règle est tenue par un index
    unique — pas par une vérification applicative que deux validations

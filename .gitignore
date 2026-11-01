@@ -11,3 +11,7 @@ uploads/imports/
 livraison/archives/
 livraison/triangle-livraison-*.tar.gz
 livraison/triangle-livraison-*.sha256
+
+# Le dépôt de fichiers du Studio. Volontairement HORS du dossier servi en
+# statique : aucune URL ne doit pouvoir atteindre ces documents.
+storage/
