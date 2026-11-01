@@ -226,10 +226,25 @@ const PDF2 = Buffer.from("%PDF-1.7\nContrat Triangle Logistics - version corrige
   r = await appel("POST", `/studio/documents/${doc.id}/corbeille`, { user: DIR });
   v("la mise à la corbeille passe", r.status === 200, JSON.stringify(r.data)?.slice(0, 200));
   v("et le dit clairement", /Rien n'est effacé/.test(r.data?.message || ""), r.data?.message);
-  r = await appel("GET", `/studio/documents/${doc.id}`, { user: DIR });
-  v("il n'apparaît plus dans la bibliothèque", r.status === 404, `${r.status}`);
+  r = await appel("GET", "/studio/documents", { user: DIR });
+  v("il quitte la liste courante",
+    !(r.data?.documents || []).some((x) => x.id === doc.id));
   r = await appel("GET", "/studio/documents?corbeille=1", { user: DIR });
-  v("mais il est dans la corbeille", (r.data?.documents || []).some((x) => x.id === doc.id));
+  v("et se retrouve dans la corbeille", (r.data?.documents || []).some((x) => x.id === doc.id));
+
+  /* CETTE AFFIRMATION ÉTAIT FAUSSE ET ELLE A COÛTÉ CHER. Elle exigeait un
+     404 sur la fiche d'un document à la corbeille — ce qui semblait prudent
+     et rendait en réalité la corbeille inutilisable : « Restaurer » et
+     « Supprimer définitivement » vivent dans cette fiche, donc un document
+     jeté ne pouvait plus ni revenir ni partir. Le défaut n'est apparu
+     qu'en pilotant l'écran. La frontière n'est pas là : elle est sur le
+     lien public, qui refuse bien d'ouvrir un document à la corbeille. */
+  r = await appel("GET", `/studio/documents/${doc.id}`, { user: DIR });
+  v("sa fiche s'ouvre encore, sinon la corbeille est un cul-de-sac",
+    r.status === 200, `${r.status}`);
+  v("et la fiche dit qu'il est à la corbeille", !!r.data?.document?.trashed_at);
+  r = await appel("GET", `/studio/documents/${doc.id}/fichier`, { user: DIR });
+  v("on peut le relire avant de le détruire", r.status === 200, `${r.status}`);
 
   r = await appel("POST", `/studio/documents/${doc.id}/restaurer`, { user: DIR });
   v("il se restaure", r.status === 200, `${r.status}`);

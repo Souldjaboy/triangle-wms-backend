@@ -215,9 +215,13 @@ module.exports = function createStudioBibliothequeRouter(deps) {
     async (req, res) => {
       const companyId = requireCompany(req, res); if (!companyId) return;
       try {
+        /* On sert aussi ce qui est à la corbeille : avant une suppression
+           définitive, il faut pouvoir relire le document pour être sûr de
+           ce qu'on détruit. Un lien public, lui, le refuse toujours. */
         const { document } = await B.acces(pool, {
           companyId, utilisateur: utilisateurDe(req),
-          documentId: Number(req.params.id), requis: "LECTURE" });
+          documentId: Number(req.params.id), requis: "LECTURE",
+          inclureCorbeille: true });
         await B.journaliser(pool, {
           companyId, documentId: document.id, action: "TELECHARGEMENT",
           detail: `v${document.version}`, utilisateur: utilisateurDe(req), ip: ipDe(req) });
@@ -240,7 +244,8 @@ module.exports = function createStudioBibliothequeRouter(deps) {
         if (!version) return res.status(404).json({ error: "Version introuvable.", code: "VERSION_INTROUVABLE" });
         const { document } = await B.acces(pool, {
           companyId, utilisateur: utilisateurDe(req),
-          documentId: version.document_id, requis: "LECTURE" });
+          documentId: version.document_id, requis: "LECTURE",
+          inclureCorbeille: true });
         await B.journaliser(pool, {
           companyId, documentId: document.id, action: "TELECHARGEMENT",
           detail: `version ${version.version}${version.is_original ? " (original)" : ""}`,

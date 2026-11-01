@@ -309,7 +309,14 @@ async function lister(client, { companyId, utilisateur, folderId, recherche, tag
 }
 
 async function detail(client, { companyId, utilisateur, documentId, ip = "" }) {
-  const { document, niveau, motif } = await acces(client, { companyId, utilisateur, documentId });
+  /* LA CORBEILLE DOIT S'OUVRIR. Sans `inclureCorbeille`, la liste montrait
+     le document jeté mais sa fiche répondait « introuvable » : on ne pouvait
+     plus ni le restaurer ni le supprimer, puisque les deux boutons vivent
+     dans cette fiche. La corbeille devenait un cul-de-sac. La fiche annonce
+     d'elle-même l'état du document, et un lien public refuse toujours de
+     l'ouvrir — c'est là qu'est la frontière, pas ici. */
+  const { document, niveau, motif } = await acces(client, {
+    companyId, utilisateur, documentId, inclureCorbeille: true });
   const { rows: versions } = await client.query(
     `SELECT id, version, mime, size_bytes, sha256, page_count, change_note,
             is_original, created_by_name, created_at
