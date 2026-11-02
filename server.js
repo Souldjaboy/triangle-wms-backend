@@ -19642,6 +19642,20 @@ app.use(
   })
 );
 
+/* Le studio graphique. Une création est un document ORDINAIRE — une image
+   qui se cherche, se partage, s'imprime, se signe — qui porte en plus le
+   plan de sa mise en page pour qu'on puisse la rouvrir. Si le document rangé
+   était le plan, personne n'en verrait rien. Ses dimensions physiques sont
+   conservées : sans elles, le PDF d'impression sortirait à une échelle
+   quelconque, et une carte de visite n'entrerait plus dans un porte-cartes. */
+const createStudioCreationsRouter = require("./routes/studio-creations");
+app.use(
+  "/",
+  createStudioCreationsRouter({
+    pool, authenticateToken, getEffectiveCompanyId, requirePermission, logActivity,
+  })
+);
+
 /* États de factures, sable et ciment. Un état validé est une pièce : ses
    factures cessent d'être disponibles, et la règle est tenue par un index
    unique — pas par une vérification applicative que deux validations

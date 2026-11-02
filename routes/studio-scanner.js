@@ -9,17 +9,18 @@
  * séance existe, la seconde n'apprend rien.
  */
 const express = require("express");
-const multer = require("multer");
+const { recevoir } = require("../services/televersement");
 const SC = require("../services/studio-scanner");
 const S = require("../services/studio-stockage");
 
 const MODULE = "studio.scanner";
 /* La page passe en mémoire : elle doit être contrôlée — taille, type, octets
-   de tête — AVANT d'exister quelque part. */
-const televersement = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: S.TAILLE_MAX, files: 1 },
-});
+   de tête — AVANT d'exister quelque part. Le texte reconnu de la page
+   voyage à côté et peut être volumineux : la limite de champ est élargie en
+   conséquence, sinon le refus sortait en 500 muet. */
+const televersement = recevoir("page", { messages: {
+  LIMIT_FIELD_VALUE: "Le texte reconnu de cette page est trop volumineux.",
+} });
 
 module.exports = function createStudioScannerRouter(deps) {
   const { pool, authenticateToken, getEffectiveCompanyId, requirePermission, logActivity } = deps;
@@ -95,7 +96,7 @@ module.exports = function createStudioScannerRouter(deps) {
   /* ──────────────────────────── LES PAGES ────────────────────────────── */
 
   router.post("/studio/scans/:id/pages", authenticateToken, requirePermission(MODULE, "create"),
-    televersement.single("page"), async (req, res) => {
+    televersement, async (req, res) => {
       const companyId = requireCompany(req, res); if (!companyId) return;
       if (!req.file) {
         return res.status(400).json({ error: "Aucune image reçue.", code: "PAGE_MANQUANTE" });

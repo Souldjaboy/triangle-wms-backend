@@ -15,15 +15,12 @@
  * de signature, c'est la signature.
  */
 const express = require("express");
-const multer = require("multer");
+const { recevoir } = require("../services/televersement");
 const SG = require("../services/studio-signatures");
 const S = require("../services/studio-stockage");
 
 const MODULE = "studio.signature";
-const televersement = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: SG.TAILLE_MAX, files: 1 },
-});
+const televersement = recevoir("image", { tailleMax: SG.TAILLE_MAX });
 
 module.exports = function createStudioSignaturesRouter(deps) {
   const { pool, authenticateToken, getEffectiveCompanyId, requirePermission, logActivity } = deps;
@@ -71,7 +68,7 @@ module.exports = function createStudioSignaturesRouter(deps) {
     });
 
   router.post("/studio/signatures", authenticateToken, requirePermission(MODULE, "create"),
-    televersement.single("image"), async (req, res) => {
+    televersement, async (req, res) => {
       const companyId = requireCompany(req, res); if (!companyId) return;
       if (!req.file) {
         return res.status(400).json({ error: "Aucune image reçue.", code: "IMAGE_MANQUANTE" });

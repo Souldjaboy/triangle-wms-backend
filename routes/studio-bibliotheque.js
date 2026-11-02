@@ -26,18 +26,22 @@
  */
 
 const express = require("express");
-const multer = require("multer");
+const { recevoir } = require("../services/televersement");
 const B = require("../services/studio-bibliotheque");
 const S = require("../services/studio-stockage");
 
 const MODULE = "studio.bibliotheque";
 
 /* Le fichier passe en mémoire, pas sur le disque : il doit être contrôlé —
-   taille, type annoncé, octets de tête — AVANT d'exister quelque part. */
-const televersement = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: S.TAILLE_MAX, files: 1 },
-});
+   taille, type annoncé, octets de tête — AVANT d'exister quelque part.
+
+   Et le texte reconnu d'un scan voyage à côté, dans un champ qui peut peser
+   plus d'un mégaoctet : sans la limite élargie, multer refusait l'envoi en
+   500 muet avant que le moindre contrôle applicatif ait eu lieu. */
+const televersement = recevoir("fichier", { messages: {
+  LIMIT_FIELD_VALUE:
+    "Le texte reconnu de ce document est trop volumineux pour être envoyé avec lui.",
+} });
 
 module.exports = function createStudioBibliothequeRouter(deps) {
   const { pool, authenticateToken, getEffectiveCompanyId, requirePermission, logActivity } = deps;
@@ -114,7 +118,7 @@ module.exports = function createStudioBibliothequeRouter(deps) {
     });
 
   router.post("/studio/documents", authenticateToken, requirePermission(MODULE, "create"),
-    televersement.single("fichier"), async (req, res) => {
+    televersement, async (req, res) => {
       const companyId = requireCompany(req, res); if (!companyId) return;
       if (!req.file) return res.status(400).json({ error: "Aucun fichier reçu.", code: "FICHIER_MANQUANT" });
       const r = await enTransaction(res, "Dépôt impossible.", (client) =>
@@ -165,7 +169,7 @@ module.exports = function createStudioBibliothequeRouter(deps) {
     });
 
   router.post("/studio/documents/:id/versions", authenticateToken, requirePermission(MODULE, "update"),
-    televersement.single("fichier"), async (req, res) => {
+    televersement, async (req, res) => {
       const companyId = requireCompany(req, res); if (!companyId) return;
       if (!req.file) return res.status(400).json({ error: "Aucun fichier reçu.", code: "FICHIER_MANQUANT" });
       const r = await enTransaction(res, "Nouvelle version impossible.", (client) =>
