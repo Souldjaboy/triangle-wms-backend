@@ -19614,6 +19614,21 @@ app.use(
   })
 );
 
+/* Signatures et cachets. Une signature n'appartient qu'à son propriétaire —
+   ni à son rôle, ni à la direction : quiconque l'obtient peut signer à sa
+   place. Un cachet appartient à la société et ne traverse jamais la
+   frontière entre les deux maisons. On ne supprime pas une signature, on la
+   révoque : les documents déjà signés restent signés. Chaque apposition
+   produit une version de plus — l'original non signé reste intact — et
+   laisse une trace qui garde les empreintes d'avant et d'après. */
+const createStudioSignaturesRouter = require("./routes/studio-signatures");
+app.use(
+  "/",
+  createStudioSignaturesRouter({
+    pool, authenticateToken, getEffectiveCompanyId, requirePermission, logActivity,
+  })
+);
+
 /* États de factures, sable et ciment. Un état validé est une pièce : ses
    factures cessent d'être disponibles, et la règle est tenue par un index
    unique — pas par une vérification applicative que deux validations
