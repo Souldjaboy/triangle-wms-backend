@@ -19629,6 +19629,19 @@ app.use(
   })
 );
 
+/* L'éditeur de pages : réordonner, tourner, retirer, extraire, fusionner,
+   découper. Les trois premiers changent le document et produisent une
+   version de plus ; les trois autres en fabriquent de nouveaux sans toucher
+   aux sources. Chaque réponse dit combien de pages il y avait et combien il
+   en reste — un feuillet perdu en silence se découvre au mauvais moment. */
+const createStudioPdfRouter = require("./routes/studio-pdf");
+app.use(
+  "/",
+  createStudioPdfRouter({
+    pool, authenticateToken, getEffectiveCompanyId, requirePermission, logActivity,
+  })
+);
+
 /* États de factures, sable et ciment. Un état validé est une pièce : ses
    factures cessent d'être disponibles, et la règle est tenue par un index
    unique — pas par une vérification applicative que deux validations
