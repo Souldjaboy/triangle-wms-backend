@@ -151,6 +151,81 @@ fichier.*
 **Ce qui manque à ce module** : l'ajout de texte, de tableaux et
 d'annotations sur la page elle-même.
 
+### Module 5 — l'éditeur photo
+
+Recadrer, tourner par quarts, redresser au degré, éclaircir, contraster,
+passer en noir et blanc, et le réglage qui sert le plus souvent ici :
+**« document »**, qui blanchit le papier et noircit l'encre d'une photo prise
+à la main.
+
+**L'original ne bouge jamais.** Chaque enregistrement crée une version de
+plus ; la version 1 garde son fichier et son empreinte. Un bouton rend
+l'image d'origine à tout moment, et rien n'est écrit avant qu'on le demande.
+
+Tout le travail se fait **dans le navigateur**, sur une toile : rien ne part
+au serveur avant l'enregistrement, et aucun service extérieur ne voit la
+photo.
+
+*Vérifié : 25 contrôles d'écran — l'essai dépose une image dont il connaît
+les couleurs par quadrant, puis relit les pixels du résultat après chaque
+opération : un quart de tour met bien le coin rouge en haut à droite, et
+« document » éclaircit le fond sans effacer le trait.*
+
+**Deux affirmations de l'essai étaient fausses et ont été corrigées** plutôt
+que contournées : l'une ignorait que la moitié basse de l'image d'essai est
+volontairement plus sombre, l'autre attendait d'une image en largeur qu'elle
+reste en largeur après un quart de tour.
+
+### Module 4 — le studio graphique
+
+Badges, cartes de visite, étiquettes de palette, en-têtes de courrier,
+attestations, affichettes. Six modèles, **tous dessinés pour Triangle** :
+aucun modèle sous licence n'a été repris, ni de Canva ni d'ailleurs — c'était
+une interdiction explicite du cahier des charges.
+
+On place des blocs de texte, des images, des formes, des codes QR ; on change
+les polices, les couleurs, les tailles ; on aligne, on superpose, on duplique.
+Le format se choisit en millimètres, et l'export PDF sort **à la dimension
+réelle**, prêt pour l'imprimeur.
+
+Un dessin se range dans la bibliothèque comme n'importe quel document : il se
+rouvre, se modifie, se repartage, et chaque export est une version de plus.
+Le plan de la création est gardé en JSON à côté du PDF — c'est ce qui permet
+de rouvrir un badge six mois plus tard et de n'y changer que le nom.
+
+*Vérifié : 40 contrôles d'API, 23 contrôles d'écran — l'essai pose un carré
+de couleur connue à une position connue, exporte, puis relit le pixel attendu
+dans le PDF rendu ; il vérifie aussi qu'un code QR produit est bien un
+damier et non un carré vide.*
+
+**Un défaut rendait l'éditeur inutilisable sur tout modèle portant un code
+QR** : une fonction de référence écrite dans le corps du rendu rappelait
+l'état à chaque passage, et React s'arrêtait sur une erreur de rendu infini.
+Il n'apparaissait que sur les modèles à QR, donc trois des six.
+
+### Module 10 — l'espace détente
+
+Un démineur et un taquin, dans le navigateur, pour une pause de cinq minutes.
+
+**Ce que cet espace ne fait pas est tout l'intérêt.** Il ne s'impose jamais :
+rien ne s'ouvre tout seul, rien ne clignote ailleurs dans l'application,
+aucune notification n'invite à jouer. Il n'envoie rien : pas de score, pas de
+classement, **pas de temps de jeu** — un temps de jeu mesuré finirait par
+être regardé par quelqu'un, et une pause surveillée n'est plus une pause. Il
+ne retient pas : aucune récompense à revenir demain, aucune série à ne pas
+briser.
+
+Deux détails font la différence entre un jeu et une corvée : les mines sont
+posées **après** le premier clic, en évitant la case touchée et ses voisines ;
+et le taquin se mélange **en partant de la solution**, par des coups légaux,
+car un tirage au sort donne une grille impossible une fois sur deux.
+
+*Vérifié : 16 contrôles d'écran — l'essai écoute toutes les requêtes pendant
+la partie et n'en trouve aucune qui parle de jeu, de score ou de partie ni
+aucune écriture ; il rejoue vingt fois le premier clic du démineur pour
+établir qu'il ne saute jamais, et calcule la parité des inversions du taquin
+pour établir que le mélange est résoluble.*
+
 ---
 
 ## Ce qui n'existe pas encore
@@ -160,12 +235,9 @@ rendre cliquables, pour que personne ne clique et découvre le vide.
 
 | Module | État | Ce qu'il faudra |
 |---|---|---|
-| 2 — Annotations sur la page | partiel | les opérations de pages sont faites ; le texte, les tableaux et les annotations restent à écrire |
-| 4 — Studio graphique | rien | modèles **originaux** : aucun modèle sous licence ne sera repris |
-| 5 — Éditeur photo | rien | travaillera sur une copie, l'original restant intact |
-| 6 — Présentations | rien | import/export PowerPoint |
-| 9 — Partage externe | partiel | les liens signés marchent. Le courriel demande un SMTP configuré ; les pièces jointes WhatsApp demandent un compte **WhatsApp Business API** — sans lui, rien ne part automatiquement, et il ne faut pas le laisser croire |
-| 10 — Espace détente | rien | jeux courts, jamais imposés à l'ouverture |
+| 2 — Annotations sur la page | partiel | les opérations de pages sont faites ; le texte, les tableaux et les annotations sur la page elle-même restent à écrire |
+| 6 — Présentations | rien | import/export PowerPoint. C'est le plus lourd des dix : lire un `.pptx` demande de déballer un ZIP d'XML et d'en interpréter la mise en page, et en écrire un demande de la reconstruire |
+| 9 — Partage externe | partiel | les liens signés marchent, et les permissions avec. Le courriel demande un SMTP configuré ; les pièces jointes WhatsApp demandent un compte **WhatsApp Business API** — sans lui, rien ne part automatiquement, et il ne faut pas le laisser croire |
 
 ---
 
@@ -174,9 +246,15 @@ rendre cliquables, pour que personne ne clique et découvre le vide.
 | Fonction | Dépendance | Sans elle |
 |---|---|---|
 | Reconnaissance de texte | 4 paquets npm, ~60 Mo servis | le scanner marche, l'écran annonce que la lecture n'est pas disponible |
-| Détection des contours | `public/vendor/opencv.js`, déjà au dépôt | la capture reste possible, sans redressement |
-| Envoi par courriel | serveur SMTP | non construit |
-| Pièces jointes WhatsApp | compte WhatsApp Business API | non construit |
+| Détection des contours | `public/vendor/opencv.js`, installé au `prebuild` | la capture reste possible, sans redressement |
+| Rendu des pages à l'écran | `pdfjs-dist` + son `worker` copié dans `public/vendor/` | l'éditeur de pages et le placement de signature n'affichent rien |
+| Fabrication des PDF | `pdf-lib` et `pdfkit` (serveur) | ni assemblage de scan, ni apposition, ni export de création |
+| Envoi par courriel | serveur SMTP | **non construit** |
+| Pièces jointes WhatsApp | compte WhatsApp Business API | **non construit** |
+
+Les deux dernières lignes demandent un service que vous seul pouvez ouvrir.
+Rien n'a été écrit qui prétende envoyer un message sans ce service — c'était
+une interdiction explicite du cahier des charges.
 
 ---
 
@@ -186,8 +264,8 @@ rendre cliquables, pour que personne ne clique et découvre le vide.
 |---|---|---|
 | `test-pieces-jointes-chat.sh` | 46 | le service authentifié des pièces jointes |
 | `test-studio-bibliotheque.sh` | 91 | dépôt, versions, partages, corbeille, cloisonnement |
-| `test-studio-scanner.sh` | 86 | séances, pages, ordre, assemblage, orientation du PDF |
 | `test-ecrans-studio.sh` | 73 | la bibliothèque dans un navigateur, 1280 px et 375 px |
+| `test-studio-scanner.sh` | 86 | séances, pages, ordre, assemblage, orientation du PDF |
 | `test-ecrans-scanner.sh` | 49 | le scanner avec une caméra simulée |
 | `test-ecrans-ocr.sh` | 17 | la lecture de texte, de l'image à la recherche |
 | `test-studio-signatures.sh` | 70 | signatures, cachets, apposition, révocation |
@@ -195,9 +273,19 @@ rendre cliquables, pour que personne ne clique et découvre le vide.
 | `test-ecrans-signatures.sh` | 39 | tracer un paraphe et signer un PDF à l'écran |
 | `test-studio-pdf.sh` | 53 | pages : ordre, rotation, retrait, extraction, fusion, découpe |
 | `test-ecrans-pdf.sh` | 25 | l'éditeur de pages dans un navigateur |
-| **Total** | **590** | |
+| `test-ecrans-photo.sh` | 25 | l'éditeur photo, pixels relus après chaque opération |
+| `test-studio-creations.sh` | 40 | créations : plans, formats en millimètres, export PDF |
+| `test-ecrans-design.sh` | 23 | le studio graphique, du modèle au PDF à la bonne dimension |
+| `test-ecrans-detente.sh` | 16 | les deux jeux, et qu'ils ne rapportent rien |
+| **Total** | **694** | |
 
-Ces 590 contrôles portent sur **cet environnement**, pas sur le vôtre.
+Ces 694 contrôles portent sur **cet environnement**, pas sur le vôtre.
+
+**Treize affirmations d'essai se sont révélées fausses** au fil du travail —
+un essai qui passe n'est pas forcément un essai juste. Chacune a été corrigée
+avec un commentaire qui dit pourquoi elle était fausse, jamais contournée ni
+supprimée. La plus parlante : un essai d'API **affirmait comme voulu** le
+cul-de-sac de la corbeille, et empêchait donc de voir le défaut.
 
 ---
 
@@ -212,7 +300,8 @@ Ces 590 contrôles portent sur **cet environnement**, pas sur le vôtre.
 - **14 routes Express masquées** : du code déployé est inatteignable parce
   qu'un chemin identique est déclaré deux fois. Express retient la première
   déclaration, sans erreur ni trace. La liste s'affiche au démarrage du
-  serveur.
+  serveur. Aucune des routes du Studio n'en fait partie — c'est vérifié au
+  démarrage, le compte n'a pas bougé.
 - **7 numéros de migration en double** dans l'historique du dépôt.
 - `reminder_settings` n'a pas de migration : le planificateur de rappels
   échoue toutes les heures sur une base reconstruite.

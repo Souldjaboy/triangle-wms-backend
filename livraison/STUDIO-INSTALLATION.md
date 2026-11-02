@@ -21,6 +21,7 @@ instance Triangle WMS Pro existante, et les commandes à exécuter sur le VPS.
 | `sql/160_studio_fondation.sql` | migration | dossiers, documents, versions, partages, journal, 9 modules de droits |
 | `sql/161_studio_scanner.sql` | migration | séances de numérisation et pages |
 | `sql/162_studio_signatures.sql` | migration | signatures, cachets et trace des appositions |
+| `sql/163_studio_creations.sql` | migration | le plan des créations graphiques, en colonnes de `studio_documents` |
 | `services/studio-stockage.js` | code | dépôt privé des fichiers, hors du dossier servi en statique |
 | `services/studio-bibliotheque.js` | code | dépôt, versions, corbeille, partages |
 | `services/studio-scanner.js` | code | séances, pages, assemblage |
@@ -99,8 +100,9 @@ Même opération pour le frontend, dans `/var/www/triangle-wms/frontend`.
 
 ### Backend
 
-Une seule dépendance nouvelle : **`pdf-lib`**, qui appose les signatures et
-manipule les pages. `pdfkit` et `multer` étaient déjà là.
+Une seule dépendance nouvelle côté serveur : **`pdf-lib`**, qui appose les
+signatures, manipule les pages et écrit les PDF de création. `pdfkit` — qui
+assemble les pages d'un scan — et `multer` étaient déjà là.
 
 ```bash
 cd /var/www/triangle-wms/backend
@@ -151,12 +153,14 @@ less sql/159_chat_pieces_jointes.sql
 less sql/160_studio_fondation.sql
 less sql/161_studio_scanner.sql
 less sql/162_studio_signatures.sql
+less sql/163_studio_creations.sql
 
 # Puis on applique, en s'arrêtant à la première erreur.
 for f in sql/159_chat_pieces_jointes.sql \
          sql/160_studio_fondation.sql \
          sql/161_studio_scanner.sql \
-         sql/162_studio_signatures.sql; do
+         sql/162_studio_signatures.sql \
+         sql/163_studio_creations.sql; do
   echo "── $f"
   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f" || { echo "ÉCHEC sur $f"; break; }
 done
@@ -173,6 +177,13 @@ psql "$DATABASE_URL" -c "
 #           studio_documents, studio_folders, studio_scan_pages,
 #           studio_scan_sessions, studio_shares, studio_signature_uses,
 #           studio_signatures
+
+# La 163 n'ajoute aucune table : elle ajoute quatre colonnes à studio_documents.
+psql "$DATABASE_URL" -c "
+  SELECT column_name FROM information_schema.columns
+   WHERE table_name = 'studio_documents' AND column_name LIKE 'design%'
+   ORDER BY column_name"
+# Attendu : design, design_format, design_mm_height, design_mm_width
 ```
 
 ### Les droits
@@ -279,7 +290,8 @@ Puis, dans un navigateur, connecté : **Tableau de bord → Triangle Studio**.
 
 ## 9. Revenir en arrière
 
-Le retour est en trois niveaux, du moins destructeur au plus.
+Le retour est en quatre niveaux, du moins destructeur au plus — le « 1 bis »
+ne concerne que les créations graphiques.
 
 ### Niveau 1 — le code seul
 
@@ -293,6 +305,28 @@ git log --oneline -8          # repérer le commit d'avant la fusion
 git checkout <commit>
 npm ci --omit=dev
 pm2 restart triangle-backend
+```
+
+### Niveau 1 bis — défaire la seule migration 163
+
+Si l'on ne veut revenir que sur les créations graphiques, sans toucher au
+reste du Studio : la 163 n'a créé aucune table, elle a ajouté quatre colonnes
+à `studio_documents`.
+
+**Les retirer efface les plans des créations.** Le PDF d'un badge restera
+dans la bibliothèque et se téléchargera encore, mais le badge ne se rouvrira
+plus pour n'y changer qu'un nom : le plan est ce qui permet de le rouvrir.
+Garder les colonnes ne casse rien, même avec le code d'avant — elles
+acceptent `NULL`. Ne les retirez donc que si quelqu'un l'exige.
+
+```sql
+BEGIN;
+ALTER TABLE studio_documents
+  DROP COLUMN IF EXISTS design,
+  DROP COLUMN IF EXISTS design_format,
+  DROP COLUMN IF EXISTS design_mm_width,
+  DROP COLUMN IF EXISTS design_mm_height;
+COMMIT;
 ```
 
 ### Niveau 2 — défaire les tables du Studio
@@ -360,6 +394,7 @@ bash scripts/test-studio-bibliotheque.sh    # 91 contrôles
 bash scripts/test-studio-scanner.sh         # 86 contrôles
 bash scripts/test-studio-signatures.sh      # 70 contrôles
 bash scripts/test-studio-pdf.sh             # 53 contrôles
+bash scripts/test-studio-creations.sh       # 40 contrôles
 ```
 
 Les suites qui ouvrent un navigateur demandent en plus le frontend :
@@ -370,6 +405,9 @@ bash scripts/test-ecrans-scanner.sh         # 49 contrôles, caméra simulée
 bash scripts/test-ecrans-ocr.sh             # 17 contrôles
 bash scripts/test-ecrans-signatures.sh      # 39 contrôles
 bash scripts/test-ecrans-pdf.sh             # 25 contrôles
+bash scripts/test-ecrans-photo.sh           # 25 contrôles
+bash scripts/test-ecrans-design.sh          # 23 contrôles
+bash scripts/test-ecrans-detente.sh         # 16 contrôles
 ```
 
 Si Chromium n'est pas installé, ces trois dernières s'arrêtent en le disant.
