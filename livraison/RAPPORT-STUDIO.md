@@ -106,6 +106,51 @@ autrement :
   filtre de routes, ce qui cassait aussi, silencieusement, la capture de
   reçus déjà en place.
 
+### Module 3 — les signatures et les cachets
+
+Une signature se trace au doigt ou s'importe ; un cachet d'entreprise se pose
+par un responsable. On l'appose sur un PDF en la plaçant à l'écran, et
+l'apposition se fait sur le serveur.
+
+**Une signature n'appartient qu'à son propriétaire.** Ni son rôle, ni la
+direction, ni un administrateur n'y accèdent — pas même à son image, qui
+n'est jamais mise en cache. Quiconque l'obtient peut signer à la place de
+quelqu'un : c'est la règle qui rend tout le reste crédible, et la base la
+tient par une contrainte, pas seulement le code.
+
+**Signer produit une version de plus, jamais une réécriture.** L'original non
+signé reste intact et téléchargeable. La trace garde les empreintes d'avant
+et d'après, la page et la position : c'est elle qu'on relira si une signature
+est contestée, et elle survit au document.
+
+On ne supprime pas une signature, on la révoque avec un motif. Les documents
+déjà signés restent signés.
+
+*Vérifié : 70 contrôles d'API, 41 contrôles de rendu — les quatre rotations
+de page possibles sont rendues et leurs pixels inspectés —, 39 contrôles
+d'écran où le paraphe est tracé au pointeur puis l'encre retrouvée dans le
+PDF produit.*
+
+### Module 2 — l'éditeur de pages *(partiel)*
+
+Réordonner, tourner, retirer, extraire, fusionner, découper. Ce qui modifie
+le document produit une version de plus ; ce qui en fabrique d'autres ne
+touche pas aux sources, et l'écran sépare les deux familles sous leurs
+intitulés.
+
+**Aucune page ne se perd en silence** : chaque action dit combien il y en
+avait et combien il en reste. Le découpage se fait par coupures entre les
+pages, donc les parties se suivent et aucune page ne peut être oubliée ni se
+retrouver dans deux documents.
+
+*Vérifié : 53 contrôles d'API, 25 contrôles d'écran — les pages du document
+d'essai portant chacune une marque différente, l'essai lit l'ordre des
+vignettes au pixel et vérifie que déplacer une page la déplace dans le
+fichier.*
+
+**Ce qui manque à ce module** : l'ajout de texte, de tableaux et
+d'annotations sur la page elle-même.
+
 ---
 
 ## Ce qui n'existe pas encore
@@ -115,8 +160,7 @@ rendre cliquables, pour que personne ne clique et découvre le vide.
 
 | Module | État | Ce qu'il faudra |
 |---|---|---|
-| 2 — Éditeur PDF | rien | une bibliothèque PDF côté navigateur (`pdf-lib`, `pdfjs-dist`) |
-| 3 — Signatures et cachets | socle posé | la bibliothèque sait déjà stocker une signature comme document cloisonné ; l'apposition demande l'éditeur PDF |
+| 2 — Annotations sur la page | partiel | les opérations de pages sont faites ; le texte, les tableaux et les annotations restent à écrire |
 | 4 — Studio graphique | rien | modèles **originaux** : aucun modèle sous licence ne sera repris |
 | 5 — Éditeur photo | rien | travaillera sur une copie, l'original restant intact |
 | 6 — Présentations | rien | import/export PowerPoint |
@@ -146,9 +190,14 @@ rendre cliquables, pour que personne ne clique et découvre le vide.
 | `test-ecrans-studio.sh` | 73 | la bibliothèque dans un navigateur, 1280 px et 375 px |
 | `test-ecrans-scanner.sh` | 49 | le scanner avec une caméra simulée |
 | `test-ecrans-ocr.sh` | 17 | la lecture de texte, de l'image à la recherche |
-| **Total** | **362** | |
+| `test-studio-signatures.sh` | 70 | signatures, cachets, apposition, révocation |
+| `verif-apposition-rotation.js` | 41 | les quatre rotations de page, rendues et inspectées |
+| `test-ecrans-signatures.sh` | 39 | tracer un paraphe et signer un PDF à l'écran |
+| `test-studio-pdf.sh` | 53 | pages : ordre, rotation, retrait, extraction, fusion, découpe |
+| `test-ecrans-pdf.sh` | 25 | l'éditeur de pages dans un navigateur |
+| **Total** | **590** | |
 
-Ces 362 contrôles portent sur **cet environnement**, pas sur le vôtre.
+Ces 590 contrôles portent sur **cet environnement**, pas sur le vôtre.
 
 ---
 

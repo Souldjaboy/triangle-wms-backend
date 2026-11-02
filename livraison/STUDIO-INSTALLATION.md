@@ -20,6 +20,7 @@ instance Triangle WMS Pro existante, et les commandes à exécuter sur le VPS.
 | `sql/159_chat_pieces_jointes.sql` | migration | colonnes manquantes du chat + journal des pièces jointes |
 | `sql/160_studio_fondation.sql` | migration | dossiers, documents, versions, partages, journal, 9 modules de droits |
 | `sql/161_studio_scanner.sql` | migration | séances de numérisation et pages |
+| `sql/162_studio_signatures.sql` | migration | signatures, cachets et trace des appositions |
 | `services/studio-stockage.js` | code | dépôt privé des fichiers, hors du dossier servi en statique |
 | `services/studio-bibliotheque.js` | code | dépôt, versions, corbeille, partages |
 | `services/studio-scanner.js` | code | séances, pages, assemblage |
@@ -98,7 +99,8 @@ Même opération pour le frontend, dans `/var/www/triangle-wms/frontend`.
 
 ### Backend
 
-Aucune dépendance nouvelle. `pdfkit` et `multer` étaient déjà là.
+Une seule dépendance nouvelle : **`pdf-lib`**, qui appose les signatures et
+manipule les pages. `pdfkit` et `multer` étaient déjà là.
 
 ```bash
 cd /var/www/triangle-wms/backend
@@ -111,6 +113,7 @@ Quatre paquets nouveaux, tous pour la reconnaissance de texte :
 
 | Paquet | Rôle | Poids installé |
 |---|---|---|
+| `pdfjs-dist` | afficher un PDF page par page, pour y placer une signature | ~15 Mo |
 | `tesseract.js` | le moteur de lecture, côté navigateur | ~1 Mo |
 | `tesseract.js-core` | son cœur WebAssembly, en six variantes | ~30 Mo |
 | `@tesseract.js-data/fra` | les données du français | ~7 Mo |
@@ -122,13 +125,14 @@ npm ci
 ```
 
 La compilation recopie automatiquement ce qu'il faut dans
-`public/vendor/tesseract/` (environ 60 Mo servis). Ces fichiers **ne sont pas
-versionnés** : le dépôt reste léger, et `npm ci` les réapporte.
+`public/vendor/tesseract/` (environ 60 Mo servis) et `public/vendor/pdfjs/`
+(1 Mo). Ces fichiers **ne sont pas versionnés** : le dépôt reste léger, et
+`npm ci` les réapporte.
 
 Pour les mettre en place sans compiler :
 
 ```bash
-npm run installer-ocr
+npm run installer-ressources
 ```
 
 Si les paquets manquent, le script le dit et **n'interrompt pas la
@@ -146,11 +150,13 @@ cd /var/www/triangle-wms/backend
 less sql/159_chat_pieces_jointes.sql
 less sql/160_studio_fondation.sql
 less sql/161_studio_scanner.sql
+less sql/162_studio_signatures.sql
 
 # Puis on applique, en s'arrêtant à la première erreur.
 for f in sql/159_chat_pieces_jointes.sql \
          sql/160_studio_fondation.sql \
-         sql/161_studio_scanner.sql; do
+         sql/161_studio_scanner.sql \
+         sql/162_studio_signatures.sql; do
   echo "── $f"
   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f" || { echo "ÉCHEC sur $f"; break; }
 done
@@ -165,7 +171,8 @@ psql "$DATABASE_URL" -c "
    ORDER BY tablename;"
 # Attendu : chat_attachment_access, studio_access_log, studio_document_versions,
 #           studio_documents, studio_folders, studio_scan_pages,
-#           studio_scan_sessions, studio_shares
+#           studio_scan_sessions, studio_shares, studio_signature_uses,
+#           studio_signatures
 ```
 
 ### Les droits
@@ -296,8 +303,11 @@ désigne.
 
 ```sql
 BEGIN;
+DROP VIEW IF EXISTS v_studio_documents_signes;
 DROP VIEW IF EXISTS v_studio_scans_a_reprendre;
 DROP VIEW IF EXISTS v_studio_acces;
+DROP TABLE IF EXISTS studio_signature_uses;
+DROP TABLE IF EXISTS studio_signatures;
 DROP TABLE IF EXISTS studio_scan_pages;
 DROP TABLE IF EXISTS studio_scan_sessions;
 DROP TABLE IF EXISTS studio_access_log;
@@ -348,6 +358,8 @@ cd /var/www/triangle-wms/backend
 bash scripts/test-pieces-jointes-chat.sh    # 46 contrôles
 bash scripts/test-studio-bibliotheque.sh    # 91 contrôles
 bash scripts/test-studio-scanner.sh         # 86 contrôles
+bash scripts/test-studio-signatures.sh      # 70 contrôles
+bash scripts/test-studio-pdf.sh             # 53 contrôles
 ```
 
 Les suites qui ouvrent un navigateur demandent en plus le frontend :
@@ -356,6 +368,8 @@ Les suites qui ouvrent un navigateur demandent en plus le frontend :
 bash scripts/test-ecrans-studio.sh          # 73 contrôles
 bash scripts/test-ecrans-scanner.sh         # 49 contrôles, caméra simulée
 bash scripts/test-ecrans-ocr.sh             # 17 contrôles
+bash scripts/test-ecrans-signatures.sh      # 39 contrôles
+bash scripts/test-ecrans-pdf.sh             # 25 contrôles
 ```
 
 Si Chromium n'est pas installé, ces trois dernières s'arrêtent en le disant.
