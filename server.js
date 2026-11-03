@@ -19656,6 +19656,22 @@ app.use(
   })
 );
 
+/* Les présentations. Même idée que le studio graphique, à deux différences
+   près. Le plan contient PLUSIEURS diapositives, donc une colonne de la base
+   dit laquelle des deux familles on a sous la main : sans elle, la liste des
+   planches ramasserait les présentations et l'inverse. Et le document rangé
+   est un PDF d'autant de pages — ce qui se montre, s'imprime et se partage
+   par un lien, sans que personne ait à installer PowerPoint. L'export .pptx,
+   lui, est un document DE PLUS, produit à la demande pour qui doit continuer
+   le travail dans PowerPoint. */
+const createStudioPresentationsRouter = require("./routes/studio-presentations");
+app.use(
+  "/",
+  createStudioPresentationsRouter({
+    pool, authenticateToken, getEffectiveCompanyId, requirePermission, logActivity,
+  })
+);
+
 /* États de factures, sable et ciment. Un état validé est une pièce : ses
    factures cessent d'être disponibles, et la règle est tenue par un index
    unique — pas par une vérification applicative que deux validations

@@ -57,4 +57,45 @@ function recevoir(champ, { tailleMax = S.TAILLE_MAX, messages = {} } = {}) {
   };
 }
 
-module.exports = { recevoir, CHAMP_MAX };
+/**
+ * PLUSIEURS FICHIERS SOUS LE MÊME NOM DE CHAMP.
+ *
+ * Une présentation s'enregistre d'un coup : le plan, et une image par
+ * diapositive. Les envoyer un par un laisserait, en cas de coupure, un
+ * document dont les pages ne correspondent plus à son plan.
+ *
+ * @param champ     le nom du champ qui porte les fichiers
+ * @param maximum   combien au plus
+ * @param options.tailleMax  taille maximale PAR fichier
+ */
+function recevoirPlusieurs(champ, maximum, { tailleMax = S.TAILLE_MAX, messages = {} } = {}) {
+  const outil = multer({
+    storage: multer.memoryStorage(),
+    limits: {
+      fileSize: tailleMax, files: maximum, fieldSize: CHAMP_MAX,
+      /* Chaque fichier et chaque champ est une « partie » du corps multipart.
+         La limite par défaut est basse : une présentation de deux cents
+         diapositives la dépasserait, et le refus arriverait en 500 muet. */
+      parts: maximum + 20,
+    },
+  }).array(champ, maximum);
+
+  return function middleware(req, res, suite) {
+    outil(req, res, (e) => {
+      if (!e) return suite();
+      const code = e.code || "";
+      const message = messages[code] || (code === "LIMIT_FILE_COUNT"
+        ? `Pas plus de ${maximum} fichiers dans un même envoi.`
+        : MESSAGES[code]);
+      res.status(413).json({
+        error: message
+          || (code === "LIMIT_UNEXPECTED_FILE"
+            ? `Champ de fichier inattendu : il doit s'appeler « ${champ} ».`
+            : `Envoi refusé (${code || e.message}).`),
+        code: code || "ENVOI_REFUSE",
+      });
+    });
+  };
+}
+
+module.exports = { recevoir, recevoirPlusieurs, CHAMP_MAX };

@@ -58,6 +58,22 @@ async function journaliser(client, { companyId, documentId = null, shareId = nul
  */
 async function acces(client, { companyId, utilisateur, documentId, requis = "LECTURE",
   inclureCorbeille = false }) {
+  /* UN IDENTIFIANT QUI N'EST PAS UN NOMBRE EST UN DOCUMENT INTROUVABLE, pas
+     une erreur de serveur.
+
+     Les routes reçoivent l'identifiant de l'URL et le passent par Number() :
+     « /studio/presentations/undefined » donne donc NaN, que PostgreSQL
+     refuse avec le code 22P02. Sans ce garde-fou, la réponse était un 500
+     portant le texte brut du moteur — qui apprend au passage le nom de la
+     table et du type de la colonne.
+
+     Le refus est le même que pour un document d'une autre société : 404, et
+     rien d'autre. Un curieux n'apprend donc rien en essayant des
+     identifiants, qu'ils soient numériques ou non. */
+  const id = Number(documentId);
+  if (!Number.isInteger(id) || id <= 0) {
+    throw erreur("Document introuvable.", "DOCUMENT_INTROUVABLE", 404);
+  }
   const { rows } = await client.query(
     `SELECT * FROM studio_documents WHERE id = $1 AND company_id = $2`,
     [documentId, companyId]);

@@ -97,7 +97,7 @@ async function creer(client, {
 
   await client.query(
     `UPDATE studio_documents
-        SET design = $2::jsonb, design_format = $3,
+        SET design = $2::jsonb, design_kind = 'CREATION', design_format = $3,
             design_mm_width = $4, design_mm_height = $5
       WHERE id = $1`,
     [document.id, JSON.stringify(objet), dims.format, dims.largeurMm, dims.hauteurMm]);
@@ -118,6 +118,15 @@ async function plan(client, { companyId, utilisateur, documentId }) {
       "Ce document n'est pas une création : il n'a pas de plan de mise en page. " +
       "Seules les créations faites dans le studio graphique se rouvrent.",
       "PAS_UNE_CREATION", 409);
+  }
+  if (document.design_kind === "PRESENTATION") {
+    /* UNE PRÉSENTATION A UN PLAN, MAIS CE N'EST PAS LE MÊME. L'ouvrir dans
+       l'éditeur de planches lui enlèverait toutes ses diapositives sauf
+       l'idée qu'il s'en fait — c'est-à-dire aucune. On renvoie donc là où il
+       faut aller, plutôt qu'un refus sec. */
+    throw erreur(
+      "Ce document est une présentation, pas une planche. Ouvrez-le dans les présentations.",
+      "C_EST_UNE_PRESENTATION", 409);
   }
   return {
     document: {
@@ -142,7 +151,7 @@ async function modifier(client, {
 }) {
   const { document } = await B.acces(client, {
     companyId, utilisateur, documentId, requis: "MODIFICATION" });
-  if (!document.design) {
+  if (!document.design || document.design_kind === "PRESENTATION") {
     throw erreur("Ce document n'est pas une création.", "PAS_UNE_CREATION", 409);
   }
   if (document.trashed_at) {
@@ -195,7 +204,7 @@ async function exporterPdf(client, {
 }) {
   const { document } = await B.acces(client, {
     companyId, utilisateur, documentId, requis: "LECTURE" });
-  if (!document.design) {
+  if (!document.design || document.design_kind === "PRESENTATION") {
     throw erreur("Ce document n'est pas une création.", "PAS_UNE_CREATION", 409);
   }
   const n = Math.max(1, Math.min(50, Number(exemplaires) || 1));
@@ -257,6 +266,7 @@ async function lister(client, { companyId, utilisateur, limite = 100 }) {
             (d.owner_id = $2) AS je_suis_proprietaire
        FROM studio_documents d
       WHERE d.company_id = $1 AND d.design IS NOT NULL AND d.trashed_at IS NULL
+        AND d.design_kind = 'CREATION'
         AND (d.owner_id = $2 OR d.visibility = 'SOCIETE'
              OR EXISTS (SELECT 1 FROM studio_shares s
                          WHERE s.document_id = d.id AND s.kind = 'INTERNE'
