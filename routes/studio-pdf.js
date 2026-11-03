@@ -35,7 +35,13 @@ module.exports = function createStudioPdfRouter(deps) {
     String(req.headers["x-forwarded-for"] || "").split(",")[0].trim() || req.ip || "";
   const fail = (res, e, secours) => {
     if (!e.httpStatus) console.error(secours, e);
-    res.status(e.httpStatus || 500).json({ error: e.message || secours, code: e.code });
+    /* `index` est le rang, dans la liste envoyée, de l'annotation refusée.
+       L'écran s'en sert pour sélectionner le cadre fautif : avec six cadres
+       en attente, le message seul ne dit pas lequel corriger. */
+    res.status(e.httpStatus || 500).json({
+      error: e.message || secours, code: e.code,
+      ...(e.index === undefined ? {} : { index: e.index }),
+    });
   };
 
   async function enTransaction(res, secours, travail) {
@@ -53,6 +59,42 @@ module.exports = function createStudioPdfRouter(deps) {
   }
 
   const listeDe = (v) => Array.isArray(v) ? v.map(Number) : [];
+
+  /* ═══════════════════════ ANNOTER UNE PAGE ════════════════════════
+
+     LA GÉOMÉTRIE D'ABORD. L'écran a besoin de savoir, pour chaque page, ses
+     dimensions TELLES QU'ON LES VOIT — une page tournée d'un quart de tour
+     se présente couchée — car c'est dans ce repère qu'il envoie les
+     positions. Voir services/pdf-reperes.js : le contrat n'est pas celui de
+     l'apposition de signature, et les mélanger envoie les annotations à
+     l'autre bout de la page.                                             */
+  router.get("/studio/documents/:id/pages-vues", authenticateToken,
+    requirePermission(MODULE, "view"), async (req, res) => {
+      const companyId = requireCompany(req, res); if (!companyId) return;
+      const client = await pool.connect();
+      try {
+        const pages = await E.pagesVues(client, {
+          companyId, utilisateur: utilisateurDe(req), documentId: Number(req.params.id) });
+        res.json({ pages, repere: "affichage" });
+      } catch (e) { fail(res, e, "Lecture de la géométrie impossible."); }
+      finally { client.release(); }
+    });
+
+  router.post("/studio/documents/:id/annotations", authenticateToken,
+    requirePermission(MODULE, "update"), async (req, res) => {
+      const companyId = requireCompany(req, res); if (!companyId) return;
+      const r = await enTransaction(res, "Annotation impossible.", (client) =>
+        E.annoter(client, {
+          companyId, utilisateur: utilisateurDe(req), ip: ipDe(req),
+          documentId: Number(req.params.id), annotations: req.body?.annotations }));
+      if (r) {
+        logActivity?.(utilisateurDe(req).name, req.user?.role,
+          `Annotations posées sur « ${r.document.name} »`, "studio", `v${r.version}`);
+        res.json({ ...r, message:
+          `${r.posees.length} annotation${r.posees.length > 1 ? "s" : ""} posée${r.posees.length > 1 ? "s" : ""}. ` +
+          `Le document est en version ${r.version} ; la précédente reste intacte.` });
+      }
+    });
 
   /* ═══════════════ CE QUI MODIFIE LE DOCUMENT ══════════════════════ */
 

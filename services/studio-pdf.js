@@ -19,6 +19,7 @@
 const S = require("./studio-stockage");
 const B = require("./studio-bibliotheque");
 const P = require("./pdf-pages");
+const A = require("./pdf-annotations");
 
 function erreur(message, code, httpStatus = 400) {
   const e = new Error(message);
@@ -212,4 +213,50 @@ async function decouper(client, {
   };
 }
 
-module.exports = { reordonner, tourner, retirer, extraire, fusionner, decouper };
+/* ═════════════════════ ANNOTER UNE PAGE ═════════════════════
+
+   Poser du texte, un tableau, un surlignage ou un cadre MODIFIE le document :
+   une version de plus, et le droit de modification exigé. L'original garde sa
+   version 1, avec son fichier et son empreinte.
+
+   LA NOTE DE VERSION DIT CE QUI A ÉTÉ POSÉ, ET OÙ. C'est tout ce dont on
+   dispose six mois plus tard pour savoir d'où vient une mention manuscrite
+   sur un bon de livraison. Un « document annoté » sans détail ne servirait à
+   personne.                                                                */
+function resume(posees) {
+  const parNature = new Map();
+  for (const a of posees) parNature.set(a.nature, (parNature.get(a.nature) || 0) + 1);
+  const mots = {
+    TEXTE: ["mention", "mentions"],
+    TABLEAU: ["tableau", "tableaux"],
+    SURLIGNAGE: ["surlignage", "surlignages"],
+    CADRE: ["cadre", "cadres"],
+  };
+  const morceaux = [...parNature.entries()].map(([nature, n]) =>
+    `${n} ${mots[nature][n > 1 ? 1 : 0]}`);
+  const pages = [...new Set(posees.map((a) => a.page))].sort((x, y) => x - y);
+  return `${morceaux.join(", ")} sur ${pages.length > 1 ? "les pages" : "la page"} ${pages.join(", ")}`;
+}
+
+async function annoter(client, { companyId, utilisateur, documentId, annotations, ip = "" }) {
+  const { octets } = await octetsDe(client, {
+    companyId, utilisateur, documentId, requis: "MODIFICATION" });
+  const r = await A.annoter({ pdf: octets, annotations });
+  const doc = await enVersion(client, {
+    companyId, utilisateur, documentId, buffer: r.buffer, pages: r.pages, ip,
+    note: `Annotations posées : ${resume(r.posees)}.`,
+  });
+  return { document: doc, posees: r.posees, version: doc.version };
+}
+
+/* La géométrie des pages TELLE QU'ON LA VOIT : c'est le repère dans lequel
+   l'écran place les annotations. Voir services/pdf-reperes.js. */
+async function pagesVues(client, { companyId, utilisateur, documentId }) {
+  const { octets } = await octetsDe(client, {
+    companyId, utilisateur, documentId, requis: "LECTURE" });
+  return A.decrire(octets);
+}
+
+module.exports = {
+  reordonner, tourner, retirer, extraire, fusionner, decouper, annoter, pagesVues,
+};
