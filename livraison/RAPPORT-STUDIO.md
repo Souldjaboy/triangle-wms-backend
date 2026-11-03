@@ -131,7 +131,7 @@ de page possibles sont rendues et leurs pixels inspectés —, 39 contrôles
 d'écran où le paraphe est tracé au pointeur puis l'encre retrouvée dans le
 PDF produit.*
 
-### Module 2 — l'éditeur de pages *(partiel)*
+### Module 2 — l'éditeur de pages et les annotations
 
 Réordonner, tourner, retirer, extraire, fusionner, découper. Ce qui modifie
 le document produit une version de plus ; ce qui en fabrique d'autres ne
@@ -148,8 +148,48 @@ d'essai portant chacune une marque différente, l'essai lit l'ordre des
 vignettes au pixel et vérifie que déplacer une page la déplace dans le
 fichier.*
 
-**Ce qui manque à ce module** : l'ajout de texte, de tableaux et
-d'annotations sur la page elle-même.
+**Et l'on écrit maintenant SUR la page** : une mention, un tableau, un
+surlignage, un cadre. On trace le cadre au doigt ou à la souris, on remplit,
+et la pose se fait sur le serveur — le navigateur ne réécrit jamais le PDF.
+Comme pour les pages, annoter produit une version de plus, et la note de
+version dit ce qui a été posé et sur quelles pages : six mois plus tard,
+c'est tout ce dont on disposera pour expliquer une mention sur un bon de
+livraison.
+
+**Le piège était la rotation de page, et il mord plus fort ici que pour une
+signature.** Une signature est une image : il suffit de la redresser. Une
+annotation a un sens de lecture interne — un tableau a des lignes qui vont de
+gauche à droite et des lignes qui s'empilent. En ne transformant que le cadre
+extérieur, sur une page tournée d'un quart de tour, les lignes du tableau
+deviennent des colonnes : le cadre est juste, et le tableau illisible. Tout
+se calcule donc dans le repère de l'affichage — celui que l'utilisateur a
+sous les yeux — et ce repère n'est quitté qu'au dernier moment, trait par
+trait.
+
+**Rien ne déborde en silence.** Si le texte ne tient pas dans son cadre, le
+refus dit combien de lignes il demande et combien le cadre en tient ; l'écran
+le répète mot pour mot et sélectionne le cadre fautif, que le serveur désigne
+par son rang. Réduire la police tout seul produirait un document que personne
+n'a voulu ; rogner le texte en ferait disparaître une partie sans que
+quiconque s'en aperçoive avant l'impression.
+
+**Un surlignage est de l'encre, et l'écran le dit.** Dans un lecteur PDF, un
+surlignage se sélectionne, se commente et se retire d'un clic. Ici c'est un
+aplat translucide imprimé dans la page. L'inverse se découvrirait trop tard.
+
+*Vérifié : 50 contrôles d'API, 71 contrôles de rendu — les quatre rotations
+de page sont rendues et leurs pixels inspectés, l'en-tête du tableau d'essai
+étant sur fond coloré : une bande horizontale en haut si tout va bien, une
+bande verticale à gauche si c'est transposé —, et 48 contrôles d'écran où
+l'essai trace à la souris, lit la position que l'écran affiche, pose, puis
+rend le PDF produit pour vérifier que l'encre est là où l'écran l'avait
+annoncée.*
+
+**Trois défauts que seul un vrai navigateur a montrés** : la cloche de
+notifications de l'application recouvrait le bouton « Poser » ; poser faisait
+revenir en page 1, donc perdre sa place dans un dossier de vingt feuillets ;
+et un simple clic créait une annotation invisible de deux pixels, qu'on
+aurait retrouvée plus tard dans le PDF sans savoir d'où elle venait.
 
 ### Module 5 — l'éditeur photo
 
@@ -203,6 +243,51 @@ QR** : une fonction de référence écrite dans le corps du rendu rappelait
 l'état à chaque passage, et React s'arrêtait sur une erreur de rendu infini.
 Il n'apparaissait que sur les modèles à QR, donc trois des six.
 
+### Module 6 — les présentations
+
+Des diapositives en 16/9 ou en 4/3, six modèles originaux, et les mêmes
+outils que le studio graphique : texte, rectangles, ellipses, traits, images.
+Une présentation se range dans la bibliothèque comme n'importe quel
+document — propriétaire, visibilité, versions, corbeille, journal d'accès.
+
+**Ce qui est rangé est un PDF, pas un `.pptx`.** Le PDF se montre, s'imprime,
+se partage par un lien signé et s'ouvre sur n'importe quel téléphone sans
+rien installer — y compris chez un client qui n'a pas PowerPoint. Le `.pptx`
+est un **export**, produit à la demande pour qui doit continuer le travail
+dans PowerPoint ; il entre comme un document de plus, avec sa provenance
+écrite, et ne remplace rien.
+
+**L'export donne de vraies formes modifiables**, pas des images de
+diapositives collées sur des pages : ouvert dans PowerPoint, le texte se
+corrige et les formes se déplacent. Le `.pptx` est écrit à la main — c'est une
+archive ZIP de documents XML, la norme Office Open XML —, donc aucun service
+extérieur n'intervient.
+
+**Un `.pptx` déposé est lu, MONTRÉ, et son compte rendu affiché avant qu'on
+enregistre.** Un fichier PowerPoint peut contenir des tableaux, des
+graphiques, des SmartArt, des animations, et des formes qui tiennent leur
+position d'un masque et leur couleur d'un thème : reprendre tout cela, c'est
+réécrire PowerPoint. Chaque élément non repris est donc nommé, forme par
+forme, et ce compte rendu est recopié dans la provenance du document — où il
+restera lisible longtemps après l'import. Deux cas du monde réel sont traités
+nommément : un titre sans position — le cas le plus courant, car la plupart
+des titres héritent leur géométrie du masque — garde **son texte**, placé
+raisonnablement, et c'est signalé ; une couleur de thème n'est pas devinée.
+
+*Vérifié : 73 contrôles d'API, 53 contrôles d'écran, et 46 contrôles sur le
+`.pptx` où **LibreOffice Impress est le juge** : il convertit l'archive en
+PDF — ce qu'il refuserait si elle était invalide —, le PDF est rendu et ses
+pixels relus, puis il RÉÉCRIT l'archive à sa façon et c'est celle-là qu'on
+relit. Relire sa propre écriture ne prouve presque rien : les deux moitiés
+peuvent se tromper de la même façon. L'aller-retour est enfin établi comme un
+point fixe — lire, réécrire, relire redonne le même plan, élément par
+élément — sans quoi chaque export dégraderait un peu la présentation, ce qui
+ne se voit qu'au dixième tour.*
+
+**Ce qui n'existe pas dans ce module** : les transitions entre diapositives et
+les animations d'apparition. Elles n'existent ni dans le PDF, ni dans
+l'export, et l'accueil du Studio le dit.
+
 ### Module 10 — l'espace détente
 
 Un démineur et un taquin, dans le navigateur, pour une pause de cinq minutes.
@@ -235,8 +320,7 @@ rendre cliquables, pour que personne ne clique et découvre le vide.
 
 | Module | État | Ce qu'il faudra |
 |---|---|---|
-| 2 — Annotations sur la page | partiel | les opérations de pages sont faites ; le texte, les tableaux et les annotations sur la page elle-même restent à écrire |
-| 6 — Présentations | rien | import/export PowerPoint. C'est le plus lourd des dix : lire un `.pptx` demande de déballer un ZIP d'XML et d'en interpréter la mise en page, et en écrire un demande de la reconstruire |
+| 6 — Transitions et animations | partiel | les présentations existent, avec leurs diapositives, leur PDF et leur aller-retour PowerPoint. Les transitions entre diapositives et les animations d'apparition ne sont pas faites : elles n'existent ni dans le PDF, ni dans l'export |
 | 9 — Partage externe | partiel | les liens signés marchent, et les permissions avec. Le courriel demande un SMTP configuré ; les pièces jointes WhatsApp demandent un compte **WhatsApp Business API** — sans lui, rien ne part automatiquement, et il ne faut pas le laisser croire |
 
 ---
@@ -247,8 +331,10 @@ rendre cliquables, pour que personne ne clique et découvre le vide.
 |---|---|---|
 | Reconnaissance de texte | 4 paquets npm, ~60 Mo servis | le scanner marche, l'écran annonce que la lecture n'est pas disponible |
 | Détection des contours | `public/vendor/opencv.js`, installé au `prebuild` | la capture reste possible, sans redressement |
-| Rendu des pages à l'écran | `pdfjs-dist` + son `worker` copié dans `public/vendor/` | l'éditeur de pages et le placement de signature n'affichent rien |
-| Fabrication des PDF | `pdf-lib` et `pdfkit` (serveur) | ni assemblage de scan, ni apposition, ni export de création |
+| Rendu des pages à l'écran | `pdfjs-dist` + son `worker` copié dans `public/vendor/` | l'éditeur de pages, le placement de signature et l'annotation n'affichent rien |
+| Fabrication des PDF | `pdf-lib` et `pdfkit` (serveur) | ni assemblage de scan, ni apposition, ni annotation, ni export |
+| Lecture et écriture des `.pptx` | `jszip` et `@xmldom/xmldom` (serveur) | les présentations se font et s'exportent en PDF, mais l'aller-retour PowerPoint est impossible |
+| Juger un `.pptx` produit | **LibreOffice**, pour l'essai seulement | le module marche ; ce sont les 46 contrôles de `verif-pptx.js` qui ne disent plus rien |
 | Envoi par courriel | serveur SMTP | **non construit** |
 | Pièces jointes WhatsApp | compte WhatsApp Business API | **non construit** |
 
@@ -277,15 +363,31 @@ une interdiction explicite du cahier des charges.
 | `test-studio-creations.sh` | 40 | créations : plans, formats en millimètres, export PDF |
 | `test-ecrans-design.sh` | 23 | le studio graphique, du modèle au PDF à la bonne dimension |
 | `test-ecrans-detente.sh` | 16 | les deux jeux, et qu'ils ne rapportent rien |
-| **Total** | **694** | |
+| `test-studio-annotations.sh` | 50 | mentions, tableaux, surlignages : poses et refus |
+| `verif-annotations-rotation.js` | 71 | les quatre rotations, rendues et inspectées au pixel |
+| `test-ecrans-annoter.sh` | 48 | tracer, remplir, poser — puis relire le PDF produit |
+| `test-studio-presentations.sh` | 73 | diapositives, PDF assemblé, export et lecture PowerPoint |
+| `verif-pptx.js` | 46 | le `.pptx`, jugé par LibreOffice Impress dans les deux sens |
+| `test-ecrans-presentations.sh` | 53 | créer, ajouter, enregistrer, exporter, réimporter |
+| **Total** | **1 035** | |
 
-Ces 694 contrôles portent sur **cet environnement**, pas sur le vôtre.
+Ces 1 035 contrôles portent sur **cet environnement**, pas sur le vôtre.
 
-**Treize affirmations d'essai se sont révélées fausses** au fil du travail —
+Deux d'entre eux ne demandent ni base de données ni serveur, et se lancent
+seuls : `verif-annotations-rotation.js` et `verif-pptx.js`. Le second a besoin
+de **LibreOffice** — uniquement pour l'essai, jamais pour l'application.
+
+**Vingt-six affirmations d'essai se sont révélées fausses** au fil du travail —
 un essai qui passe n'est pas forcément un essai juste. Chacune a été corrigée
 avec un commentaire qui dit pourquoi elle était fausse, jamais contournée ni
-supprimée. La plus parlante : un essai d'API **affirmait comme voulu** le
-cul-de-sac de la corbeille, et empêchait donc de voir le défaut.
+supprimée. Deux sont particulièrement parlantes. Un essai d'API
+**affirmait comme voulu** le cul-de-sac de la corbeille, et empêchait donc de
+voir le défaut. Et l'essai de l'accueil du Studio comparait les liens des
+tuiles à une **liste écrite en dur** : juste le jour où elle a été écrite, et
+fausse dès le module suivant, puisque chaque écran construit ajoutait
+légitimement une tuile. Il criait au lien mort pendant que le logiciel
+avançait. Il suit désormais chaque lien et regarde où il atterrit — une liste
+figée ne décrit pas une promesse, elle décrit un instant.
 
 ---
 
@@ -307,3 +409,6 @@ cul-de-sac de la corbeille, et empêchait donc de voir le défaut.
   échoue toutes les heures sur une base reconstruite.
 - Les sociétés créées **après** la migration 160 n'ont pas de droits Studio
   par défaut.
+- **Un `npm install` est nécessaire** sur le VPS, et non seulement un
+  `npm ci --omit=dev` : `jszip` et `@xmldom/xmldom` sont désormais déclarés,
+  alors qu'ils n'étaient présents qu'amenés par d'autres paquets.

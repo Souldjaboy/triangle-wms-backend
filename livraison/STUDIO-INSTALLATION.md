@@ -22,6 +22,7 @@ instance Triangle WMS Pro existante, et les commandes à exécuter sur le VPS.
 | `sql/161_studio_scanner.sql` | migration | séances de numérisation et pages |
 | `sql/162_studio_signatures.sql` | migration | signatures, cachets et trace des appositions |
 | `sql/163_studio_creations.sql` | migration | le plan des créations graphiques, en colonnes de `studio_documents` |
+| `sql/164_studio_presentations.sql` | migration | `design_kind`, qui sépare une planche d'une présentation |
 | `services/studio-stockage.js` | code | dépôt privé des fichiers, hors du dossier servi en statique |
 | `services/studio-bibliotheque.js` | code | dépôt, versions, corbeille, partages |
 | `services/studio-scanner.js` | code | séances, pages, assemblage |
@@ -100,9 +101,21 @@ Même opération pour le frontend, dans `/var/www/triangle-wms/frontend`.
 
 ### Backend
 
-Une seule dépendance nouvelle côté serveur : **`pdf-lib`**, qui appose les
-signatures, manipule les pages et écrit les PDF de création. `pdfkit` — qui
-assemble les pages d'un scan — et `multer` étaient déjà là.
+Trois dépendances nouvelles côté serveur :
+
+| Paquet | À quoi il sert |
+|---|---|
+| `pdf-lib` | apposer les signatures, manipuler les pages, écrire les PDF de création et de présentation |
+| `jszip` | lire et écrire les archives `.pptx` — une présentation Office est un ZIP de documents XML |
+| `@xmldom/xmldom` | lire ces documents XML |
+
+`pdfkit` — qui assemble les pages d'un scan — et `multer` étaient déjà là.
+
+**`jszip` et `@xmldom/xmldom` étaient déjà présents sur le disque**, amenés
+par d'autres paquets, mais pas déclarés. Ils le sont maintenant : s'appuyer
+sur une dépendance transitive, c'est attendre qu'un `npm install` la fasse
+disparaître. Un `npm install` est donc nécessaire sur le VPS, pas seulement un
+`npm ci --omit=dev` sur le `package-lock.json` d'avant.
 
 ```bash
 cd /var/www/triangle-wms/backend
@@ -154,13 +167,15 @@ less sql/160_studio_fondation.sql
 less sql/161_studio_scanner.sql
 less sql/162_studio_signatures.sql
 less sql/163_studio_creations.sql
+less sql/164_studio_presentations.sql
 
 # Puis on applique, en s'arrêtant à la première erreur.
 for f in sql/159_chat_pieces_jointes.sql \
          sql/160_studio_fondation.sql \
          sql/161_studio_scanner.sql \
          sql/162_studio_signatures.sql \
-         sql/163_studio_creations.sql; do
+         sql/163_studio_creations.sql \
+         sql/164_studio_presentations.sql; do
   echo "── $f"
   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f" || { echo "ÉCHEC sur $f"; break; }
 done
@@ -184,6 +199,19 @@ psql "$DATABASE_URL" -c "
    WHERE table_name = 'studio_documents' AND column_name LIKE 'design%'
    ORDER BY column_name"
 # Attendu : design, design_format, design_mm_height, design_mm_width
+
+# La 164 ajoute une colonne et sa contrainte. Les lignes existantes sont
+# toutes des créations du studio graphique : les présentations n'existaient
+# pas avant elle.
+psql "$DATABASE_URL" -c "
+  SELECT design_kind, count(*) FROM studio_documents
+   WHERE design IS NOT NULL GROUP BY 1"
+# Attendu : uniquement CREATION juste après la migration.
+psql "$DATABASE_URL" -c "
+  SELECT conname FROM pg_constraint
+   WHERE conname = 'studio_documents_design_kind_chk'"
+# Attendu : une ligne. Sans elle, une faute de frappe dans design_kind
+#           casserait les deux listes sans qu'aucune erreur ne se produise.
 ```
 
 ### Les droits
@@ -290,8 +318,11 @@ Puis, dans un navigateur, connecté : **Tableau de bord → Triangle Studio**.
 
 ## 9. Revenir en arrière
 
-Le retour est en quatre niveaux, du moins destructeur au plus — le « 1 bis »
-ne concerne que les créations graphiques.
+Le retour est en cinq niveaux, du moins destructeur au plus. Les deux
+intermédiaires ne défont qu'une migration chacun : le « 1 bis » la séparation
+des planches et des présentations, le « 1 ter » les créations graphiques. Ni
+l'un ni l'autre n'est nécessaire pour revenir au code d'avant — les deux
+colonnes acceptent de rester.
 
 ### Niveau 1 — le code seul
 
@@ -307,7 +338,29 @@ npm ci --omit=dev
 pm2 restart triangle-backend
 ```
 
-### Niveau 1 bis — défaire la seule migration 163
+### Niveau 1 bis — défaire la seule migration 164
+
+La 164 n'a créé aucune table : elle a ajouté `design_kind` à
+`studio_documents`, avec sa contrainte, et remplacé un index.
+
+**La retirer mélange les deux listes.** Les présentations réapparaîtraient
+dans le studio graphique et les planches dans les présentations, et ouvrir
+l'une dans l'éditeur de l'autre ne serait plus refusé. La garder ne casse
+rien, même avec le code d'avant : la colonne a une valeur par défaut.
+
+```sql
+BEGIN;
+ALTER TABLE studio_documents DROP CONSTRAINT IF EXISTS studio_documents_design_kind_chk;
+ALTER TABLE studio_documents DROP COLUMN IF EXISTS design_kind;
+DROP INDEX IF EXISTS studio_documents_plans_idx;
+-- L'index que la 163 avait créé et que la 164 a remplacé :
+CREATE INDEX IF NOT EXISTS studio_documents_creations_idx
+  ON studio_documents (company_id, updated_at DESC)
+  WHERE design IS NOT NULL AND trashed_at IS NULL;
+COMMIT;
+```
+
+### Niveau 1 ter — défaire la seule migration 163
 
 Si l'on ne veut revenir que sur les créations graphiques, sans toucher au
 reste du Studio : la 163 n'a créé aucune table, elle a ajouté quatre colonnes
@@ -395,6 +448,8 @@ bash scripts/test-studio-scanner.sh         # 86 contrôles
 bash scripts/test-studio-signatures.sh      # 70 contrôles
 bash scripts/test-studio-pdf.sh             # 53 contrôles
 bash scripts/test-studio-creations.sh       # 40 contrôles
+bash scripts/test-studio-annotations.sh     # 50 contrôles
+bash scripts/test-studio-presentations.sh   # 73 contrôles
 ```
 
 Les suites qui ouvrent un navigateur demandent en plus le frontend :
@@ -408,6 +463,24 @@ bash scripts/test-ecrans-pdf.sh             # 25 contrôles
 bash scripts/test-ecrans-photo.sh           # 25 contrôles
 bash scripts/test-ecrans-design.sh          # 23 contrôles
 bash scripts/test-ecrans-detente.sh         # 16 contrôles
+bash scripts/test-ecrans-annoter.sh         # 48 contrôles
+bash scripts/test-ecrans-presentations.sh   # 53 contrôles
+
+# Deux essais de rendu, sans base de données ni serveur :
+node scripts/verif-annotations-rotation.js  # 71 contrôles
+node scripts/verif-pptx.js                  # 46 contrôles — DEMANDE LIBREOFFICE
+```
+
+**LibreOffice n'est nécessaire QU'À CET ESSAI, jamais à l'application.** Il y
+sert de juge indépendant : il ouvre le `.pptx` produit et le convertit en PDF,
+ce qu'il refuserait de faire si l'archive était invalide, puis il la réécrit à
+sa façon pour éprouver le lecteur sur l'XML d'un autre producteur. Si
+LibreOffice n'est pas installé sur le VPS, cet essai échoue au lancement et
+les 46 contrôles ne disent rien ; le module des présentations, lui, fonctionne
+sans lui. Pour l'installer le temps d'un essai :
+
+```bash
+apt-get install -y libreoffice-impress   # environ 400 Mo
 ```
 
 Si Chromium n'est pas installé, ces trois dernières s'arrêtent en le disant.
