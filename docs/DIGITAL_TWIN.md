@@ -186,3 +186,11 @@ La correction du 16 novembre ajoute au frontend une projection schématique des 
 Le programme `scripts/update-digital-twin-auto-vps.cjs` regroupe la préparation, la sauvegarde du frontend, le chargement de fichiers à empreintes fixes, les tests, la compilation et l'activation. Il vérifie la version des sept fichiers du module initial, puis construit une copie du frontend réellement installé, en utilisant ses dépendances existantes. Il ne se connecte pas à PostgreSQL et ne redémarre pas le backend. Le frontend est brièvement arrêté uniquement lors de l'échange du dossier du module et du build. En cas d'échec de cette bascule, le programme tente de rétablir les deux anciens dossiers.
 
 Le statut final attendu est `AUTO_VIEW_DEPLOYED`. Le résultat fournit également le dossier privé de sauvegarde et la commande de retour arrière. Les emplacements créés ultérieurement deviennent visibles à la prochaine lecture (15 secondes maximum lorsque la page reste visible, ou dès le retour sur l'écran). Une capacité physique ne peut pas être déduite des dimensions purement graphiques.
+
+### Rendu et navigation améliorés, entrée dans Stocks
+
+`scripts/update-digital-twin-navigation-vps.cjs` vise la version automatique précédemment installée (neuf fichiers vérifiés). Cette mise à jour est exclusivement frontend : elle ne se connecte pas à PostgreSQL, ne modifie pas les stocks et ne redémarre pas le backend.
+
+Après sauvegarde privée, elle construit une copie du frontend réel. L'entrée « Entrepôts — Vue 3D / 2D » est ajoutée juste après le titre Stocks par analyse TSX, uniquement si aucun lien vers ce module n'existe. Le reste de la page Stocks et ses contrôles de permissions sont conservés octet pour octet. Si le titre est ambigu, le programme s'arrête avant toute bascule. La variable de build d'activation du module est explicitement activée.
+
+La bascule journalisée comprend le dossier Digital Twin, la page Stocks et le build. Le résultat `NAVIGATION_VIEW_DEPLOYED` atteste les contrôles HTTP publics/authentification, pas la validation visuelle WebGL. Il fournit un dossier `navigation-*` et une commande de retour arrière. Les deux tests de cette révision vérifient l'insertion idempotente, la conservation de la source et le retour arrière aux différentes frontières de renommage, y compris pour la page Stocks seule.
