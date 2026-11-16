@@ -160,3 +160,21 @@ Validation locale : 19 tests métier/intégration passent également avec le fic
 `scripts/stage-digital-twin-vps.cjs` et son manifeste à empreintes fixes préparent un dossier privé sous `/var/backups/triangle-digital-twin/`. Le programme vérifie les fonctions d'authentification, les fichiers de droits et les versions, archive le frontend réel (modifications locales comprises), ajoute uniquement les nouveaux fichiers dans cette copie, exécute les tests avec les permissions réelles et compile le frontend. Les identifiants de connexion restent sur le VPS dans le dossier privé ; ne pas publier ou transmettre cette archive.
 
 Le statut final attendu est `CANDIDATE_COMPILED_NOT_DEPLOYED`. Ce programme ne se connecte pas à PostgreSQL, n'applique aucune migration et ne redémarre aucun processus. La sauvegarde PostgreSQL et la bascule avec retour arrière restent à réaliser après examen du résultat. Une erreur laisse la production intacte et indique le contrôle manquant ; ne pas contourner les contrôles d'empreintes. La validation visuelle avec un utilisateur autorisé reste nécessaire après activation.
+
+### Activation de la candidate compilée
+
+Le contrôle VPS fourni confirme `CANDIDATE_COMPILED_NOT_DEPLOYED` pour `/var/backups/triangle-digital-twin/candidate-druPpd`, avec tests métier et build réussis. Le frontend démarre par `npm start -- -p 3000` ; sa variable `PORT=5050` ne décrit pas son port d'écoute effectif. Le programme d'activation identifie le socket du backend par son PID et vérifie la destination API du build.
+
+`scripts/activate-digital-twin-vps.cjs <dossier-candidat>` effectue les opérations suivantes :
+
+1. Vérifie les empreintes de la source réelle, de la candidate et de son build, puis les services et l'accès HTTPS existant. Un verrou empêche deux activations simultanées.
+2. Crée une sauvegarde PostgreSQL au format custom, en vérifie la table des matières et calcule son SHA-256. Les secrets restent dans un fichier privé temporaire supprimé après sauvegarde. Ce contrôle ne remplace pas un exercice complet de restauration.
+3. Applique uniquement la migration additive du plan, en transaction, puis exécute les lectures métier sur la base réelle, en lecture seule. Aucun entrepôt, emplacement ou stock fictif n'est créé.
+4. Conserve par renommage le serveur, la configuration, les dépendances et le build actuels. Installe les nouveaux fichiers et redémarre uniquement `triangle-backend` et `triangle-frontend`. Une courte interruption est à prévoir. La liste PM2 est enregistrée après vérification pour conserver la configuration au redémarrage.
+5. Contrôle `/login`, le refus HTTP 401 des API sans JWT et la redirection de la page protégée. Aucun jeton d'utilisateur n'est fabriqué. L'accès authentifié et les interactions 2D/3D doivent ensuite être vérifiés dans le navigateur.
+
+Le résultat attendu est `DEPLOYED_SMOKE_CHECKS_PASSED`, avec l'URL `/stocks/digital-twin`. Ce statut ne certifie pas encore les 18 critères métier ou les fonctionnalités avancées non livrées. Les implantations physiques doivent être renseignées ; la candidate n'en invente pas.
+
+En cas d'échec pendant la bascule, le programme tente de restaurer automatiquement les fichiers précédents et de redémarrer les services. Le journal `activation-state.json` décrit chaque déplacement. Pour un retour arrière manuel, exécuter le script conservé dans le dossier candidat avec ce même dossier et `--rollback`. Ne pas restaurer la sauvegarde de base par-dessus la production : cela supprimerait les opérations légitimes saisies depuis la sauvegarde. Le rollback de code conserve les tables additives, les plans et les historiques.
+
+Validation locale complémentaire : neuf tests de déploiement couvrent les interruptions à différentes étapes, la conservation des deux versions, la détection du port par PID et le traitement privé du mot de passe PostgreSQL. La bascule elle-même doit être constatée sur le VPS ; elle n'a pas été effectuée depuis l'environnement de développement.
