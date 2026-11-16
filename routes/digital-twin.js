@@ -36,14 +36,12 @@ module.exports = function createDigitalTwinRouter({
       } catch (e) {
         if (db) await db.query("ROLLBACK").catch(() => {});
         if (!e.status) console.error("digital-twin", e.code || e.message);
-        res
-          .status(e.status || 503)
-          .json({
-            error: e.status
-              ? e.message
-              : "Module indisponible : vérifier les prérequis et les permissions.",
-            code: e.status ? "DIGITAL_TWIN_ERROR" : "DIGITAL_TWIN_UNAVAILABLE",
-          });
+        res.status(e.status || 503).json({
+          error: e.status
+            ? e.message
+            : "Module indisponible : vérifier les prérequis et les permissions.",
+          code: e.status ? "DIGITAL_TWIN_ERROR" : "DIGITAL_TWIN_UNAVAILABLE",
+        });
       } finally {
         db?.release();
       }
@@ -65,6 +63,7 @@ module.exports = function createDigitalTwinRouter({
           configured: !!data.layout,
           unmapped: data.unmapped.length,
           unallocated: data.unallocated.length,
+          discrepancies: data.discrepancies.length,
           locations: data.locations.length,
           preview: data.nodes
             .filter((n) => n.kind === "zone")
@@ -145,11 +144,10 @@ module.exports = function createDigitalTwinRouter({
       const id = integer(req.params.id),
         locId = integer(req.params.locationId);
       await S.requireWarehouse(db, ctx, id);
-      const location = (await S.locations(db, ctx, id)).find(
-        (l) => Number(l.id) === locId,
-      );
+      const snapshot = await S.snapshot(db, ctx, id);
+      const location = snapshot.locations.find((l) => Number(l.id) === locId);
       if (!location) throw error("Emplacement introuvable.", 404);
-      const stock = (await S.balances(db, ctx, id)).filter(
+      const stock = snapshot.balances.filter(
         (b) => Number(b.location_id) === locId,
       );
       const before = req.query.before ? integer(req.query.before) : null;

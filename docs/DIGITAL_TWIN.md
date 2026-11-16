@@ -142,3 +142,15 @@ Retour arrière : désactiver `DIGITAL_TWIN_ENABLED`, retirer l'activation front
 - Administrateur : Configurer le plan → renseigner les données mesurées → enregistrer un brouillon → prévisualiser → confirmer → publier le plan. Aucun stock n'est déplacé par cette publication.
 
 Références techniques consultées : documentation Next.js 16.2.6 embarquée (`use-client`, `lazy-loading`) ; [R3F — performances](https://r3f.docs.pmnd.rs/advanced/scaling-performance) ; [Three.js — OrbitControls](https://threejs.org/docs/pages/OrbitControls) ; [Three.js — InstancedMesh](https://threejs.org/docs/pages/InstancedMesh.html).
+
+## Contrôle VPS du 16 novembre 2026
+
+Le diagnostic fourni par l’administrateur confirme Express 5, Next 16, les colonnes requises et aucune table dt_ existante. Le serveur comporte 19 fichiers backend et 27 fichiers frontend suivis modifiés : les branches candidates ne doivent pas remplacer ces dépôts.
+
+La base contrôlée présente 89 produits gérés par emplacement dont le stock global diffère de la somme des balances, 228 produits avec stock non gérés par emplacement et 82 sans emplacement principal. Ces nombres concernent le périmètre global du diagnostic, pas nécessairement une seule société. Ils ne constituent pas une instruction de réconciliation. Aucune correction de stock n’a été exécutée.
+
+La candidate signale désormais les références en écart par entrepôt autorisé. Les bins concernés, y compris un emplacement principal sans balance, sont non vérifiés : ni vide confirmé, ni capacité disponible calculée. Les quantités enregistrées restent visibles et marquées à vérifier. Les totaux de comparaison interentrepôts ne sont pas exposés aux utilisateurs. Les changements validés des services de stock existants pourront lever ces alertes au rafraîchissement suivant.
+
+Le moteur de permissions conserve la société d’origine de l’utilisateur et reçoit séparément la société effective. Les droits historiques ne traversent pas cette frontière. Les habilitations sont relues, et le corps d’un formulaire ne choisit pas la société.
+
+Validation locale : 19 tests métier/intégration passent également avec le fichier de permissions dont l’empreinte correspond exactement au VPS. Cela ne vaut pas validation visuelle ou test utilisateur sur le serveur.

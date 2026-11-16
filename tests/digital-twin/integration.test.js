@@ -253,6 +253,76 @@ test("audit failure rolls back the entire draft", async () => {
     await pg.exec("ALTER TABLE audit_logs_unavailable RENAME TO audit_logs");
   }
 });
+test("mismatches hide capacity without changing stock, including an empty primary bin", async () => {
+  await pg.exec("BEGIN");
+  try {
+    await pg.exec("UPDATE products SET stock=90 WHERE id=1");
+    let data = await S.snapshot(pool, ctx, 1);
+    assert.deepEqual(
+      data.discrepancies.map((p) => p.id),
+      [1],
+    );
+    assert.equal(data.balances[0].quantity, "40");
+    assert.equal(data.balances[0].unverified, true);
+    assert.equal(data.locations[0].unverified, true);
+    let metric = data.nodes.find((n) => n.kind === "warehouse").metrics;
+    assert.equal(metric.percent, null);
+    assert.equal(metric.capacities[0].available, null);
+    assert.equal(metric.empty, 0);
+    assert.equal(metric.overloaded, 0);
+    assert.equal((await S.snapshot(pool, ctx, 2)).discrepancies.length, 0);
+    assert.equal("stock" in data.discrepancies[0], false);
+    await pg.exec("DELETE FROM stock_location_balances WHERE id=1");
+    data = await S.snapshot(pool, ctx, 1);
+    metric = data.nodes.find((n) => n.kind === "warehouse").metrics;
+    assert.equal(data.discrepancies.length, 1);
+    assert.equal(metric.empty, 0);
+    assert.equal(metric.percent, null);
+    assert.equal(
+      (await pool.query("SELECT stock FROM products WHERE id=1")).rows[0].stock,
+      "90",
+    );
+  } finally {
+    await pg.exec("ROLLBACK");
+  }
+});
+test("integrity uses all company balances but does not disclose an inaccessible location", async () => {
+  await pg.exec("BEGIN");
+  try {
+    await pg.exec(`INSERT INTO locations(id,company_id,warehouse_id) VALUES(3,1,2);
+      INSERT INTO stock_location_balances VALUES(3,1,3,1,10,0);
+      UPDATE products SET stock=50,location_id=3 WHERE id=1;`);
+    let data = await S.snapshot(pool, ctx, 1);
+    assert.equal(data.discrepancies.length, 0);
+    assert.equal(data.balances.length, 1);
+    assert.equal(data.balances[0].quantity, "40");
+    await pg.exec("UPDATE products SET stock=60 WHERE id=1");
+    data = await S.snapshot(pool, ctx, 1);
+    assert.equal(data.discrepancies[0].location_id, null);
+    assert.equal(data.balances[0].unverified, true);
+    await pg.exec("UPDATE products SET stock=50 WHERE id=1");
+    assert.equal(
+      (await S.snapshot(pool, ctx, 1)).nodes.find((n) => n.kind === "warehouse")
+        .metrics.percent,
+      40,
+    );
+  } finally {
+    await pg.exec("ROLLBACK");
+  }
+});
+test("a company grant does not carry legacy stock permissions to another company", async () => {
+  await pg.exec("BEGIN");
+  try {
+    await pg.exec(`INSERT INTO user_company_access VALUES(2,2,true);
+      INSERT INTO user_permissions VALUES(2,'stock',true,false,false,false,false);`);
+    await assert.rejects(
+      () => S.context(pool, { ...req, user: { id: 2 } }, () => 2),
+      { status: 403 },
+    );
+  } finally {
+    await pg.exec("ROLLBACK");
+  }
+});
 test("explicit DENY and inactive user revoke access immediately", async () => {
   await pg.exec(
     "INSERT INTO user_permission_overrides VALUES(1,2,'stock','view','DENY')",

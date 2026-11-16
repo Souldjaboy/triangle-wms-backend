@@ -12,7 +12,8 @@ async function context(pool, req, getCompany) {
   ).rows[0];
   if (!user || user.is_active !== true)
     throw error("Compte indisponible.", 403);
-  const companyId = Number(getCompany(req, user.company_id));
+  // Un champ de données du formulaire n'est jamais une commande de bascule.
+  const companyId = Number(getCompany({ ...req, body: {} }, user.company_id));
   if (!Number.isSafeInteger(companyId) || companyId <= 0)
     throw error("Entreprise requise.", 403);
   const company = (
@@ -24,7 +25,6 @@ async function context(pool, req, getCompany) {
     throw error("Entreprise non autorisée.", 403);
   const superUser = permissions.estSuperAdmin(user);
   if (Number(user.company_id) !== companyId) {
-    if (!superUser) throw error("Entreprise non autorisée.", 403);
     const access = await pool.query(
       "SELECT 1 FROM user_company_access WHERE user_id=$1 AND company_id=$2 AND is_active=TRUE",
       [user.id, companyId],
@@ -32,8 +32,12 @@ async function context(pool, req, getCompany) {
     if (!access.rows.length) throw error("Entreprise non autorisée.", 403);
   }
   // Contexte rechargé en base : les révocations ne dépendent pas du JWT ancien.
-  const current = { ...user, company_id: companyId };
-  const rights = await permissions.chargerContexte(pool, current);
+  // Préserve la société d'origine : les droits historiques ne doivent pas
+  // suivre l'utilisateur lorsqu'il change de société effective.
+  const current = user;
+  const rights = await permissions.chargerContexte(pool, current, companyId);
+  if (Number(user.company_id) !== companyId && rights.companyId !== companyId)
+    throw error("Moteur de permissions multi-sociétés requis.", 403);
   if (!permissions.decider(rights, "stock", "view").autorise)
     throw error("Consultation du stock non autorisée.", 403);
   return {
@@ -86,7 +90,10 @@ async function balances(db, ctx, id) {
   return (
     await db.query(
       `SELECT b.location_id,b.product_id,b.quantity,b.reserved_quantity,(b.quantity-b.reserved_quantity) AS available,
-    p.name,p.reference,p.unit,p.barcode,p.category,p.location_managed
+    p.name,p.reference,p.unit,p.barcode,p.category,p.location_managed,
+    (COALESCE(p.location_managed,FALSE)=FALSE OR p.stock IS DISTINCT FROM
+      (SELECT COALESCE(SUM(all_b.quantity),0) FROM stock_location_balances all_b
+       WHERE all_b.company_id=p.company_id AND all_b.product_id=p.id)) AS unverified
     FROM stock_location_balances b JOIN locations l ON l.id=b.location_id AND l.company_id=b.company_id
     JOIN products p ON p.id=b.product_id AND p.company_id=b.company_id
     WHERE b.company_id=$1 AND l.warehouse_id=$2 ORDER BY l.id,p.id`,
@@ -140,7 +147,35 @@ async function snapshot(db, ctx, id) {
       [ctx.companyId, id],
     )
   ).rows;
-  const uncertain = new Set(unallocated.map((p) => Number(p.location_id)));
+  // La comparaison porte sur toutes les balances de la même société ; seules
+  // les références liées à l'entrepôt autorisé sont retournées, sans totaux
+  // globaux susceptibles de révéler les stocks d'un autre entrepôt.
+  const discrepancies = (
+    await db.query(
+      `SELECT p.id,p.reference,p.name,
+       CASE WHEN EXISTS(SELECT 1 FROM locations l WHERE l.id=p.location_id
+         AND l.company_id=p.company_id AND l.warehouse_id=$2)
+         THEN p.location_id END AS location_id
+       FROM products p WHERE p.company_id=$1 AND p.location_managed=TRUE
+       AND p.stock IS DISTINCT FROM
+         (SELECT COALESCE(SUM(b.quantity),0) FROM stock_location_balances b
+          WHERE b.company_id=p.company_id AND b.product_id=p.id)
+       AND (EXISTS(SELECT 1 FROM locations l WHERE l.id=p.location_id
+          AND l.company_id=p.company_id AND l.warehouse_id=$2)
+        OR EXISTS(SELECT 1 FROM stock_location_balances b JOIN locations l
+          ON l.id=b.location_id AND l.company_id=b.company_id
+          WHERE b.product_id=p.id AND b.company_id=p.company_id AND l.warehouse_id=$2))
+       ORDER BY p.id`,
+      [ctx.companyId, id],
+    )
+  ).rows;
+  const uncertain = new Set([
+    ...unallocated.map((p) => Number(p.location_id)),
+    ...discrepancies
+      .filter((p) => p.location_id != null)
+      .map((p) => Number(p.location_id)),
+    ...stock.filter((b) => b.unverified).map((b) => Number(b.location_id)),
+  ]);
   // Les stocks historiques non répartis ne permettent pas d'attester qu'un bin est vide.
   model.forEach((n) => {
     n.unverified = uncertain.has(Number(n.location_id));
@@ -165,6 +200,7 @@ async function snapshot(db, ctx, id) {
     balances: stock,
     unmapped: bins.filter((l) => !linked.has(Number(l.id))).map((l) => l.id),
     unallocated,
+    discrepancies,
     capabilities: { configure: ctx.canConfigure, publish: ctx.canPublish },
     as_of: new Date().toISOString(),
     refresh_seconds: 15,
