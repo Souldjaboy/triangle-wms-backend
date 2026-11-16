@@ -13,7 +13,12 @@ async function context(pool, req, getCompany) {
   if (!user || user.is_active !== true)
     throw error("Compte indisponible.", 403);
   // Un champ de données du formulaire n'est jamais une commande de bascule.
-  const companyId = Number(getCompany({ ...req, body: {} }, user.company_id));
+  const companyId = Number(
+    getCompany(
+      { user: req.user, headers: req.headers, query: req.query, body: {} },
+      user.company_id,
+    ),
+  );
   if (!Number.isSafeInteger(companyId) || companyId <= 0)
     throw error("Entreprise requise.", 403);
   const company = (

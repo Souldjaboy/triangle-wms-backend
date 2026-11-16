@@ -134,6 +134,12 @@ test("company + warehouse scopes use current user and explicit grants", async ()
   );
 });
 test("API requires auth and prevents direct-object warehouse disclosure", async () => {
+  const bodySelection = await S.context(
+    pool,
+    { ...req, body: { company_id: 2 } },
+    (r, fallback) => r.body.company_id || fallback,
+  );
+  assert.equal(bodySelection.companyId, 1);
   assert.equal((await fetch(base + "/warehouses")).status, 401);
   assert.equal(
     (await fetch(base + "/warehouses/2", { headers: { Authorization: "2" } }))
