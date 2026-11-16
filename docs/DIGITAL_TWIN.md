@@ -154,3 +154,9 @@ La candidate signale désormais les références en écart par entrepôt autoris
 Le moteur de permissions conserve la société d’origine de l’utilisateur et reçoit séparément la société effective. Les droits historiques ne traversent pas cette frontière. Les habilitations sont relues, et le corps d’un formulaire ne choisit pas la société.
 
 Validation locale : 19 tests métier/intégration passent également avec le fichier de permissions dont l’empreinte correspond exactement au VPS. Cela ne vaut pas validation visuelle ou test utilisateur sur le serveur.
+
+### Préparation sur la source réelle du VPS
+
+`scripts/stage-digital-twin-vps.cjs` et son manifeste à empreintes fixes préparent un dossier privé sous `/var/backups/triangle-digital-twin/`. Le programme vérifie les fonctions d'authentification, les fichiers de droits et les versions, archive le frontend réel (modifications locales comprises), ajoute uniquement les nouveaux fichiers dans cette copie, exécute les tests avec les permissions réelles et compile le frontend. Les identifiants de connexion restent sur le VPS dans le dossier privé ; ne pas publier ou transmettre cette archive.
+
+Le statut final attendu est `CANDIDATE_COMPILED_NOT_DEPLOYED`. Ce programme ne se connecte pas à PostgreSQL, n'applique aucune migration et ne redémarre aucun processus. La sauvegarde PostgreSQL et la bascule avec retour arrière restent à réaliser après examen du résultat. Une erreur laisse la production intacte et indique le contrôle manquant ; ne pas contourner les contrôles d'empreintes. La validation visuelle avec un utilisateur autorisé reste nécessaire après activation.

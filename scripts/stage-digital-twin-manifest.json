@@ -1,0 +1,63 @@
+{
+  "functions": {
+    "authenticateToken": "f0b6de182851dfaf14c44b57854b988178ba7f46c6edf008c42f3cfebeb60c5a",
+    "getEffectiveCompanyIdStrict": "4857a55a6a3d65a717816b4c61ae8b27a89bd9719616c6dce625720a72be3ed3",
+    "getEffectiveCompanyId": "c8698e311bbd232cfb3433c2c79a089ee0fb97d028b41761a0a37bb337a153d4",
+    "isSuperAdminUser": "b21b45def9e9086e6d0643897fe4d97ca6d069da6528db03bb1410cb32003465",
+    "getRequestedActiveCompanyId": "f7322afa64f5ff8d8af966ebfd0338df4f604b49c15c860d2fabeeaaedd3b270",
+    "societesHabilitees": "1eb3801268dd1e480c24d27dd306295801cea460ff0dc2babaff542e7bdcf420",
+    "societeDemandeeAutorisee": "9c7c8b8d1c2b4a20a48982d2c5b692f99a367639f859ff321d27250e28461518",
+    "getAuthTokenFromRequest": "cc675f3dd749aaab164b3971849a80c6687e28e8a9d7bb0b2667ab1dbbe9bfff",
+    "getTenantFromRequest": "2af9c5ef535f78fa3294a6c0c9b3a5b07d191609406696cfd86214f7460591e6",
+    "normalizeTenantId": "241dcd9d7b19a7076a01baa8048b9d8102506ec2f614e4b0b2f01477aa9675ab",
+    "companyBelongsToTenant": "2e653e5fbe61c0d0f7299e21fe5fe1cd70b583afd3ae0c8d6fdea7e789eac154"
+  },
+  "live_hashes": {
+    "backend/server.js": "7585cc46f8639da674b4a358a188495d9a825b4377d2cec001c96052eee98abb",
+    "backend/services/permissions.js": "161e4f48c6f3d4053759e12ab5f901b416b1062f9a6864352cbe5f9dad58d4d6",
+    "backend/rbac-triangle.js": "e0b742aeb90b529440a6e407669b659140036abcd6fabcc676d24b9291a5bf9d",
+    "backend/services/location-rules.js": "f7b392a1cb0b2831d7e4df876dec60e47dc6567fc80d692aa0cec8b321f8d461",
+    "frontend/app/lib/api.ts": "8875185d581cd2d2a99e0c042ee009f6d5db32f0ed61eff92897574604e001d7",
+    "frontend/middleware.ts": "d89ca703836eb0d6ddb77b93ae9de5b681165e778412870add512c83c4828f9e",
+    "frontend/next.config.ts": "0ee5c04780771726e51cdc6865e779852b45f528f79fdbd4260c2df07f4d1d79"
+  },
+  "candidates": {
+    "backend": {
+      "commit": "e7584334581064ae86f914f3c921dbb9e837dcde",
+      "files": {
+        "digital-twin/model.js": "017c6d47cf3077c429ced17583103c9b7ed15f4deea9e0a55b5b3facddd17550",
+        "digital-twin/service.js": "1b417a510f8bab402c2db80e92cc3850a12575da45cb51fcf8b169de982d7d4a",
+        "routes/digital-twin.js": "f8b9544c4fa1e148255cd257af34c40077a4f1d0f32bb6fc266f5d78b2c5fe2f",
+        "sql/064_digital_twin.sql": "6f51b30addbae2c47bab6e36aeedb0ea5a240f67cb72f133a2e4940ca520022b",
+        "tests/digital-twin/model.test.js": "e5626eb4645d737165f6ebefe3a1b9d975c4da1f8eb442cb2653d6da41860ad2",
+        "tests/digital-twin/integration.test.js": "516bd48c8ee98dfbdfb0f0910997240be5f8dd9f704aa877de7c02a689018c1c"
+      }
+    },
+    "frontend": {
+      "commit": "4f1341ef4e5ba7d6812be12b300f83de65c41aed",
+      "files": {
+        "app/stocks/digital-twin/Configurator.tsx": "864c3966c508be2220fb499f9c5f19ca3f75d8031e71f2ce02543de6f69ec1b6",
+        "app/stocks/digital-twin/Plan2D.tsx": "105f4b3278e36ba5c27a533378afc8c5264bc3ab825620225f34b9aeee1502af",
+        "app/stocks/digital-twin/Plan3D.tsx": "1bedbd8ab9b48988f3221e16f1ea1da6ed6d648a4d38c6099a1b5e8c4ca7d8f4",
+        "app/stocks/digital-twin/Scene.tsx": "23935e41d8588c04c028dd15fed4a368f7396d023e38a5c668c66a02773ffef1",
+        "app/stocks/digital-twin/page.tsx": "728b4898dd57209c0b39b3bfd0e7cb30e66679c3a9e579c02e5eb7fed836c4c5",
+        "app/stocks/digital-twin/twin.css": "96fe213f93f1ee72b6b2d83c434bfa101e4115f84a689c30c024c865ebfa3421",
+        "app/stocks/digital-twin/types.ts": "9b7dae5cae21a6c21de22fb56e6ee72b517e528c1bdf9aef6aa067570b3d8ab1"
+      }
+    }
+  },
+  "dependencies": {
+    "dependencies": {
+      "three": "0.187.0",
+      "@react-three/drei": "10.7.9",
+      "@react-three/fiber": "9.8.2"
+    },
+    "devDependencies": {
+      "@types/three": "0.187.0"
+    }
+  },
+  "test_dependencies": {
+    "express": "5.2.1",
+    "@electric-sql/pglite": "0.5.16"
+  }
+}
