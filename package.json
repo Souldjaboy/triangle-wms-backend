@@ -9,7 +9,8 @@
     "test:import:real": "node tests/import-real.test.js",
     "test:import:prod": "node tests/import-prod.test.js",
     "test:import:triangle": "node tests/product-triangle.test.js",
-    "test:import:realfiles": "node tests/import-real-files.test.js"
+    "test:import:realfiles": "node tests/import-real-files.test.js",
+    "test:digital-twin": "node --test tests/digital-twin/*.test.js"
   },
   "keywords": [],
   "author": "",
@@ -32,5 +33,8 @@
     "qrcode": "^1.5.4",
     "react-qr-scanner": "^1.0.0-alpha.11",
     "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.16"
   }
 }
