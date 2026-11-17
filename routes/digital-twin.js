@@ -1,5 +1,6 @@
 "use strict";
 const express = require("express");
+const Access = require("../digital-twin/access");
 const S = require("../digital-twin/service");
 const { error } = require("../digital-twin/model");
 module.exports = function createDigitalTwinRouter({
@@ -20,16 +21,16 @@ module.exports = function createDigitalTwinRouter({
     return n;
   };
   const handle =
-    (fn, write = false) =>
+    (fn, write = false, accessOnly = false) =>
     async (req, res) => {
       let db;
       try {
-        const ctx = await S.context(pool, req, getEffectiveCompanyId);
         db = await pool.connect();
         await db.query(
           write ? "BEGIN" : "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
         );
         await db.query("SET LOCAL statement_timeout = '10s'");
+        const ctx = await S.context(db, req, getEffectiveCompanyId, accessOnly);
         const out = await fn(db, ctx, req);
         await db.query("COMMIT");
         res.json(out);
@@ -46,6 +47,9 @@ module.exports = function createDigitalTwinRouter({
         db?.release();
       }
     };
+  router.get("/access", handle(async (_db,ctx) => ({canView:ctx.canView,canManage:ctx.canManageAccess}),false,true));
+  router.get("/access/users", handle(async (db,ctx,req) => ({users:await Access.list(db,ctx,req.query.q)})));
+  router.put("/access/users/:id", handle((db,ctx,req) => Access.set(db,ctx,req,integer(req.params.id),req.body?.allowed),true));
   router.get(
     "/warehouses",
     handle(async (db, ctx) => {

@@ -2,8 +2,9 @@
 const { error, validateLayout, summarize } = require("./model");
 const rules = require("../services/location-rules");
 const permissions = require("../services/permissions");
+const Access = require("./access");
 const ADMIN = ["super_admin", "admin", "administrateur"];
-async function context(pool, req, getCompany) {
+async function context(pool, req, getCompany, accessOnly = false) {
   const user = (
     await pool.query(
       "SELECT id, email, fullname, role, company_id, is_active, is_super_admin, to_jsonb(users)->>'warehouse_id' AS warehouse_id FROM users WHERE id=$1",
@@ -43,20 +44,23 @@ async function context(pool, req, getCompany) {
   const rights = await permissions.chargerContexte(pool, current, companyId);
   if (Number(user.company_id) !== companyId && rights.companyId !== companyId)
     throw error("Moteur de permissions multi-sociétés requis.", 403);
-  if (!permissions.decider(rights, "stock", "view").autorise)
-    throw error("Consultation du stock non autorisée.", 403);
+  const access = await Access.read(pool, user.id, companyId);
+  const canView = access.canView && permissions.decider(rights, "stock", "view").autorise;
+  if (!accessOnly && !canView) throw error("Module privé : accès non accordé.", 403);
   return {
     companyId,
+    canView,
+    canManageAccess: access.isOwner,
     user: current,
     admin: ADMIN.includes(String(user.role).toLowerCase()) || superUser,
     allWarehouses:
       permissions.ROLES_ADMIN.includes(String(user.role).toLowerCase()) ||
       superUser,
     canConfigure:
-      (ADMIN.includes(String(user.role).toLowerCase()) || superUser) &&
+      access.isOwner && (ADMIN.includes(String(user.role).toLowerCase()) || superUser) &&
       permissions.decider(rights, "stock.emplacement", "update").autorise,
     canPublish:
-      (ADMIN.includes(String(user.role).toLowerCase()) || superUser) &&
+      access.isOwner && (ADMIN.includes(String(user.role).toLowerCase()) || superUser) &&
       permissions.decider(rights, "stock.emplacement", "validate").autorise,
   };
 }

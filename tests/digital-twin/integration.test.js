@@ -80,6 +80,9 @@ before(async () => {
       )
       .replace(/^\\.*$/gm, ""),
   );
+  const privateSchema = fs.readFileSync(require("node:path").join(__dirname,"../../sql/065_digital_twin_private_access.sql"),"utf8").replace(/^\\.*$/gm,"").split("DO $$")[0];
+  await pg.exec(privateSchema + "COMMIT;");
+  await pg.exec("INSERT INTO dt_module_owner(singleton,user_id) VALUES(TRUE,1); INSERT INTO dt_module_access(company_id,user_id,allowed,updated_by) VALUES(1,2,TRUE,1),(2,3,TRUE,1),(1,4,TRUE,1);");
   ctx = await S.context(pool, req, (_r, f) => f);
   const app = express();
   app.use(express.json());
